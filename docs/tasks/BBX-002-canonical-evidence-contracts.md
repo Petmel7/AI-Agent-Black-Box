@@ -1,6 +1,6 @@
 # BBX-002: Canonical Evidence Contracts
 
-- **Status:** Approved
+- **Status:** Done
 - **Owner:** Implementation Chat
 - **Review:** Review Chat
 - **Architecture:** [ADR-0001](../architecture/decisions/ADR-0001-modular-monolith.md), [ADR-0002](../architecture/decisions/ADR-0002-canonical-evidence-envelope.md)
