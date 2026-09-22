@@ -1,8 +1,153 @@
 generator client {
   provider = "prisma-client"
-  output   = "../generated/client"
+  output   = "../src/generated/client"
 }
 
 datasource db {
   provider = "postgresql"
+}
+
+model Organization {
+  id           String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  createdAt    DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
+  repositories Repository[]
+  runs         Run[]
+  batches      EvidenceBatch[]
+  events       EvidenceEvent[]
+  memberships  EvidenceBatchEvent[]
+  artifacts    ArtifactDeclaration[]
+  references   EvidenceEventArtifact[]
+
+  @@map("organizations")
+}
+
+model Repository {
+  id             String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String       @map("organization_id") @db.Uuid
+  createdAt      DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "repositories_organization_id_fkey")
+  runs           Run[]
+
+  @@unique([organizationId, id], map: "repositories_org_id_key")
+  @@map("repositories")
+}
+
+model Run {
+  id             String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String                @map("organization_id") @db.Uuid
+  repositoryId   String                @map("repository_id") @db.Uuid
+  canonicalRunId String                @map("canonical_run_id") @db.Uuid
+  createdAt      DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
+  organization   Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "runs_organization_id_fkey")
+  repository     Repository            @relation(fields: [organizationId, repositoryId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "runs_org_repository_fkey")
+  batches        EvidenceBatch[]
+  events         EvidenceEvent[]
+  memberships    EvidenceBatchEvent[]
+  artifacts      ArtifactDeclaration[]
+  references     EvidenceEventArtifact[]
+
+  @@unique([organizationId, canonicalRunId], map: "runs_org_canonical_run_id_key")
+  @@unique([organizationId, id], map: "runs_org_id_key")
+  @@map("runs")
+}
+
+model EvidenceBatch {
+  id               String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId   String               @map("organization_id") @db.Uuid
+  runId            String               @map("run_id") @db.Uuid
+  canonicalBatchId String               @map("canonical_batch_id") @db.Uuid
+  schemaVersion    Int                  @map("schema_version")
+  sentAt           DateTime             @map("sent_at") @db.Timestamptz(3)
+  receivedAt       DateTime             @default(now()) @map("received_at") @db.Timestamptz(3)
+  rawBatch         Json                 @map("raw_batch") @db.JsonB
+  organization     Organization         @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "batches_organization_id_fkey")
+  run              Run                  @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "batches_org_run_fkey")
+  memberships      EvidenceBatchEvent[]
+
+  @@unique([organizationId, canonicalBatchId], map: "batches_org_canonical_batch_id_key")
+  @@unique([organizationId, runId, id], map: "batches_org_run_id_key")
+  @@index([organizationId, runId, receivedAt], map: "batches_org_run_received_idx")
+  @@map("evidence_batches")
+}
+
+model EvidenceEvent {
+  id               String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId   String                  @map("organization_id") @db.Uuid
+  runId            String                  @map("run_id") @db.Uuid
+  canonicalEventId String                  @map("canonical_event_id") @db.Uuid
+  schemaVersion    Int                     @map("schema_version")
+  sequence         BigInt
+  kind             String
+  observedAt       DateTime                @map("observed_at") @db.Timestamptz(3)
+  occurredAt       DateTime?               @map("occurred_at") @db.Timestamptz(3)
+  receivedAt       DateTime                @default(now()) @map("received_at") @db.Timestamptz(3)
+  rawEvent         Json                    @map("raw_event") @db.JsonB
+  organization     Organization            @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "events_organization_id_fkey")
+  run              Run                     @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "events_org_run_fkey")
+  memberships      EvidenceBatchEvent[]
+  artifactLinks    EvidenceEventArtifact[]
+
+  @@unique([organizationId, canonicalEventId], map: "events_org_canonical_event_id_key")
+  @@unique([runId, sequence], map: "events_run_sequence_key")
+  @@unique([organizationId, runId, id], map: "events_org_run_id_key")
+  @@index([organizationId, runId, kind], map: "events_org_run_kind_idx")
+  @@map("evidence_events")
+}
+
+model EvidenceBatchEvent {
+  id             String        @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String        @map("organization_id") @db.Uuid
+  runId          String        @map("run_id") @db.Uuid
+  batchId        String        @map("batch_id") @db.Uuid
+  eventId        String        @map("event_id") @db.Uuid
+  position       BigInt
+  organization   Organization  @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "batch_events_organization_id_fkey")
+  run            Run           @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "batch_events_org_run_fkey")
+  batch          EvidenceBatch @relation(fields: [organizationId, runId, batchId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "batch_events_org_run_batch_fkey")
+  event          EvidenceEvent @relation(fields: [organizationId, runId, eventId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "batch_events_org_run_event_fkey")
+
+  @@unique([batchId, position], map: "batch_events_batch_position_key")
+  @@unique([batchId, eventId], map: "batch_events_batch_event_key")
+  @@map("evidence_batch_events")
+}
+
+model ArtifactDeclaration {
+  id                  String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId      String                  @map("organization_id") @db.Uuid
+  runId               String                  @map("run_id") @db.Uuid
+  canonicalArtifactId String                  @map("canonical_artifact_id") @db.Uuid
+  kind                String
+  mediaType           String                  @map("media_type")
+  byteLength          BigInt                  @map("byte_length")
+  sha256              String
+  redactionApplied    Boolean                 @map("redaction_applied")
+  redactionRuleset    String?                 @map("redaction_ruleset_version")
+  compression         String?
+  characterEncoding   String?                 @map("character_encoding")
+  receivedAt          DateTime                @default(now()) @map("received_at") @db.Timestamptz(3)
+  rawReference        Json                    @map("raw_reference") @db.JsonB
+  organization        Organization            @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "artifacts_organization_id_fkey")
+  run                 Run                     @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "artifacts_org_run_fkey")
+  eventLinks          EvidenceEventArtifact[]
+
+  @@unique([organizationId, canonicalArtifactId], map: "artifacts_org_canonical_artifact_id_key")
+  @@unique([organizationId, runId, id], map: "artifacts_org_run_id_key")
+  @@index([organizationId, runId, kind], map: "artifacts_org_run_kind_idx")
+  @@map("artifact_declarations")
+}
+
+model EvidenceEventArtifact {
+  id             String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String              @map("organization_id") @db.Uuid
+  runId          String              @map("run_id") @db.Uuid
+  eventId        String              @map("event_id") @db.Uuid
+  artifactId     String              @map("artifact_id") @db.Uuid
+  jsonPointer    String              @map("json_pointer")
+  organization   Organization        @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "event_artifacts_organization_id_fkey")
+  run            Run                 @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "event_artifacts_org_run_fkey")
+  event          EvidenceEvent       @relation(fields: [organizationId, runId, eventId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "event_artifacts_org_run_event_fkey")
+  artifact       ArtifactDeclaration @relation(fields: [organizationId, runId, artifactId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "event_artifacts_org_run_artifact_fkey")
+
+  @@unique([eventId, jsonPointer], map: "event_artifacts_event_pointer_key")
+  @@map("evidence_event_artifacts")
 }

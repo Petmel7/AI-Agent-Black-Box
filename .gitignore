@@ -22,3 +22,4 @@ Thumbs.db
 .vscode/
 
 packages/database/generated/
+packages/database/src/generated/

@@ -1,11 +1,12 @@
 # AI Agent Black Box
 
-AI Agent Black Box is an evidence and quality layer for AI-generated code. This repository currently contains the BBX-001 monorepo foundation; evidence recording behavior is intentionally not implemented yet.
+AI Agent Black Box is an evidence and quality layer for AI-generated code. The repository contains the monorepo foundation, canonical version 1 evidence contracts, and the PostgreSQL evidence-persistence foundation. HTTP ingestion and later processing behavior are intentionally not implemented yet.
 
 ## Prerequisites
 
 - Node.js 24 LTS (the exact major is recorded in `.nvmrc`)
 - pnpm 11 (Corepack can install the version recorded in `package.json`)
+- Docker with Compose, only for database integration tests
 
 ## Install
 
@@ -14,7 +15,7 @@ corepack enable
 pnpm install --frozen-lockfile
 ```
 
-No database, Supabase, queue, storage, or LLM credentials are required to install, build, or test the bootstrap. Copy `.env.example` to `.env` only when a later task requires local infrastructure configuration.
+No Supabase project, queue, storage, or LLM credentials are required. Normal generation, validation, and builds remain credential-free. Real database integration tests use the isolated PostgreSQL service documented in `packages/database/README.md`.
 
 ## Development
 
@@ -47,6 +48,10 @@ pnpm typecheck
 pnpm test
 pnpm build
 ```
+
+`pnpm test` explicitly skips only the database integration suite when
+`TEST_DATABASE_URL` is absent. Run the database workflow separately when
+validating persistence changes.
 
 ## Workspace layout
 

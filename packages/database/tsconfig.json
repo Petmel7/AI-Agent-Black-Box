@@ -1,0 +1,13 @@
+{
+  "extends": "@blackbox/config/typescript/node.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "."
+  },
+  "include": [
+    "src/**/*.ts",
+    "tests/**/*.ts",
+    "prisma.config.ts",
+    "vitest.integration.config.ts"
+  ]
+}

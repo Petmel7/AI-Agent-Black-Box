@@ -12,6 +12,22 @@ permissions:
 jobs:
   validate:
     runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: blackbox_integration
+          POSTGRES_USER: blackbox
+          POSTGRES_PASSWORD: blackbox_integration
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U blackbox -d blackbox_integration"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      TEST_DATABASE_URL: postgresql://blackbox:blackbox_integration@localhost:5432/blackbox_integration
     steps:
       - uses: actions/checkout@v7
       - uses: pnpm/action-setup@v6
@@ -22,6 +38,11 @@ jobs:
           node-version: 24
           cache: pnpm
       - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter @blackbox/database db:generate
+      - run: pnpm --filter @blackbox/database db:validate
+      - run: pnpm --filter @blackbox/database db:migrate:deploy
+      - run: pnpm --filter @blackbox/database db:migrate:verify
+      - run: pnpm --filter @blackbox/database test:integration
       - run: pnpm format:check
       - run: pnpm lint
       - run: pnpm typecheck
