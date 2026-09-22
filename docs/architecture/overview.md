@@ -10,10 +10,12 @@ AI Agent Black Box starts as a modular monolith in a TypeScript monorepo. It has
 
 This design keeps v0.1 operationally small without coupling telemetry ingestion or background analysis to the Next.js request lifecycle.
 
-The governing decisions are [ADR-0001](decisions/ADR-0001-modular-monolith.md)
-and [ADR-0002](decisions/ADR-0002-canonical-evidence-envelope.md). The canonical
-wire-level evidence semantics are documented in
-[Canonical Evidence Model](evidence-model.md).
+The governing decisions are [ADR-0001](decisions/ADR-0001-modular-monolith.md),
+[ADR-0002](decisions/ADR-0002-canonical-evidence-envelope.md), and
+[ADR-0003](decisions/ADR-0003-durable-evidence-persistence.md). The canonical
+wire-level evidence semantics are documented in the
+[Canonical Evidence Model](evidence-model.md). The implementation dependency
+order is maintained in the [v0.1 delivery sequence](v0.1-delivery-sequence.md).
 
 ## System Context
 
@@ -141,6 +143,11 @@ PostgreSQL stores:
 - Job and processing metadata when provided by the selected queue implementation.
 
 The raw evidence log is append-only. Query-oriented tables are rebuildable projections, not substitutes for raw evidence.
+
+The durable identity, batch-receipt, raw-event, and artifact-declaration model is
+defined by
+[ADR-0003](decisions/ADR-0003-durable-evidence-persistence.md). Database identity
+is server-owned and remains distinct from canonical collector identifiers.
 
 ### Object storage
 
