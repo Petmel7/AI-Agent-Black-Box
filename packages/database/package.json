@@ -1,0 +1,12 @@
+{
+  "name": "@blackbox/database",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "prisma generate",
+    "typecheck": "prisma validate"
+  },
+  "devDependencies": {
+    "prisma": "7.10.0"
+  }
+}
