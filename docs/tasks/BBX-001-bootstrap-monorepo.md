@@ -1,6 +1,6 @@
 # BBX-001: Bootstrap the TypeScript Monorepo
 
-- **Status:** Approved
+- **Status:** Done
 - **Owner:** Implementation Chat
 - **Review:** Review Chat
 - **Architecture:** [ADR-0001](../architecture/decisions/ADR-0001-modular-monolith.md)

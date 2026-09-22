@@ -2,7 +2,7 @@
 
 **Status:** Initial architecture for v0.1
 
-**Last updated:** 2026-09-21
+**Last updated:** 2026-09-22
 
 ## Architectural Style
 
@@ -10,7 +10,10 @@ AI Agent Black Box starts as a modular monolith in a TypeScript monorepo. It has
 
 This design keeps v0.1 operationally small without coupling telemetry ingestion or background analysis to the Next.js request lifecycle.
 
-The governing decision is [ADR-0001](decisions/ADR-0001-modular-monolith.md).
+The governing decisions are [ADR-0001](decisions/ADR-0001-modular-monolith.md)
+and [ADR-0002](decisions/ADR-0002-canonical-evidence-envelope.md). The canonical
+wire-level evidence semantics are documented in
+[Canonical Evidence Model](evidence-model.md).
 
 ## System Context
 

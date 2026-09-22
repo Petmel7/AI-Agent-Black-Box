@@ -1,6 +1,6 @@
 # BBX-001A: Update GitHub Actions Runtimes
 
-- **Status:** Approved
+- **Status:** Done
 - **Owner:** Implementation Chat
 - **Review:** Review Chat
 - **Parent task:** [BBX-001](./BBX-001-bootstrap-monorepo.md)
