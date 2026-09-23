@@ -38,9 +38,49 @@ A task should produce one reviewable change with one coherent purpose. Split it 
 - Different parts require different reviewers or risk profiles.
 - The expected diff is too large to review confidently.
 
+## Checkout Choice
+
+Use the saved project checkout for sequential implementation, review, and finalization. Use a worktree only when work will proceed in parallel or requires intentional isolation, and record that reason in the handoff. The checkout choice does not change review, authorization, or evidence requirements.
+
+## Risk-Based Validation
+
+Use the `Validation Economy` policy in `AGENTS.md` throughout delivery:
+
+1. **Implementation editing:** run checks affected by the current change.
+2. **Implementation handoff:** run the task-required final local gate once on the final implementation state.
+3. **Independent review:** inspect the complete diff and independently verify affected behavior, implementation claims, and high-risk boundaries. Repeat the full deterministic suite only for the high-risk cases defined in `AGENTS.md` or when another documented reason justifies it.
+4. **Finalization:** do not rerun unchanged successful local checks after review; hosted CI is the full authoritative post-push gate.
+
+Successful evidence applies only to the exact state tested. A later change invalidates only affected evidence. Failures, unexplained warnings, changed relevant diffs, or newly discovered risk require broader validation.
+
+## Compact Handoff Reports
+
+Implementation report:
+
+```text
+Changed files: <paths>
+Validation: <exact command — concise result>
+Acceptance criteria: <met or exceptions>
+Deviations: <none or details>
+Residual risks / excluded follow-up: <none or details>
+Stop: ready for independent review; not committed or finalized
+```
+
+Review report:
+
+```text
+Findings: <No actionable findings. or full actionable findings>
+Validation: <exact command — concise result>
+Acceptance criteria and scope: <met or exceptions>
+Residual risks / validation gaps: <none or details>
+Verdict: <PASS or NEEDS FIXES>
+```
+
+Keep successful command output summarized. Preserve details for findings, failures, deviations, material warnings, and residual risks.
+
 ## Completion Report
 
-Implementation should finish with:
+The compact implementation report must retain:
 
 - Acceptance criteria status.
 - Changed files.

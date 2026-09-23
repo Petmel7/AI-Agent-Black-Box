@@ -94,6 +94,14 @@ Use the versions committed in the lockfile. Do not upgrade dependencies or add p
 - Do not claim a check passed unless it was executed successfully in the current environment.
 - Once the bootstrap task exists, the standard repository checks are `pnpm lint`, `pnpm typecheck`, `pnpm test`, and `pnpm build`.
 
+### Validation Economy
+
+- Scale validation to the changed surface and risk. Run affected checks while editing, then run the task-required final local gate once on the final implementation state.
+- A successful check is evidence only for the exact state it tested. Later changes invalidate only affected evidence, so do not repeat successful checks when the relevant state is unchanged.
+- Review always inspects the complete diff and independently verifies affected behavior, implementation claims, and high-risk boundaries. Repeat the full deterministic suite for migrations, authentication, tenant isolation, evidence integrity, concurrency, dependency or build-system changes, or another documented high-risk reason; otherwise use focused checks.
+- Finalization does not rerun unchanged successful local checks after review. Hosted CI remains the authoritative full post-push gate.
+- Broaden validation for any failure, unexplained warning, changed relevant diff, or high-risk scope. Efficiency never bypasses independent review, explicit authorization, secret protection, destructive-action controls, or evidence requirements.
+
 ## Change Discipline
 
 - Inspect the repository and relevant instructions before editing.

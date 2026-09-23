@@ -1,6 +1,6 @@
 # BBX-003B: Token-Efficient Delivery Workflow
 
-- **Status:** Approved
+- **Status:** Done
 - **Owner:** Implementation Chat
 - **Review:** Review Chat
 - **Architecture:** No ADR required; repository workflow only

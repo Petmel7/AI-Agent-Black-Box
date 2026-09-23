@@ -18,19 +18,23 @@ Implement only an approved specification or an explicitly user-approved fix pass
 
 - Stay within the approved scope and acceptance criteria. Do not silently expand the task or change an accepted ADR.
 - Add or update tests for changed behavior.
-- Run every task-required validation command against the final relevant state. A result is passing evidence only when the command completed successfully on that state.
+- Run checks affected by the files or behavior being changed while implementing. Before handoff, run the task-required final local suite once against the final implementation state.
+- A result is passing evidence only for the exact state on which it completed successfully. If that state changes, rerun only the checks affected by the change; do not repeat successful checks on an unchanged relevant state.
+- Broaden validation when a check fails, a warning is unexplained, the relevant diff changes, or the scope includes a high-risk boundary identified by repository policy.
 - Do not make redundant network requests; reuse existing evidence instead of repeating a network request merely to obtain additional metadata or confirmation. Permit task-required network access only when the network action is within the approved task scope and the user has explicitly authorized it. Do not start unrelated services or tools, including Docker, unless the approved task requires them and the user explicitly authorizes the action.
 - Do not commit, push, mark the task `Done`, or begin finalization during the implementation phase.
 
 ## Report and hand off
 
-Write the implementation report in English. Include:
+Write a compact implementation report in English. Include:
 
 - changed files;
 - exact commands and results;
 - acceptance-criteria status;
 - deviations from the specification;
 - residual risks and explicitly excluded follow-up work.
+
+For successful commands, report the exact command and concise result without routine output. Expand output only for failures or material warnings.
 
 Stop after implementation and validation so an independent reviewer can inspect the unchanged worktree.
 

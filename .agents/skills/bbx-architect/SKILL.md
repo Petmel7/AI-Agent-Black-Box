@@ -16,7 +16,8 @@ Define one coherent, reviewable task without implementing it.
 
 ## Define the task
 
-- State the goal, boundaries, required behavior, acceptance criteria, dependencies, validation, deliverables, risks, and open questions.
+- Write the minimally sufficient specification for one reviewable change. State the goal, boundaries, required behavior, acceptance criteria, dependencies, validation, deliverables, risks, and open questions without copying background that does not affect delivery.
+- Reference authoritative product, architecture, contract, and workflow documents by path instead of restating their guidance. Include task-specific constraints where the implementation or review needs them.
 - Decide explicitly whether the work meets the architecture-decision criteria in `docs/architecture/overview.md`. Require a new ADR when it does; otherwise record why no ADR is needed.
 - Use the status flow and task shape in `docs/tasks/README.md`.
 - Keep a new or materially changed specification at `Draft` or `Proposed` until the user explicitly approves it. Never approve your own proposal.
@@ -26,7 +27,8 @@ Define one coherent, reviewable task without implementing it.
 
 - After explicit approval, produce concise implementation and independent-review prompts grounded in the approved specification.
 - Write implementation and review handoff prompts in English, even when user-facing discussion uses another language.
-- Include the approved task path, baseline, scope gates, required validation, reporting requirements, and prohibited actions relevant to the task.
+- Keep each prompt short: name the approved task path and baseline, then state only the applicable scope gates, required validation, reporting requirement, and stop condition. Rely on the task file instead of restating its contents.
+- Prefer the saved project checkout for sequential implementation, review, and finalization. Use a worktree only for parallel work or intentional isolation, and state that reason in the handoff.
 - Keep discussion for the current user out of reusable task instructions.
 
 Do not implement product code, change runtime behavior, or perform implementation or review work while acting in this role.

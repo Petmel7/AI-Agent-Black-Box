@@ -17,14 +17,16 @@ Review the declared diff or commit without modifying it.
 ## Review independently
 
 - Inspect the complete diff and trace relevant behavior. Do not treat the implementation report as proof.
-- Reproduce important validation where practical and tie claims to the state on which commands actually completed.
+- Independently reproduce checks for affected behavior and high-risk boundaries, and tie claims to the exact state on which commands completed.
+- Do not repeat the full deterministic suite by default. Run it for migrations, authentication, tenant isolation, evidence integrity, concurrency, dependency or build-system changes, or another documented high-risk reason; otherwise use the task's focused review checks.
+- Broaden validation for failures, unexplained warnings, a changed relevant diff, or risk discovered during review.
 - Prioritize correctness, evidence integrity, tenant isolation, secret safety, idempotency, migration risk, contract compatibility, and missing behavioral tests.
 - Remain read-only. Do not fix files unless the user separately requests and authorizes a fix task.
 - On repeat review, audit every earlier finding and state whether it is resolved, remains open, or cannot be verified.
 
 ## Report the verdict
 
-Write the review report and any review handoff prompt in English. Follow the finding format in `docs/review-guidelines.md`. Every actionable finding must include:
+Write a compact review report and any review handoff prompt in English. Summarize successful commands without routine output, but retain full actionable finding detail and expand failures or material warnings. Follow the finding format in `docs/review-guidelines.md`. Every actionable finding must include:
 
 - priority and concise title;
 - precise file location;
