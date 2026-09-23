@@ -41,6 +41,9 @@ importers:
       '@blackbox/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@blackbox/database':
+        specifier: workspace:*
+        version: link:../../packages/database
       fastify:
         specifier: 5.12.5
         version: 5.12.5
@@ -168,6 +171,9 @@ importers:
 
   packages/database:
     dependencies:
+      '@blackbox/contracts':
+        specifier: workspace:*
+        version: link:../contracts
       '@prisma/adapter-pg':
         specifier: 7.10.0
         version: 7.10.0

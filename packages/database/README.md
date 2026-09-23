@@ -9,7 +9,8 @@ version 1 evidence foundation and PostgreSQL-owned integrity guards.
 - `DATABASE_URL` is reserved for later deployed application composition.
 - `DIRECT_URL` is reserved for later deployed migration composition.
 - `TEST_DATABASE_URL` is the only variable accepted by the checked-in database
-  migration and integration helpers.
+  migration and integration helpers. The ingestion process receives its
+  explicit `DATABASE_URL` only at its composition root.
 
 The helpers do not fall back to another variable or PostgreSQL driver defaults.
 They reject an empty URL and require the isolated database name `blackbox_test`
@@ -18,6 +19,11 @@ generation and schema validation do not connect.
 Importing `@blackbox/database` does not construct a client or read a connection
 variable. Callers must pass either a connection string or a created adapter to
 `createDatabaseClient` and call the returned `dispose()` method.
+
+The BBX-004 migration adds mutable processing-intent records. The ingestion
+transaction commits exactly one pending `evidence_batch.accepted` intent with
+each new batch. A later relay may update delivery metadata; it must not mutate
+raw evidence. No queue connection is made by this package.
 
 ## Prisma commands
 

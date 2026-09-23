@@ -5,3 +5,11 @@ export {
   type DatabaseClientHandle,
   type DatabaseClientOptions,
 } from './client.js';
+export {
+  EvidenceConflictError,
+  ingestEvidenceBatch,
+  RepositoryNotFoundError,
+  type IngestEvidenceBatchInput,
+  type IngestEvidenceBatchResult,
+  type IngestionFailureHooks,
+} from './ingestion.js';

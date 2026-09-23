@@ -1,4 +1,5 @@
 export * from './artifact.js';
+export * from './artifact-references.js';
 export * from './batch.js';
 export * from './content.js';
 export * from './events.js';

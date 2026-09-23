@@ -1,6 +1,6 @@
 # BBX-004: Idempotent Ingestion API
 
-- **Status:** Approved
+- **Status:** Done
 - **Owner:** Implementation Chat
 - **Review:** Review Chat
 - **Architecture:** ADR-0001, ADR-0002, ADR-0003, and proposed ADR-0004

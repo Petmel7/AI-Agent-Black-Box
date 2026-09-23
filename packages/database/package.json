@@ -21,9 +21,10 @@
     "lint": "eslint .",
     "test": "node ./scripts/run-integration-if-configured.mjs",
     "test:integration": "node ./scripts/require-test-database-url.mjs && vitest run --config vitest.integration.config.ts",
-    "typecheck": "pnpm run db:generate && tsc --noEmit"
+    "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@blackbox/contracts": "workspace:*",
     "@prisma/adapter-pg": "7.10.0",
     "@prisma/client": "7.10.0",
     "pg": "8.16.3"

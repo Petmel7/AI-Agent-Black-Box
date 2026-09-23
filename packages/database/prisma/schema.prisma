@@ -17,6 +17,7 @@ model Organization {
   memberships  EvidenceBatchEvent[]
   artifacts    ArtifactDeclaration[]
   references   EvidenceEventArtifact[]
+  processingIntents ProcessingIntent[]
 
   @@map("organizations")
 }
@@ -45,6 +46,7 @@ model Run {
   memberships    EvidenceBatchEvent[]
   artifacts      ArtifactDeclaration[]
   references     EvidenceEventArtifact[]
+  processingIntents ProcessingIntent[]
 
   @@unique([organizationId, canonicalRunId], map: "runs_org_canonical_run_id_key")
   @@unique([organizationId, id], map: "runs_org_id_key")
@@ -63,6 +65,7 @@ model EvidenceBatch {
   organization     Organization         @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "batches_organization_id_fkey")
   run              Run                  @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "batches_org_run_fkey")
   memberships      EvidenceBatchEvent[]
+  processingIntents ProcessingIntent[]
 
   @@unique([organizationId, canonicalBatchId], map: "batches_org_canonical_batch_id_key")
   @@unique([organizationId, runId, id], map: "batches_org_run_id_key")
@@ -150,4 +153,37 @@ model EvidenceEventArtifact {
 
   @@unique([eventId, jsonPointer], map: "event_artifacts_event_pointer_key")
   @@map("evidence_event_artifacts")
+}
+
+enum ProcessingIntentKind {
+  EVIDENCE_BATCH_ACCEPTED @map("evidence_batch.accepted")
+}
+
+enum ProcessingIntentState {
+  PENDING   @map("pending")
+  LEASED    @map("leased")
+  DELIVERED @map("delivered")
+}
+
+model ProcessingIntent {
+  id             String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String                @map("organization_id") @db.Uuid
+  runId          String                @map("run_id") @db.Uuid
+  batchId        String                @map("batch_id") @db.Uuid
+  kind           ProcessingIntentKind
+  state          ProcessingIntentState @default(PENDING)
+  createdAt      DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
+  availableAt    DateTime              @default(now()) @map("available_at") @db.Timestamptz(3)
+  attemptCount   Int                   @default(0) @map("attempt_count")
+  lastAttemptAt  DateTime?             @map("last_attempt_at") @db.Timestamptz(3)
+  leaseExpiresAt DateTime?             @map("lease_expires_at") @db.Timestamptz(3)
+  deliveredAt    DateTime?             @map("delivered_at") @db.Timestamptz(3)
+  lastErrorCode  String?               @map("last_error_code")
+  organization   Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "processing_intents_organization_id_fkey")
+  run            Run                   @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "processing_intents_org_run_fkey")
+  batch          EvidenceBatch         @relation(fields: [organizationId, runId, batchId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "processing_intents_org_run_batch_fkey")
+
+  @@unique([batchId, kind], map: "processing_intents_batch_kind_key")
+  @@index([state, availableAt], map: "processing_intents_state_available_idx")
+  @@map("processing_intents")
 }
