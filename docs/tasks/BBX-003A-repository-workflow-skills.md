@@ -1,6 +1,6 @@
 # BBX-003A: Repository Workflow Skills
 
-- **Status:** Approved
+- **Status:** Done
 - **Owner:** Implementation Chat
 - **Review:** Review Chat
 - **Architecture:** No new ADR required; this task changes repository-local development workflow only

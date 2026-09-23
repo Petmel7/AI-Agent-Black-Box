@@ -48,3 +48,21 @@ Implementation should finish with:
 - Deviations from the specification.
 - Residual risks.
 - Follow-up work explicitly excluded from the current task.
+
+## Repository Workflow Skills
+
+Three repository-scoped Codex Skills support the recurring task workflow:
+
+- `$bbx-architect` defines or refines scope, architecture decisions, acceptance criteria, dependency order, and English implementation and review handoffs. It does not implement or approve its own proposal.
+- `$bbx-implement` implements an `Approved` task or an explicitly approved review fix pass, validates the final relevant state, and reports evidence in English. It does not independently review or finalize without the required gates.
+- `$bbx-review` independently reviews a declared diff or commit without editing and ends with `PASS` or `NEEDS FIXES`.
+
+Invoke a Skill explicitly in a prompt, for example:
+
+```text
+$bbx-architect define the scope and acceptance criteria for the next task.
+$bbx-implement implement the Approved task in docs/tasks/<task>.md.
+$bbx-review independently review the current diff against docs/tasks/<task>.md.
+```
+
+These Skills describe workflow roles; they are not new sources of product truth. `AGENTS.md`, the current approved task, and accepted ADRs remain authoritative under the repository's documented source-of-truth hierarchy.
