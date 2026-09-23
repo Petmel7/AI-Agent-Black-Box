@@ -62,7 +62,13 @@ Then deploy from an empty database, verify migration state, and run the suite:
 pnpm --filter @blackbox/database db:migrate:deploy
 pnpm --filter @blackbox/database db:migrate:verify
 pnpm --filter @blackbox/database test:integration
+pnpm --filter @blackbox/ingest test
 ```
+
+This direct sequence works from a clean checkout after `db:generate`; the test
+runners resolve workspace package names to their public source entrypoints and
+do not depend on stale `dist` output. Production and build consumers continue
+to use each package's default compiled export.
 
 Stop the ephemeral service and remove its anonymous data volume:
 

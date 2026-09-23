@@ -6,14 +6,11 @@ export default defineConfig({
   resolve: {
     alias: {
       '@blackbox/contracts': fileURLToPath(
-        new URL('../contracts/src/index.ts', import.meta.url),
+        new URL('../../packages/contracts/src/index.ts', import.meta.url),
+      ),
+      '@blackbox/database': fileURLToPath(
+        new URL('../../packages/database/src/index.ts', import.meta.url),
       ),
     },
-  },
-  test: {
-    include: ['tests/integration/**/*.test.ts'],
-    testTimeout: 15_000,
-    hookTimeout: 15_000,
-    fileParallelism: false,
   },
 });
