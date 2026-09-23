@@ -14,7 +14,7 @@ The current product phase is v0.1, Evidence Recorder. Codex is the only supporte
 - Task specifications: `docs/tasks/`
 - Review criteria: `docs/review-guidelines.md`
 
-Before implementing a task, read this file, the task specification, and only the architecture documents referenced by that task. A task is ready for implementation only when its `Status` is `Approved`.
+Before implementing a task, read this file, the task specification, and only the architecture documents referenced by that task. A task is ready for implementation only when its `Status` is `Approved`, the unchanged approved specification is tracked in `HEAD`, and the implementation baseline is that commit. An uncommitted approval or specification change is not a valid implementation baseline.
 
 If documents conflict, use this precedence order:
 
@@ -99,7 +99,7 @@ Use the versions committed in the lockfile. Do not upgrade dependencies or add p
 - Scale validation to the changed surface and risk. Run affected checks while editing, then run the task-required final local gate once on the final implementation state.
 - A successful check is evidence only for the exact state it tested. Later changes invalidate only affected evidence, so do not repeat successful checks when the relevant state is unchanged.
 - Review always inspects the complete diff and independently verifies affected behavior, implementation claims, and high-risk boundaries. Repeat the full deterministic suite for migrations, authentication, tenant isolation, evidence integrity, concurrency, dependency or build-system changes, or another documented high-risk reason; otherwise use focused checks.
-- Finalization does not rerun unchanged successful local checks after review. Hosted CI remains the authoritative full post-push gate.
+- Finalization does not rerun unchanged successful local checks after review. Hosted CI remains the authoritative full post-push gate. User-reported hosted-CI results are valid user-provided evidence, but must be labeled as such and must not be presented as independently observed by an agent.
 - Broaden validation for any failure, unexplained warning, changed relevant diff, or high-risk scope. Efficiency never bypasses independent review, explicit authorization, secret protection, destructive-action controls, or evidence requirements.
 
 ## Change Discipline
@@ -111,6 +111,8 @@ Use the versions committed in the lockfile. Do not upgrade dependencies or add p
 - If implementation reveals a missing architecture decision, document the decision request instead of silently choosing a new direction.
 - Update documentation in the same change when a public contract, architecture boundary, or development command changes.
 - Do not commit generated output, credentials, local databases, coverage output, or build artifacts.
+- Commit, push, and hosted-CI inspection are user-managed by default. Agents stop after the applicable approval, implementation, review, or mechanical task-status step and provide the compact manual handoff defined in `docs/tasks/README.md`.
+- Agent-executed Git or network finalization is allowed only when the approved task defines a task-specific exception and the user explicitly authorizes that execution. Existing review, clean-diff, secret, destructive-action, evidence, and task-status gates still apply.
 
 ## Definition of Done
 

@@ -25,10 +25,14 @@ Define one coherent, reviewable task without implementing it.
 
 ## Produce the handoff
 
-- After explicit approval, produce concise implementation and independent-review prompts grounded in the approved specification.
+- After explicit approval, stop before implementation until the unchanged `Approved` task is committed and is contained in `HEAD`. An uncommitted approval or specification edit is not a valid baseline.
+- Provide the compact approved-specification baseline handoff from `docs/tasks/README.md`: expected baseline, exact task pathspecs, proposed commit message, status, explicit staging, staged-diff, commit, and push commands, plus the hosted-CI checklist. Never recommend `git add .` or another broad staging command.
+- Treat push and CI outcomes reported by the user as user-provided evidence and label them accordingly. Do not claim agent-observed CI metadata unless the agent actually inspected it.
+- Once the user reports the committed baseline, produce concise implementation and independent-review prompts grounded in the approved specification and name the reported baseline commit.
 - Write implementation and review handoff prompts in English, even when user-facing discussion uses another language.
 - Keep each prompt short: name the approved task path and baseline, then state only the applicable scope gates, required validation, reporting requirement, and stop condition. Rely on the task file instead of restating its contents.
 - Prefer the saved project checkout for sequential implementation, review, and finalization. Use a worktree only for parallel work or intentional isolation, and state that reason in the handoff.
 - Keep discussion for the current user out of reusable task instructions.
+- Do not execute commit, push, or network finalization. Such execution requires both a task-specific exception and explicit user authorization.
 
 Do not implement product code, change runtime behavior, or perform implementation or review work while acting in this role.

@@ -36,4 +36,8 @@ Write a compact review report and any review handoff prompt in English. Summariz
 
 Separate actionable findings from residual risks and validation gaps. If there are no actionable findings, state `No actionable findings.` explicitly. End with exactly one verdict: `PASS` or `NEEDS FIXES`.
 
+After `PASS`, provide the compact manual finalization handoff from `docs/tasks/README.md`. Identify the reviewed baseline or commit, exact reviewed pathspecs (including the task path reserved for the later mechanical `Done` change), proposed commit message, status, explicit staging, staged-diff, commit, and push commands, and the hosted-CI checklist. Never recommend `git add .` or another broad staging command. State that finalization still requires explicit user authorization and that the agent must prepare the mechanical `Done` status change before the user runs the commands.
+
+Treat push and CI outcomes reported by the user as user-provided evidence and label them accordingly. Do not claim agent-observed CI metadata unless the agent actually inspected it. Commit, push, and hosted-CI inspection remain user-managed by default; agent execution requires an approved task-specific exception plus explicit user authorization.
+
 Never commit, push, change task status, or modify reviewed files.

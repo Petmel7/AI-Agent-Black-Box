@@ -1,6 +1,6 @@
 # BBX-003C: User-Managed Git Finalization
 
-- **Status:** Approved
+- **Status:** Done
 - **Owner:** Implementation Chat
 - **Review:** Review Chat
 - **Architecture:** No ADR required; this changes repository workflow only and does not alter a product, trust, process-runtime, or data boundary.
