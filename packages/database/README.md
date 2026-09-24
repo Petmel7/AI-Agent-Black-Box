@@ -25,6 +25,12 @@ transaction commits exactly one pending `evidence_batch.accepted` intent with
 each new batch. A later relay may update delivery metadata; it must not mutate
 raw evidence. No queue connection is made by this package.
 
+The BBX-005 migration adds mutable artifact-upload attempts, bounded verification
+leases, terminal integrity observations, partial uniqueness for active and
+verified attempts, and migration-owned legal-transition guards. These rows are
+operational state; they never update or delete append-only artifact declarations
+or raw references.
+
 ## Prisma commands
 
 From the repository root:

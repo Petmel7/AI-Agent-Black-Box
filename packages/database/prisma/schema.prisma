@@ -18,6 +18,7 @@ model Organization {
   artifacts    ArtifactDeclaration[]
   references   EvidenceEventArtifact[]
   processingIntents ProcessingIntent[]
+  artifactUploadAttempts ArtifactUploadAttempt[]
 
   @@map("organizations")
 }
@@ -47,6 +48,7 @@ model Run {
   artifacts      ArtifactDeclaration[]
   references     EvidenceEventArtifact[]
   processingIntents ProcessingIntent[]
+  artifactUploadAttempts ArtifactUploadAttempt[]
 
   @@unique([organizationId, canonicalRunId], map: "runs_org_canonical_run_id_key")
   @@unique([organizationId, id], map: "runs_org_id_key")
@@ -132,11 +134,45 @@ model ArtifactDeclaration {
   organization        Organization            @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "artifacts_organization_id_fkey")
   run                 Run                     @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "artifacts_org_run_fkey")
   eventLinks          EvidenceEventArtifact[]
+  uploadAttempts      ArtifactUploadAttempt[]
 
   @@unique([organizationId, canonicalArtifactId], map: "artifacts_org_canonical_artifact_id_key")
   @@unique([organizationId, runId, id], map: "artifacts_org_run_id_key")
   @@index([organizationId, runId, kind], map: "artifacts_org_run_kind_idx")
   @@map("artifact_declarations")
+}
+
+enum ArtifactUploadState {
+  ISSUED    @map("issued")
+  VERIFYING @map("verifying")
+  VERIFIED  @map("verified")
+  REJECTED  @map("rejected")
+  EXPIRED   @map("expired")
+}
+
+model ArtifactUploadAttempt {
+  id                    String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId        String              @map("organization_id") @db.Uuid
+  runId                 String              @map("run_id") @db.Uuid
+  artifactDeclarationId String              @map("artifact_declaration_id") @db.Uuid
+  objectKey             String              @unique(map: "artifact_upload_attempts_object_key_key") @map("object_key")
+  state                 ArtifactUploadState @default(ISSUED)
+  issuedAt              DateTime            @default(now()) @map("issued_at") @db.Timestamptz(3)
+  expiresAt             DateTime            @map("expires_at") @db.Timestamptz(3)
+  verificationLeaseId   String?             @map("verification_lease_id") @db.Uuid
+  leaseExpiresAt        DateTime?           @map("lease_expires_at") @db.Timestamptz(3)
+  observedByteLength    BigInt?             @map("observed_byte_length")
+  observedSha256        String?             @map("observed_sha256")
+  verifiedAt            DateTime?           @map("verified_at") @db.Timestamptz(3)
+  rejectedAt            DateTime?           @map("rejected_at") @db.Timestamptz(3)
+  expiredAt             DateTime?           @map("expired_at") @db.Timestamptz(3)
+  lastErrorCode         String?             @map("last_error_code")
+  organization          Organization        @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "artifact_upload_attempts_organization_id_fkey")
+  run                   Run                 @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "artifact_upload_attempts_org_run_fkey")
+  artifactDeclaration   ArtifactDeclaration @relation(fields: [organizationId, runId, artifactDeclarationId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "artifact_upload_attempts_org_run_artifact_fkey")
+
+  @@index([organizationId, artifactDeclarationId, state], map: "artifact_upload_attempts_artifact_state_idx")
+  @@map("artifact_upload_attempts")
 }
 
 model EvidenceEventArtifact {

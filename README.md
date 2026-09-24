@@ -1,6 +1,6 @@
 # AI Agent Black Box
 
-AI Agent Black Box is an evidence and quality layer for AI-generated code. The repository contains the monorepo foundation, canonical version 1 evidence contracts, the PostgreSQL evidence-persistence foundation, and the authenticated idempotent ingestion write path. Queue relay and later processing behavior are intentionally not implemented yet.
+AI Agent Black Box is an evidence and quality layer for AI-generated code. The repository contains the monorepo foundation, canonical version 1 evidence contracts, the PostgreSQL evidence-persistence foundation, the authenticated idempotent ingestion write path, and private artifact transport with server-side integrity verification. Queue relay and later processing behavior are intentionally not implemented yet.
 
 ## Prerequisites
 
@@ -86,3 +86,20 @@ The default v0.1 authenticator requires `INGEST_ORGANIZATION_ID` and the
 lowercase SHA-256 token digest in `INGEST_BEARER_TOKEN_SHA256`. `DATABASE_URL`
 is required by the ingestion process for writes. Missing or invalid auth
 configuration fails closed. Do not store or log the raw bearer token.
+
+## Artifact transport
+
+The authenticated artifact API creates upload sessions, completes server-side
+verification, and reports safe storage state:
+
+```text
+POST /v1/repositories/:repositoryId/artifacts/:artifactId/uploads
+POST /v1/repositories/:repositoryId/artifacts/:artifactId/uploads/:uploadId/complete
+GET  /v1/repositories/:repositoryId/artifacts/:artifactId/storage
+```
+
+The upload response contains a short-lived TUS capability but never a bucket,
+object key, service credential, or public URL. Completion accepts identifiers
+only; it does not accept client hashes, lengths, object paths, URLs, or
+verification claims. See `docs/operations/artifact-storage.md` for private
+bucket and runtime configuration.

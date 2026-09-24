@@ -1,6 +1,6 @@
 # BBX-005: Artifact Transport and Storage
 
-- **Status:** Approved
+- **Status:** Done
 - **Owner:** Implementation Chat
 - **Review:** Review Chat
 - **Architecture:** ADR-0001 through ADR-0004, plus proposed ADR-0005
