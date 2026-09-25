@@ -16,6 +16,10 @@ importers:
         version: 2.11.2
 
   apps/cli:
+    dependencies:
+      '@blackbox/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
     devDependencies:
       '@blackbox/config':
         specifier: workspace:*

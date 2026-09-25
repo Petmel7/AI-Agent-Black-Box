@@ -1,6 +1,6 @@
 # BBX-006A: Local Spool and Redaction Foundation
 
-- **Status:** Approved
+- **Status:** Done
 - **Owner:** Implementation Chat
 - **Review:** Review Chat
 - **Architecture:** ADR-0001 through ADR-0005, plus proposed ADR-0006 and ADR-0007

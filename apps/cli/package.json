@@ -15,6 +15,9 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
+  "dependencies": {
+    "@blackbox/contracts": "workspace:*"
+  },
   "devDependencies": {
     "@blackbox/config": "workspace:*",
     "@types/node": "24.13.6",
