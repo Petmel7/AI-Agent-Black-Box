@@ -37,7 +37,7 @@ function allFiles(path: string): string[] {
 }
 
 describe('complete durable-surface sentinel scan', () => {
-  it('keeps secrets and private absolute paths out of SQLite, WAL/SHM, files, batches, diagnostics, status, stdout, and stderr', () => {
+  it('keeps secrets and private absolute paths out of SQLite, WAL/SHM, files, batches, diagnostics, status, stdout, and stderr', async () => {
     const spoolRoot = temporaryRoot();
     const sentinel = ['bbx', randomUUID(), 'sentinel'].join('-');
     const repositoryRoot = join(tmpdir(), `private-repository-${randomUUID()}`);
@@ -117,7 +117,7 @@ describe('complete durable-surface sentinel scan', () => {
     const output: string[] = [];
     const errors: string[] = [];
     expect(
-      runCli(
+      await runCli(
         ['status', '--json', '--run', runId],
         {
           output: (value) => output.push(value),
@@ -189,6 +189,9 @@ describe('complete durable-surface sentinel scan', () => {
       'recoverExpired',
       'releaseArtifact',
       'releaseBatch',
+      'replaceArtifactUpload',
+      'scheduleArtifactRetry',
+      'scheduleBatchRetry',
       'status',
       'supersedeOversizedBatch',
     ]);

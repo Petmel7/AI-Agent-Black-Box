@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 import { Worker } from 'node:worker_threads';
 import { mkdtempSync, rmSync } from 'node:fs';
@@ -50,6 +52,92 @@ const { parentPort, workerData } = require('node:worker_threads');
   spool.close();
 })().catch((error) => parentPort.postMessage({ error: String(error && error.stack || error) }));
 `;
+
+const lockWorkerSource = String.raw`
+const { parentPort, workerData } = require('node:worker_threads');
+const { DatabaseSync } = require('node:sqlite');
+const database = new DatabaseSync(workerData.databasePath, { timeout: 10000 });
+database.exec('BEGIN IMMEDIATE');
+parentPort.postMessage({ locked: true });
+setTimeout(() => {
+  database.exec('COMMIT');
+  database.close();
+  parentPort.postMessage({ released: true });
+}, workerData.holdMs);
+`;
+
+async function holdWriterLock(
+  databasePath: string,
+  holdMs: number,
+): Promise<{ done: Promise<void> }> {
+  const worker = new Worker(lockWorkerSource, {
+    eval: true,
+    workerData: { databasePath, holdMs },
+  });
+  let resolveDone!: () => void;
+  let rejectDone!: (error: Error) => void;
+  const done = new Promise<void>((resolvePromise, reject) => {
+    resolveDone = resolvePromise;
+    rejectDone = reject;
+  });
+  await new Promise<void>((resolvePromise, reject) => {
+    worker.on('error', (error) => {
+      reject(error);
+      rejectDone(error);
+    });
+    worker.on(
+      'message',
+      (message: { locked?: boolean; released?: boolean }) => {
+        if (message.locked) resolvePromise();
+        if (message.released) resolveDone();
+      },
+    );
+  });
+  return { done };
+}
+
+function createBatchWork(spool: LocalSpool, eventCount = 1) {
+  const now = Date.now();
+  const handle = spool.createRun(60_000, now);
+  for (let index = 0; index < eventCount; index += 1)
+    spool.recordRunStarted(handle, {}, now + index + 1);
+  const batch = spool.createBatch(handle.runId, now + eventCount + 1)!;
+  return { batch, handle };
+}
+
+function createArtifactWork(spool: LocalSpool) {
+  const now = Date.now();
+  const handle = spool.createRun(60_000, now);
+  const event = spool.recordCommandFinished(
+    handle,
+    {
+      commandId: randomUUID(),
+      outcome: 'succeeded',
+      stdout: Buffer.from('contention-artifact'),
+    },
+    now + 1,
+  );
+  if (
+    event.kind !== 'command.finished' ||
+    event.payload.stdout.state !== 'captured' ||
+    !event.payload.stdout.artifact
+  )
+    throw new Error('expected artifact');
+  const batch = spool.createBatch(handle.runId, now + 2)!;
+  const batchClaim = spool.claimBatch(1_000, now + 3)!;
+  spool.acknowledgeBatchDelivery(
+    batch.batchId,
+    batchClaim.leaseToken,
+    {
+      outcome: 'accepted',
+      batchId: batch.batchId,
+      runId: handle.runId,
+      receivedAt: timestamp,
+    },
+    now + 4,
+  );
+  return { handle, reference: event.payload.stdout.artifact };
+}
 
 function runWorkers(
   count: number,
@@ -147,4 +235,164 @@ describe('multi-connection SQLite contention', () => {
     }
     expect(reclaimed.size).toBe(8);
   }, 20_000);
+
+  it.each(['batch', 'artifact'] as const)(
+    'bounds %s claim writer-lock waiting and preserves recoverable work',
+    async (kind) => {
+      const root = temporarySpool();
+      using spool = new LocalSpool(
+        validateCollectorConfig({
+          captureClasses: ['stdout'],
+          spoolRoot: root,
+        }),
+      ).open({ busyTimeoutMs: 1_000 });
+      if (kind === 'batch') createBatchWork(spool);
+      else createArtifactWork(spool);
+      const lock = await holdWriterLock(spool.databasePath, 300);
+      const startedAt = Date.now();
+      const claim =
+        kind === 'batch'
+          ? spool.claimBatch(1_000, undefined, undefined, 60)
+          : spool.claimArtifact(1_000, undefined, undefined, 60);
+      const elapsed = Date.now() - startedAt;
+      expect(claim).toBeUndefined();
+      expect(elapsed).toBeLessThan(250);
+      await lock.done;
+      const recovered =
+        kind === 'batch' ? spool.claimBatch() : spool.claimArtifact();
+      expect(recovered).toBeDefined();
+    },
+  );
+
+  it.each([
+    'batch-release',
+    'batch-block',
+    'batch-retry',
+    'batch-supersede',
+    'batch-acknowledge',
+    'artifact-bind',
+    'artifact-replace',
+    'artifact-release',
+    'artifact-block',
+    'artifact-retry',
+    'artifact-acknowledge',
+  ] as const)(
+    'rejects stale ownership for %s after writer-lock contention',
+    async (operation) => {
+      const root = temporarySpool();
+      using spool = new LocalSpool(
+        validateCollectorConfig({
+          captureClasses: ['stdout'],
+          spoolRoot: root,
+        }),
+      ).open({ busyTimeoutMs: 1_000 });
+      const isArtifact = operation.startsWith('artifact-');
+      let id: string;
+      let token: string;
+      let runId: string;
+      let uploadId: string | undefined;
+      let byteLength = 0;
+      let hash = '';
+      if (isArtifact) {
+        const seeded = createArtifactWork(spool);
+        const claim = spool.claimArtifact(1_000)!;
+        id = claim.id;
+        token = claim.leaseToken;
+        runId = seeded.handle.runId;
+        byteLength = claim.declaration.byteLength;
+        hash = claim.declaration.sha256;
+        if (
+          operation === 'artifact-replace' ||
+          operation === 'artifact-acknowledge'
+        ) {
+          uploadId = randomUUID();
+          spool.bindArtifactUpload(id, token, uploadId);
+        }
+      } else {
+        const seeded = createBatchWork(
+          spool,
+          operation === 'batch-supersede' ? 2 : 1,
+        );
+        const claim = spool.claimBatch(1_000)!;
+        id = claim.id;
+        token = claim.leaseToken;
+        runId = seeded.handle.runId;
+      }
+      using database = new DatabaseSync(spool.databasePath);
+      database
+        .prepare(
+          `UPDATE ${isArtifact ? 'artifact_work' : 'batch_work'} SET lease_expires_at_ms=? WHERE ${isArtifact ? 'artifact_id' : 'batch_id'}=?`,
+        )
+        .run(Date.now() + 50, id);
+      const lock = await holdWriterLock(spool.databasePath, 120);
+      const action = () => {
+        switch (operation) {
+          case 'batch-release':
+            return spool.releaseBatch(id, token);
+          case 'batch-block':
+            return spool.blockBatch(id, token, 'validation-rejected');
+          case 'batch-retry':
+            return spool.scheduleBatchRetry(
+              id,
+              token,
+              Date.now() + 10_000,
+              'network-failed',
+            );
+          case 'batch-supersede':
+            return spool.supersedeOversizedBatch(
+              id,
+              token,
+              { batchId: id, code: 'payload_too_large', runId },
+              1,
+            );
+          case 'batch-acknowledge':
+            return spool.acknowledgeBatchDelivery(id, token, {
+              outcome: 'accepted',
+              batchId: id,
+              runId,
+              receivedAt: timestamp,
+            });
+          case 'artifact-bind':
+            return spool.bindArtifactUpload(id, token, randomUUID());
+          case 'artifact-replace':
+            return spool.replaceArtifactUpload(
+              id,
+              token,
+              uploadId!,
+              randomUUID(),
+            );
+          case 'artifact-release':
+            return spool.releaseArtifact(id, token);
+          case 'artifact-block':
+            return spool.blockArtifact(id, token, 'validation-rejected');
+          case 'artifact-retry':
+            return spool.scheduleArtifactRetry(
+              id,
+              token,
+              Date.now() + 10_000,
+              'network-failed',
+            );
+          case 'artifact-acknowledge':
+            return spool.acknowledgeArtifactVerification(id, token, {
+              schemaVersion: 1,
+              outcome: 'verified',
+              artifactId: id,
+              verification: {
+                uploadId: uploadId!,
+                byteLength,
+                sha256: hash,
+                verifiedAt: timestamp,
+              },
+            });
+        }
+      };
+      expect(action).toThrowError(
+        expect.objectContaining({ code: 'lease-lost' }),
+      );
+      await lock.done;
+      const recovered = spool.recoverExpired();
+      expect(isArtifact ? recovered.artifacts : recovered.batches).toBe(1);
+    },
+    20_000,
+  );
 });

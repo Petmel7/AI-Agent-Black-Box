@@ -1,7 +1,15 @@
 import { UuidSchema } from '@blackbox/contracts';
 
-import { collectorConfigFromEnvironment } from './collector/index.js';
+import {
+  CollectorWorkSpool,
+  collectorConfigFromEnvironment,
+} from './collector/index.js';
 import { auditArtifacts } from './collector/artifacts.js';
+import {
+  DeliveryCoordinator,
+  type DeliveryDrainResult,
+} from './collector/coordinator.js';
+import { deliveryConfigFromEnvironment } from './collector/delivery-config.js';
 import { LocalSpool } from './collector/spool.js';
 
 export const CLI_VERSION = '0.1.0';
@@ -10,6 +18,7 @@ const HELP = `AI Agent Black Box collector
 
 Usage: blackbox [options]
        blackbox status [--json] [--run <run-id>]
+       blackbox retry [--json] [--run <run-id>]
 
 Options:
   -h, --help     Show help
@@ -17,6 +26,7 @@ Options:
 
 Commands:
   status         Show content-free local spool health and pending work
+  retry          Perform one bounded delivery drain and exit
 `;
 
 export interface CliIo {
@@ -37,6 +47,7 @@ function renderHumanStatus(
     `Batches: pending=${status.batches.pending} retry-delayed=${status.retryDelayed.batches} leased=${status.batches.leased} delivered=${status.batches.delivered} blocked=${status.batches.blocked} superseded=${status.batches.superseded}`,
     `Artifacts: pending=${status.artifacts.pending} retry-delayed=${status.retryDelayed.artifacts} leased=${status.artifacts.leased} verified=${status.artifacts.verified} blocked=${status.artifacts.blocked}`,
     `Stored bytes: total=${status.bytes.total} events=${status.bytes.events} batches=${status.bytes.batches} artifacts=${status.bytes.artifacts}`,
+    `Unbatched events: ${status.unbatchedEvents}`,
     `Filesystem: missing=${files.missing} corrupt=${files.corrupt} orphan-final=${files.orphanFinal} orphan-temporary=${files.orphanTemporary}`,
     `Next retry: ${status.nextRetryAt ?? 'none'}`,
     `Diagnostics: ${
@@ -52,11 +63,43 @@ function renderHumanStatus(
   ].join('\n');
 }
 
-export function runCli(
+function renderHumanRetry(result: DeliveryDrainResult): string {
+  return [
+    `Delivery: stopped=${result.stopped} attempts=${result.attempts} claimed=${result.claimedItems} prepared=${result.preparedBatches}`,
+    `Batches: delivered=${result.batches.delivered} retried=${result.batches.retried} blocked=${result.batches.blocked} superseded=${result.batches.superseded}`,
+    `Artifacts: verified=${result.artifacts.verified} retried=${result.artifacts.retried} blocked=${result.artifacts.blocked}`,
+    `Remaining: ready-or-delayed=${result.remaining.readyOrDelayed} blocked=${result.remaining.blocked}`,
+    `Safe codes: ${
+      Object.entries(result.safeCodes)
+        .map(([code, count]) => `${code}=${count}`)
+        .join(' ') || 'none'
+    }`,
+  ].join('\n');
+}
+
+function parseScopedArguments(
+  args: readonly string[],
+): { json: boolean; runId?: string } | undefined {
+  let json = false;
+  let runId: string | undefined;
+  for (let index = 1; index < args.length; index += 1) {
+    const argument = args[index];
+    if (argument === '--json' && !json) json = true;
+    else if (argument === '--run' && runId === undefined) {
+      const candidate = args[index + 1];
+      if (!UuidSchema.safeParse(candidate).success) return undefined;
+      runId = candidate;
+      index += 1;
+    } else return undefined;
+  }
+  return { json, ...(runId ? { runId } : {}) };
+}
+
+export async function runCli(
   args: readonly string[],
   io: CliIo,
   runtime: CliRuntime = {},
-): number {
+): Promise<number> {
   if (args.includes('--help') || args.includes('-h') || args.length === 0) {
     io.output(HELP);
     return 0;
@@ -68,30 +111,19 @@ export function runCli(
   }
 
   if (args[0] === 'status') {
-    const supported = new Set(['status', '--json', '--run']);
-    if (
-      args.some(
-        (argument, index) =>
-          index > 0 && !supported.has(argument) && args[index - 1] !== '--run',
-      )
-    ) {
+    const parsed = parseScopedArguments(args);
+    if (!parsed) {
       io.error('Invalid status arguments');
-      return 1;
-    }
-    const runIndex = args.indexOf('--run');
-    const runId = runIndex >= 0 ? args[runIndex + 1] : undefined;
-    if (runIndex >= 0 && !UuidSchema.safeParse(runId).success) {
-      io.error('Invalid run identifier');
       return 1;
     }
     try {
       const env = runtime.env ?? process.env;
       const config = collectorConfigFromEnvironment(env);
       using spool = new LocalSpool(config).open();
-      const status = spool.status(runId);
+      const status = spool.status(parsed.runId);
       const files = auditArtifacts(spool);
       io.output(
-        args.includes('--json')
+        parsed.json
           ? JSON.stringify({ schemaVersion: 1, ...status, filesystem: files })
           : renderHumanStatus(status, files),
       );
@@ -101,6 +133,57 @@ export function runCli(
         error instanceof Error && 'code' in error
           ? `Status unavailable: ${String(error.code)}`
           : 'Status unavailable: collection-failed',
+      );
+      return 1;
+    }
+  }
+
+  if (args[0] === 'retry') {
+    const parsed = parseScopedArguments(args);
+    if (!parsed) {
+      io.error('Invalid retry arguments');
+      return 1;
+    }
+    try {
+      const env = runtime.env ?? process.env;
+      const local = collectorConfigFromEnvironment(env);
+      const remote = deliveryConfigFromEnvironment(env);
+      if (remote.state === 'offline') {
+        const offline = {
+          schemaVersion: 1 as const,
+          state: 'offline' as const,
+        };
+        io.output(
+          parsed.json
+            ? JSON.stringify(offline)
+            : 'Delivery unavailable: offline configuration',
+        );
+        return 2;
+      }
+      using spool = CollectorWorkSpool.open({
+        captureClasses: [...local.captureClasses],
+        inputLimitBytes: local.inputLimitBytes,
+        ...(local.repositoryRoot
+          ? { repositoryRoot: local.repositoryRoot }
+          : {}),
+        spoolQuotaBytes: local.spoolQuotaBytes,
+        spoolRoot: local.spoolRoot,
+      });
+      const result = await new DeliveryCoordinator(spool, remote.config).drain(
+        parsed.runId,
+      );
+      io.output(
+        parsed.json ? JSON.stringify(result) : renderHumanRetry(result),
+      );
+      return result.remaining.blocked === 0 &&
+        result.remaining.readyOrDelayed === 0
+        ? 0
+        : 2;
+    } catch (error) {
+      io.error(
+        error instanceof Error && 'code' in error
+          ? `Retry unavailable: ${String(error.code)}`
+          : 'Retry unavailable: collection-failed',
       );
       return 1;
     }

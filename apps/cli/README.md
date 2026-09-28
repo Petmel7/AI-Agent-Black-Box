@@ -1,8 +1,8 @@
 # Local collector foundation
 
-The BBX-006A collector owns a versioned SQLite spool and adjacent immutable
-artifact files. It works without a backend. Network delivery, TUS, retry policy,
-and wrapped-process behavior are intentionally deferred to BBX-006B.
+The collector owns a versioned SQLite spool and adjacent immutable artifact
+files. It works without a backend. BBX-006B adds explicit bounded HTTP/TUS
+delivery; wrapped-process behavior remains deferred to BBX-006C.
 
 The default spool is below the operating system's per-user application-data
 directory, never the captured repository. Override it with
@@ -64,3 +64,40 @@ blackbox status --run <run-id>
 Status output contains counts, byte totals, safe codes, retry timing, and file
 integrity totals only. It never prints captured content or local artifact paths.
 See `docs/operations/local-spool-recovery.md` for non-destructive recovery.
+
+## Explicit delivery
+
+Set `BLACKBOX_API_BASE_URL`, `BLACKBOX_REPOSITORY_ID`, and
+`BLACKBOX_API_TOKEN` together, then run one finite drain:
+
+```sh
+blackbox retry
+blackbox retry --json
+blackbox retry --run <run-id>
+```
+
+The API base URL must be absolute HTTPS. Plain HTTP is accepted only for
+`localhost`, `127.0.0.1`, or `[::1]`. User information, fragments, query
+strings, redirects, malformed response media, and unbounded responses are
+rejected. The bearer token is sent only to the configured Black Box origin.
+Signed TUS capabilities remain in memory and are sent only as `x-signature` to
+the exact validated storage endpoint; the bearer token is never sent there.
+
+One invocation defaults to at most 20 attempts, 20 distinct claimed items, and
+60 seconds. Connect, inactive-request, and overall request timeouts default to
+5, 30, and 60 seconds. Retry delay starts at one second and is capped at five
+minutes, including `Retry-After`. All limits have positive finite configuration
+bounds through the `BLACKBOX_*` variables documented in `.env.example`.
+Every request for one claimed item shares the remaining drain deadline. Active
+Black Box and TUS requests are cancelled at that deadline, the work lease keeps
+a bounded local-transition margin, and new work is not claimed when too little
+bounded time remains. SQLite claim waiting is capped by that same remaining
+budget (and by the delivery busy timeout), while artifact opening and
+incremental integrity hashing observe the operation cancellation signal before
+any TUS PATCH can start. Lease expiry is evaluated after acquiring the SQLite
+writer transaction for every delivery-state mutation.
+
+Exit `0` means the selected scope has no ready, delayed, leased, or blocked
+delivery work. Exit `2` means remote configuration is offline or retained work
+remains. Exit `1` means arguments, configuration, or the local spool are
+invalid. Output contains aggregate counts and safe codes only.

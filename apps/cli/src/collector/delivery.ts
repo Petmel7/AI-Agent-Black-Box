@@ -1,4 +1,9 @@
-import { UuidSchema, type EvidenceBatch } from '@blackbox/contracts';
+import {
+  UuidSchema,
+  type ArtifactReference,
+  type EvidenceBatch,
+} from '@blackbox/contracts';
+import type { Readable } from 'node:stream';
 
 import { auditArtifacts, type ArtifactAudit } from './artifacts.js';
 import {
@@ -6,9 +11,9 @@ import {
   validateCollectorConfig,
 } from './config.js';
 import {
+  DELIVERY_SQLITE_BUSY_TIMEOUT_MS,
   LocalSpool,
   type StatusSummary,
-  type WorkClaim,
   type WorkErrorCode,
 } from './spool.js';
 
@@ -23,6 +28,29 @@ export interface PrepareBatchesOptions {
 export interface PrepareBatchesResult {
   batchesCreated: number;
   eventsBatched: number;
+}
+
+export interface BatchWorkClaim {
+  attemptCount: number;
+  body: string;
+  id: string;
+  leaseExpiresAt: string;
+  leaseToken: string;
+}
+
+export interface ArtifactWorkClaim {
+  attemptCount: number;
+  declaration: ArtifactReference;
+  id: string;
+  leaseExpiresAt: string;
+  leaseToken: string;
+  readRange(
+    offset: number,
+    length: number,
+    signal?: AbortSignal,
+  ): Promise<Readable>;
+  runId: string;
+  uploadId?: string;
 }
 
 function parsePrepareBatchesOptions(
@@ -78,7 +106,9 @@ export class CollectorWorkSpool implements Disposable {
 
   static open(config: CollectorConfigInput): CollectorWorkSpool {
     return new CollectorWorkSpool(
-      new LocalSpool(validateCollectorConfig(config)).open(),
+      new LocalSpool(validateCollectorConfig(config)).open({
+        busyTimeoutMs: DELIVERY_SQLITE_BUSY_TIMEOUT_MS,
+      }),
     );
   }
 
@@ -109,14 +139,61 @@ export class CollectorWorkSpool implements Disposable {
     return Object.freeze({ batchesCreated, eventsBatched });
   }
 
-  claimBatch(leaseMs?: number): WorkClaim | undefined {
-    const claim = this.#spool.claimBatch(leaseMs);
-    return claim ? { ...claim } : undefined;
+  claimBatch(
+    leaseMs?: number,
+    runId?: string,
+    maximumWaitMs?: number,
+  ): BatchWorkClaim | undefined {
+    const claim = this.#spool.claimBatch(
+      leaseMs,
+      undefined,
+      runId,
+      maximumWaitMs,
+    );
+    if (!claim?.body) return undefined;
+    return Object.freeze({
+      attemptCount: claim.attemptCount,
+      body: claim.body,
+      id: claim.id,
+      leaseExpiresAt: claim.leaseExpiresAt,
+      leaseToken: claim.leaseToken,
+    });
   }
 
-  claimArtifact(leaseMs?: number): WorkClaim | undefined {
-    const claim = this.#spool.claimArtifact(leaseMs);
-    return claim ? { ...claim } : undefined;
+  claimArtifact(
+    leaseMs?: number,
+    runId?: string,
+    maximumWaitMs?: number,
+  ): ArtifactWorkClaim | undefined {
+    const claim = this.#spool.claimArtifact(
+      leaseMs,
+      undefined,
+      runId,
+      maximumWaitMs,
+    );
+    if (!claim) return undefined;
+    const declaration = structuredClone(claim.declaration);
+    Object.freeze(declaration.redaction);
+    Object.freeze(declaration);
+    const result: ArtifactWorkClaim = {
+      attemptCount: claim.attemptCount,
+      declaration,
+      id: claim.id,
+      leaseExpiresAt: claim.leaseExpiresAt,
+      leaseToken: claim.leaseToken,
+      readRange: (offset, length, signal) =>
+        this.#spool.openArtifactRange(
+          claim.id,
+          claim.leaseToken,
+          offset,
+          length,
+          undefined,
+          signal,
+        ),
+      runId: claim.runId,
+      ...(claim.uploadId ? { uploadId: claim.uploadId } : {}),
+    };
+    return Object.freeze(result);
   }
 
   releaseBatch(id: string, token: string, nextAttemptAt?: number): void {
@@ -135,12 +212,44 @@ export class CollectorWorkSpool implements Disposable {
     this.#spool.blockArtifact(id, token, code);
   }
 
+  scheduleBatchRetry(
+    id: string,
+    token: string,
+    nextAttemptAt: number,
+    code: WorkErrorCode,
+  ): void {
+    this.#spool.scheduleBatchRetry(id, token, nextAttemptAt, code);
+  }
+
+  scheduleArtifactRetry(
+    id: string,
+    token: string,
+    nextAttemptAt: number,
+    code: WorkErrorCode,
+  ): void {
+    this.#spool.scheduleArtifactRetry(id, token, nextAttemptAt, code);
+  }
+
   acknowledgeBatchDelivery(id: string, token: string, response: unknown): void {
     this.#spool.acknowledgeBatchDelivery(id, token, response);
   }
 
   bindArtifactUpload(id: string, token: string, uploadId: string): void {
     this.#spool.bindArtifactUpload(id, token, uploadId);
+  }
+
+  replaceArtifactUpload(
+    id: string,
+    token: string,
+    previousUploadId: string,
+    replacementUploadId: string,
+  ): void {
+    this.#spool.replaceArtifactUpload(
+      id,
+      token,
+      previousUploadId,
+      replacementUploadId,
+    );
   }
 
   acknowledgeArtifactVerification(

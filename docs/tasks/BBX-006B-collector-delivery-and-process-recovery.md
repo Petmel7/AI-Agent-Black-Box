@@ -1,6 +1,6 @@
 # BBX-006B: Collector Delivery and Retry
 
-- **Status:** Approved
+- **Status:** Done
 - **Owner:** Implementation Chat
 - **Review:** Review Chat
 - **Depends on:** BBX-006A completed at `5fd400960a2cd4012e0bf5960f40538728fb5d42`

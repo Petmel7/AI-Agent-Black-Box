@@ -9,7 +9,10 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { validateCollectorConfig } from './config.js';
 import { CollectorError } from './errors.js';
 import {
+  DELIVERY_SQLITE_BUSY_TIMEOUT_MS,
+  DELIVERY_TRANSITION_MARGIN_MS,
   LocalSpool,
+  MAX_DELIVERY_OPERATION_BUDGET_MS,
   MAX_RUN_LEASE_MS,
   MAX_WORK_LEASE_MS,
   MIN_RUN_LEASE_MS,
@@ -93,6 +96,17 @@ afterEach(() => {
 });
 
 describe('local SQLite spool', () => {
+  it('keeps delivery lock waiting and transition margin within the maximum work lease', () => {
+    expect(DELIVERY_SQLITE_BUSY_TIMEOUT_MS).toBe(10_000);
+    expect(DELIVERY_TRANSITION_MARGIN_MS).toBe(
+      DELIVERY_SQLITE_BUSY_TIMEOUT_MS + 1_000,
+    );
+    expect(
+      MAX_DELIVERY_OPERATION_BUDGET_MS + DELIVERY_TRANSITION_MARGIN_MS,
+    ).toBe(MAX_WORK_LEASE_MS);
+    expect(MAX_WORK_LEASE_MS).toBe(300_000);
+  });
+
   it('performs no filesystem I/O until explicit open and supports repeated migration/disposal', () => {
     const path = root();
     const spool = new LocalSpool(validateCollectorConfig({ spoolRoot: path }));

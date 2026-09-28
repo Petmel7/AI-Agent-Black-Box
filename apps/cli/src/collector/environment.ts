@@ -52,8 +52,12 @@ export function composeCollectorFromEnvironment(
   collectorCredentials: readonly string[] = [],
 ): CollectorComposition {
   const config = collectorConfigFromEnvironment(env);
+  const credentials = [
+    ...collectorCredentials,
+    ...(env.BLACKBOX_API_TOKEN ? [env.BLACKBOX_API_TOKEN] : []),
+  ];
   const redactorOptions: RedactorOptions = {
-    collectorCredentials,
+    collectorCredentials: credentials,
     environment: env,
     explicitEnvironmentNames: list(env.BLACKBOX_REDACT_ENV_NAMES),
     ...(env.BLACKBOX_REDACT_LITERAL_FILE

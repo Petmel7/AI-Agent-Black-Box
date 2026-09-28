@@ -9,12 +9,16 @@ import {
   renameSync,
   writeFileSync,
 } from 'node:fs';
+import { open as openFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { DatabaseSync, type SQLInputValue } from 'node:sqlite';
+import type { Readable } from 'node:stream';
 
 import {
   ArtifactReferenceSchema,
   ArtifactCompletionResponseSchema,
+  ArtifactStorageStatusResponseSchema,
+  ArtifactUploadSessionResponseSchema,
   EvidenceBatchSchema,
   EvidenceBatchIngestionResponseSchema,
   EvidenceEventSchema,
@@ -42,6 +46,15 @@ export const MIN_RUN_LEASE_MS = 1_000;
 export const MAX_RUN_LEASE_MS = 10 * 60_000;
 export const MIN_WORK_LEASE_MS = 1_000;
 export const MAX_WORK_LEASE_MS = 5 * 60_000;
+export const DELIVERY_SQLITE_BUSY_TIMEOUT_MS = 10_000;
+export const DELIVERY_TRANSITION_MARGIN_MS =
+  DELIVERY_SQLITE_BUSY_TIMEOUT_MS + 1_000;
+export const MIN_DELIVERY_OPERATION_BUDGET_MS = Math.min(
+  100,
+  DELIVERY_SQLITE_BUSY_TIMEOUT_MS,
+);
+export const MAX_DELIVERY_OPERATION_BUDGET_MS =
+  MAX_WORK_LEASE_MS - DELIVERY_TRANSITION_MARGIN_MS;
 export const MAX_SERIALIZED_BATCH_BYTES = 1_000_000;
 
 type RunState = 'active' | 'closed' | 'interrupted';
@@ -92,6 +105,12 @@ export interface WorkClaim {
   relativePath?: string;
 }
 
+export interface ArtifactWorkClaimData extends WorkClaim {
+  declaration: ArtifactReference;
+  runId: string;
+  uploadId?: string;
+}
+
 export interface StatusSummary {
   artifacts: Record<'blocked' | 'leased' | 'pending' | 'verified', number>;
   batches: Record<
@@ -103,6 +122,7 @@ export interface StatusSummary {
   nextRetryAt: string | null;
   retryDelayed: { artifacts: number; batches: number };
   runs: Record<RunState, number>;
+  unbatchedEvents: number;
   workErrorCodes: Record<string, number>;
 }
 
@@ -115,6 +135,8 @@ export interface SpoolHooks {
   afterArtifactRename?(): void;
   afterArtifactWrite?(): void;
   beforeReplacementBatchInsert?(index: number): void;
+  beforeArtifactOpen?(): Promise<void> | void;
+  afterArtifactHashChunk?(): Promise<void> | void;
 }
 
 export interface EventIdentity {
@@ -203,6 +225,18 @@ function iso(milliseconds = Date.now()): string {
   return new Date(milliseconds).toISOString();
 }
 
+function assertRetryTimestamp(value: number, now: number): void {
+  if (
+    !Number.isSafeInteger(value) ||
+    !Number.isSafeInteger(now) ||
+    value <= now
+  )
+    throw new CollectorError(
+      'invalid-config',
+      'retry timestamp is outside its safe bounds',
+    );
+}
+
 function assertLeaseDuration(
   value: number,
   minimum: number,
@@ -224,6 +258,52 @@ function assertLeaseDuration(
 
 function sha256(bytes: Uint8Array): string {
   return createHash('sha256').update(bytes).digest('hex');
+}
+
+function isSqliteBusy(error: unknown): boolean {
+  return (
+    error !== null &&
+    typeof error === 'object' &&
+    'code' in error &&
+    typeof error.code === 'string' &&
+    error.code.startsWith('ERR_SQLITE_ERROR') &&
+    'message' in error &&
+    typeof error.message === 'string' &&
+    error.message.includes('database is locked')
+  );
+}
+
+async function waitWithAbort<T>(
+  value: Promise<T> | T,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (!signal) return value;
+  if (signal.aborted)
+    throw new CollectorError(
+      'lease-lost',
+      'artifact range preparation was cancelled',
+    );
+  return new Promise<T>((resolve, reject) => {
+    const aborted = () => {
+      reject(
+        new CollectorError(
+          'lease-lost',
+          'artifact range preparation was cancelled',
+        ),
+      );
+    };
+    signal.addEventListener('abort', aborted, { once: true });
+    Promise.resolve(value).then(
+      (result) => {
+        signal.removeEventListener('abort', aborted);
+        resolve(result);
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', aborted);
+        reject(error);
+      },
+    );
+  });
 }
 
 function syncDirectory(path: string): void {
@@ -454,6 +534,7 @@ function countRecord<T extends string>(
 export class LocalSpool implements Disposable {
   readonly config: CollectorConfig;
   #database: DatabaseSync | undefined;
+  #busyTimeoutMs = DEFAULT_BUSY_TIMEOUT_MS;
   readonly #redactor: Redactor;
 
   constructor(
@@ -475,10 +556,17 @@ export class LocalSpool implements Disposable {
   open(options: OpenSpoolOptions = {}): this {
     if (this.#database) return this;
     mkdirSync(this.artifactDirectory, { recursive: true, mode: 0o700 });
+    const busyTimeoutMs = options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS;
+    if (!Number.isSafeInteger(busyTimeoutMs) || busyTimeoutMs < 1)
+      throw new CollectorError(
+        'invalid-config',
+        'SQLite busy timeout is outside its safe bounds',
+      );
     const database = new DatabaseSync(this.databasePath, {
-      timeout: options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS,
+      timeout: busyTimeoutMs,
     });
     this.#database = database;
+    this.#busyTimeoutMs = busyTimeoutMs;
     try {
       try {
         chmodSync(this.databasePath, 0o600);
@@ -486,9 +574,7 @@ export class LocalSpool implements Disposable {
         if (process.platform !== 'win32') throw error;
       }
       database.exec('PRAGMA foreign_keys = ON');
-      database.exec(
-        `PRAGMA busy_timeout = ${options.busyTimeoutMs ?? DEFAULT_BUSY_TIMEOUT_MS}`,
-      );
+      database.exec(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
       const journal = database.prepare('PRAGMA journal_mode = WAL').get() as {
         journal_mode: string;
       };
@@ -578,20 +664,41 @@ export class LocalSpool implements Disposable {
     }
   }
 
-  #immediate<T>(operation: () => T): T {
+  #immediate<T>(operation: () => T, maximumWaitMs?: number): T {
     const database = this.#db();
-    database.exec('BEGIN IMMEDIATE');
+    if (
+      maximumWaitMs !== undefined &&
+      (!Number.isSafeInteger(maximumWaitMs) || maximumWaitMs < 1)
+    )
+      throw new CollectorError(
+        'invalid-config',
+        'SQLite wait budget is outside its safe bounds',
+      );
+    const effectiveWait =
+      maximumWaitMs === undefined
+        ? this.#busyTimeoutMs
+        : Math.min(this.#busyTimeoutMs, maximumWaitMs);
+    if (effectiveWait !== this.#busyTimeoutMs)
+      database.exec(`PRAGMA busy_timeout = ${effectiveWait}`);
+    let began = false;
     try {
+      database.exec('BEGIN IMMEDIATE');
+      began = true;
       const result = operation();
       database.exec('COMMIT');
+      began = false;
       return result;
     } catch (cause) {
-      try {
-        database.exec('ROLLBACK');
-      } catch {
-        /* Preserve the original failure. */
-      }
+      if (began)
+        try {
+          database.exec('ROLLBACK');
+        } catch {
+          /* Preserve the original failure. */
+        }
       throw cause;
+    } finally {
+      if (effectiveWait !== this.#busyTimeoutMs)
+        database.exec(`PRAGMA busy_timeout = ${this.#busyTimeoutMs}`);
     }
   }
 
@@ -1173,94 +1280,269 @@ export class LocalSpool implements Disposable {
 
   claimBatch(
     leaseMs = DEFAULT_LEASE_MS,
-    now = Date.now(),
+    now?: number,
+    runId?: string,
+    maximumWaitMs?: number,
   ): WorkClaim | undefined {
-    assertLeaseDuration(leaseMs, MIN_WORK_LEASE_MS, MAX_WORK_LEASE_MS, now);
-    return this.#claim('batch', leaseMs, now);
+    assertLeaseDuration(
+      leaseMs,
+      MIN_WORK_LEASE_MS,
+      MAX_WORK_LEASE_MS,
+      now ?? Date.now(),
+    );
+    if (runId !== undefined) UuidSchema.parse(runId);
+    return this.#claim('batch', leaseMs, now, runId, maximumWaitMs);
   }
 
   claimArtifact(
     leaseMs = DEFAULT_LEASE_MS,
-    now = Date.now(),
-  ): WorkClaim | undefined {
-    assertLeaseDuration(leaseMs, MIN_WORK_LEASE_MS, MAX_WORK_LEASE_MS, now);
-    return this.#claim('artifact', leaseMs, now);
+    now?: number,
+    runId?: string,
+    maximumWaitMs?: number,
+  ): ArtifactWorkClaimData | undefined {
+    assertLeaseDuration(
+      leaseMs,
+      MIN_WORK_LEASE_MS,
+      MAX_WORK_LEASE_MS,
+      now ?? Date.now(),
+    );
+    if (runId !== undefined) UuidSchema.parse(runId);
+    return this.#claim('artifact', leaseMs, now, runId, maximumWaitMs) as
+      ArtifactWorkClaimData | undefined;
   }
 
   #claim(
     kind: 'artifact' | 'batch',
     leaseMs: number,
-    now: number,
+    now?: number,
+    runId?: string,
+    maximumWaitMs?: number,
   ): WorkClaim | undefined {
-    return this.#immediate(() => {
-      const table = kind === 'batch' ? 'batch_work' : 'artifact_work';
-      const idColumn = `${kind}_id`;
-      const orderJoin =
-        kind === 'batch'
-          ? 'JOIN batches c ON c.batch_id=w.batch_id'
-          : 'JOIN artifacts c ON c.artifact_id=w.artifact_id';
-      const order =
-        kind === 'batch' ? 'c.first_sequence,c.created_at' : 'c.created_at';
-      const row = this.#db()
-        .prepare(
-          `SELECT w.${idColumn} AS id FROM ${table} w ${orderJoin}
+    try {
+      return this.#immediate(() => {
+        const checkedAt = now ?? Date.now();
+        assertLeaseDuration(
+          leaseMs,
+          MIN_WORK_LEASE_MS,
+          MAX_WORK_LEASE_MS,
+          checkedAt,
+        );
+        const table = kind === 'batch' ? 'batch_work' : 'artifact_work';
+        const idColumn = `${kind}_id`;
+        const orderJoin =
+          kind === 'batch'
+            ? 'JOIN batches c ON c.batch_id=w.batch_id'
+            : 'JOIN artifacts c ON c.artifact_id=w.artifact_id';
+        const order =
+          kind === 'batch' ? 'c.first_sequence,c.created_at' : 'c.created_at';
+        const row = this.#db()
+          .prepare(
+            `SELECT w.${idColumn} AS id FROM ${table} w ${orderJoin}
         WHERE w.state='pending' AND (w.next_attempt_at_ms IS NULL OR w.next_attempt_at_ms <= ?)
         ${
           kind === 'batch'
             ? `AND NOT EXISTS (SELECT 1 FROM batches earlier JOIN batch_work ew USING(batch_id)
               WHERE earlier.run_id=c.run_id AND earlier.first_sequence<c.first_sequence
-              AND ew.state NOT IN ('delivered','superseded'))`
-            : ''
+              AND ew.state NOT IN ('delivered','superseded'))
+              ${runId ? 'AND c.run_id=?' : ''}`
+            : `AND EXISTS (
+              SELECT 1 FROM event_artifacts ea
+              JOIN batch_members bm ON bm.event_id=ea.event_id
+              JOIN batch_work bw ON bw.batch_id=bm.batch_id
+              WHERE ea.artifact_id=w.artifact_id AND bw.state='delivered'
+            ) ${runId ? 'AND c.run_id=?' : ''}`
         }
         ORDER BY ${order} LIMIT 1`,
-        )
-        .get(now) as WorkRow | undefined;
-      if (!row) return undefined;
-      const token = randomUUID();
-      const expiry = now + leaseMs;
-      const update = this.#db()
-        .prepare(
-          `UPDATE ${table} SET state='leased',lease_token=?,lease_expires_at_ms=?,
+          )
+          .get(checkedAt, ...(runId ? [runId] : [])) as WorkRow | undefined;
+        if (!row) return undefined;
+        const token = randomUUID();
+        const expiry = checkedAt + leaseMs;
+        const update = this.#db()
+          .prepare(
+            `UPDATE ${table} SET state='leased',lease_token=?,lease_expires_at_ms=?,
         attempt_count=attempt_count+1 WHERE ${idColumn}=? AND state='pending'`,
-        )
-        .run(token, expiry, row.id);
-      if (update.changes !== 1) return undefined;
-      if (kind === 'batch') {
+          )
+          .run(token, expiry, row.id);
+        if (update.changes !== 1) return undefined;
+        if (kind === 'batch') {
+          const detail = this.#db()
+            .prepare(
+              `SELECT b.canonical_json,w.attempt_count FROM batches b JOIN batch_work w USING(batch_id)
+          WHERE b.batch_id=?`,
+            )
+            .get(row.id) as { attempt_count: number; canonical_json: string };
+          return {
+            id: row.id,
+            leaseToken: token,
+            leaseExpiresAt: iso(expiry),
+            attemptCount: detail.attempt_count,
+            body: detail.canonical_json,
+          };
+        }
         const detail = this.#db()
           .prepare(
-            `SELECT b.canonical_json,w.attempt_count FROM batches b JOIN batch_work w USING(batch_id)
-          WHERE b.batch_id=?`,
+            `SELECT a.relative_path,a.run_id,a.canonical_json,w.attempt_count,w.remote_upload_id
+          FROM artifacts a JOIN artifact_work w USING(artifact_id)
+        WHERE a.artifact_id=?`,
           )
-          .get(row.id) as { attempt_count: number; canonical_json: string };
+          .get(row.id) as {
+          attempt_count: number;
+          canonical_json: string;
+          relative_path: string;
+          remote_upload_id: string | null;
+          run_id: string;
+        };
         return {
           id: row.id,
           leaseToken: token,
           leaseExpiresAt: iso(expiry),
           attemptCount: detail.attempt_count,
-          body: detail.canonical_json,
+          relativePath: detail.relative_path,
+          declaration: ArtifactReferenceSchema.parse(
+            JSON.parse(detail.canonical_json),
+          ),
+          runId: detail.run_id,
+          ...(detail.remote_upload_id
+            ? { uploadId: detail.remote_upload_id }
+            : {}),
         };
-      }
-      const detail = this.#db()
+      }, maximumWaitMs);
+    } catch (error) {
+      if (maximumWaitMs !== undefined && isSqliteBusy(error)) return undefined;
+      throw error;
+    }
+  }
+
+  async openArtifactRange(
+    id: string,
+    leaseToken: string,
+    offset: number,
+    length: number,
+    now?: number,
+    signal?: AbortSignal,
+  ): Promise<Readable> {
+    const assertNotAborted = (): void => {
+      if (signal?.aborted)
+        throw new CollectorError(
+          'lease-lost',
+          'artifact range preparation was cancelled',
+        );
+    };
+    assertNotAborted();
+    if (
+      !Number.isSafeInteger(offset) ||
+      offset < 0 ||
+      !Number.isSafeInteger(length) ||
+      length < 1
+    )
+      throw new CollectorError(
+        'collection-failed',
+        'artifact range is invalid',
+      );
+    const readOwned = (at: number) =>
+      this.#db()
         .prepare(
-          `SELECT a.relative_path,w.attempt_count FROM artifacts a JOIN artifact_work w USING(artifact_id)
-        WHERE a.artifact_id=?`,
+          `SELECT a.relative_path,a.byte_length,a.sha256,w.lease_expires_at_ms
+           FROM artifacts a JOIN artifact_work w USING(artifact_id)
+           WHERE a.artifact_id=? AND w.state='leased' AND w.lease_token=? AND w.lease_expires_at_ms>?`,
         )
-        .get(row.id) as { attempt_count: number; relative_path: string };
-      return {
-        id: row.id,
-        leaseToken: token,
-        leaseExpiresAt: iso(expiry),
-        attemptCount: detail.attempt_count,
-        relativePath: detail.relative_path,
-      };
-    });
+        .get(id, leaseToken, at) as
+        | {
+            byte_length: number;
+            lease_expires_at_ms: number;
+            relative_path: string;
+            sha256: string;
+          }
+        | undefined;
+    const row = readOwned(now ?? Date.now());
+    if (!row)
+      throw new CollectorError(
+        'lease-lost',
+        'artifact lease is no longer owned',
+      );
+    if (offset + length > row.byte_length)
+      throw new CollectorError(
+        'collection-failed',
+        'artifact range is invalid',
+      );
+    let handle;
+    let opening;
+    try {
+      await waitWithAbort(this.hooks.beforeArtifactOpen?.(), signal);
+      assertNotAborted();
+      opening = openFile(join(this.artifactDirectory, row.relative_path), 'r');
+      handle = await waitWithAbort(opening, signal);
+    } catch (cause) {
+      if (signal?.aborted && opening)
+        void opening.then(
+          async (lateHandle) => lateHandle.close(),
+          () => undefined,
+        );
+      if (cause instanceof CollectorError) throw cause;
+      throw new CollectorError(
+        'artifact-missing',
+        'artifact bytes are missing',
+        {
+          cause,
+        },
+      );
+    }
+    try {
+      assertNotAborted();
+      const stat = await waitWithAbort(handle.stat(), signal);
+      const hash = createHash('sha256');
+      const buffer = Buffer.allocUnsafe(64 * 1024);
+      let position = 0;
+      while (position < stat.size) {
+        assertNotAborted();
+        const read = await waitWithAbort(
+          handle.read(
+            buffer,
+            0,
+            Math.min(buffer.byteLength, stat.size - position),
+            position,
+          ),
+          signal,
+        );
+        if (read.bytesRead === 0) break;
+        hash.update(buffer.subarray(0, read.bytesRead));
+        position += read.bytesRead;
+        await waitWithAbort(this.hooks.afterArtifactHashChunk?.(), signal);
+        assertNotAborted();
+      }
+      if (
+        stat.size !== row.byte_length ||
+        position !== row.byte_length ||
+        hash.digest('hex') !== row.sha256
+      )
+        throw new CollectorError(
+          'artifact-corrupt',
+          'artifact bytes failed integrity verification',
+        );
+      if (!readOwned(Date.now()))
+        throw new CollectorError(
+          'lease-lost',
+          'artifact lease is no longer owned',
+        );
+      return handle.createReadStream({
+        autoClose: true,
+        end: offset + length - 1,
+        ...(signal ? { signal } : {}),
+        start: offset,
+      });
+    } catch (cause) {
+      if (signal?.aborted) void handle.close();
+      else await handle.close();
+      throw cause;
+    }
   }
 
   releaseBatch(
     id: string,
     leaseToken: string,
     nextAttemptAt?: number,
-    now = Date.now(),
+    now?: number,
   ): void {
     this.#transition(
       'batch',
@@ -1276,16 +1558,34 @@ export class LocalSpool implements Disposable {
     id: string,
     leaseToken: string,
     errorCode: WorkErrorCode,
-    now = Date.now(),
+    now?: number,
   ): void {
     this.#transition('batch', id, leaseToken, 'blocked', { errorCode }, now);
+  }
+
+  scheduleBatchRetry(
+    id: string,
+    leaseToken: string,
+    nextAttemptAt: number,
+    errorCode: WorkErrorCode,
+    now?: number,
+  ): void {
+    assertRetryTimestamp(nextAttemptAt, now ?? Date.now());
+    this.#transition(
+      'batch',
+      id,
+      leaseToken,
+      'pending',
+      { errorCode, nextAttemptAt },
+      now,
+    );
   }
 
   releaseArtifact(
     id: string,
     leaseToken: string,
     nextAttemptAt?: number,
-    now = Date.now(),
+    now?: number,
   ): void {
     this.#transition(
       'artifact',
@@ -1301,16 +1601,34 @@ export class LocalSpool implements Disposable {
     id: string,
     leaseToken: string,
     errorCode: WorkErrorCode,
-    now = Date.now(),
+    now?: number,
   ): void {
     this.#transition('artifact', id, leaseToken, 'blocked', { errorCode }, now);
+  }
+
+  scheduleArtifactRetry(
+    id: string,
+    leaseToken: string,
+    nextAttemptAt: number,
+    errorCode: WorkErrorCode,
+    now?: number,
+  ): void {
+    assertRetryTimestamp(nextAttemptAt, now ?? Date.now());
+    this.#transition(
+      'artifact',
+      id,
+      leaseToken,
+      'pending',
+      { errorCode, nextAttemptAt },
+      now,
+    );
   }
 
   acknowledgeBatchDelivery(
     id: string,
     leaseToken: string,
     response: unknown,
-    now = Date.now(),
+    now?: number,
   ): void {
     assertPlainData(response, 'delivery acknowledgement');
     assertExactOwnKeys(
@@ -1327,6 +1645,7 @@ export class LocalSpool implements Disposable {
     };
     const canonical = JSON.stringify(safeResponse);
     this.#immediate(() => {
+      const checkedAt = now ?? Date.now();
       const existing = this.#db()
         .prepare(
           `SELECT b.run_id,w.state,w.remote_acknowledgement,w.lease_token,w.lease_expires_at_ms
@@ -1360,7 +1679,7 @@ export class LocalSpool implements Disposable {
       if (
         existing.state !== 'leased' ||
         existing.lease_token !== leaseToken ||
-        (existing.lease_expires_at_ms ?? 0) <= now
+        (existing.lease_expires_at_ms ?? 0) <= checkedAt
       )
         throw new CollectorError(
           'lease-lost',
@@ -1379,7 +1698,7 @@ export class LocalSpool implements Disposable {
     id: string,
     leaseToken: string,
     uploadId: string,
-    now = Date.now(),
+    now?: number,
   ): void {
     if (
       !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/iu.test(
@@ -1390,13 +1709,44 @@ export class LocalSpool implements Disposable {
         'collection-failed',
         'upload identity is invalid',
       );
-    const result = this.#immediate(() =>
-      this.#db()
+    const result = this.#immediate(() => {
+      const checkedAt = now ?? Date.now();
+      return this.#db()
         .prepare(
           `UPDATE artifact_work SET remote_upload_id=? WHERE artifact_id=? AND state='leased' AND lease_token=? AND lease_expires_at_ms>? AND (remote_upload_id IS NULL OR remote_upload_id=?)`,
         )
-        .run(uploadId, id, leaseToken, now, uploadId),
-    );
+        .run(uploadId, id, leaseToken, checkedAt, uploadId);
+    });
+    if (result.changes !== 1)
+      throw new CollectorError(
+        'lease-lost',
+        'artifact lease is no longer owned',
+      );
+  }
+
+  replaceArtifactUpload(
+    id: string,
+    leaseToken: string,
+    previousUploadId: string,
+    replacementUploadId: string,
+    now?: number,
+  ): void {
+    UuidSchema.parse(previousUploadId);
+    UuidSchema.parse(replacementUploadId);
+    if (previousUploadId === replacementUploadId)
+      throw new CollectorError(
+        'collection-failed',
+        'replacement upload identity must be fresh',
+      );
+    const result = this.#immediate(() => {
+      const checkedAt = now ?? Date.now();
+      return this.#db()
+        .prepare(
+          `UPDATE artifact_work SET remote_upload_id=? WHERE artifact_id=? AND state='leased'
+           AND lease_token=? AND lease_expires_at_ms>? AND remote_upload_id=?`,
+        )
+        .run(replacementUploadId, id, leaseToken, checkedAt, previousUploadId);
+    });
     if (result.changes !== 1)
       throw new CollectorError(
         'lease-lost',
@@ -1408,12 +1758,21 @@ export class LocalSpool implements Disposable {
     id: string,
     leaseToken: string,
     response: unknown,
-    now = Date.now(),
+    now?: number,
   ): void {
     assertPlainData(response, 'artifact verification');
+    if (!response || typeof response !== 'object' || Array.isArray(response))
+      throw new CollectorError(
+        'collection-failed',
+        'artifact verification is invalid',
+      );
+    const responseKeys = Reflect.ownKeys(response);
+    const isStatus = responseKeys.includes('state');
     assertExactOwnKeys(
       response,
-      ['schemaVersion', 'outcome', 'artifactId', 'verification'],
+      isStatus
+        ? ['schemaVersion', 'artifactId', 'state', 'verification']
+        : ['schemaVersion', 'outcome', 'artifactId', 'verification'],
       'artifact verification',
     );
     assertExactOwnKeys(
@@ -1421,8 +1780,19 @@ export class LocalSpool implements Disposable {
       ['uploadId', 'byteLength', 'sha256', 'verifiedAt'],
       'artifact verification metadata',
     );
-    const parsed = ArtifactCompletionResponseSchema.parse(response);
-    if (parsed.outcome !== 'verified')
+    const completion = ArtifactCompletionResponseSchema.safeParse(response);
+    const session = ArtifactUploadSessionResponseSchema.safeParse(response);
+    const status = ArtifactStorageStatusResponseSchema.safeParse(response);
+    const parsed = completion.success
+      ? completion.data.outcome === 'verified'
+        ? completion.data
+        : undefined
+      : session.success && session.data.outcome === 'already_verified'
+        ? session.data
+        : status.success && status.data.state === 'verified'
+          ? status.data
+          : undefined;
+    if (!parsed)
       throw new CollectorError(
         'collection-failed',
         'artifact response is not verified',
@@ -1440,6 +1810,7 @@ export class LocalSpool implements Disposable {
     };
     const canonical = JSON.stringify(safeResponse);
     this.#immediate(() => {
+      const checkedAt = now ?? Date.now();
       const row = this.#db()
         .prepare(
           `SELECT a.byte_length,a.sha256,w.state,w.remote_upload_id,w.remote_acknowledgement,w.lease_token,w.lease_expires_at_ms
@@ -1477,7 +1848,7 @@ export class LocalSpool implements Disposable {
       if (
         row.state !== 'leased' ||
         row.lease_token !== leaseToken ||
-        (row.lease_expires_at_ms ?? 0) <= now
+        (row.lease_expires_at_ms ?? 0) <= checkedAt
       )
         throw new CollectorError(
           'lease-lost',
@@ -1497,7 +1868,7 @@ export class LocalSpool implements Disposable {
     leaseToken: string,
     rejection: unknown,
     maximumEvents: number,
-    now = Date.now(),
+    now?: number,
   ): readonly EvidenceBatch[] {
     const parsedRejection = parseOversizedBatchRejection(rejection);
     const safeRejection = {
@@ -1513,12 +1884,13 @@ export class LocalSpool implements Disposable {
     let replacementCreationStarted = false;
     try {
       return this.#immediate(() => {
+        const checkedAt = now ?? Date.now();
         const source = this.#db()
           .prepare(
             `SELECT b.run_id,w.lease_expires_at_ms FROM batches b JOIN batch_work w USING(batch_id)
            WHERE b.batch_id=? AND w.state='leased' AND w.lease_token=? AND w.lease_expires_at_ms>?`,
           )
-          .get(id, leaseToken, now) as
+          .get(id, leaseToken, checkedAt) as
           { lease_expires_at_ms: number; run_id: string } | undefined;
         if (!source)
           throw new CollectorError(
@@ -1555,7 +1927,7 @@ export class LocalSpool implements Disposable {
             schemaVersion: 1,
             batchId: randomUUID(),
             runId: source.run_id,
-            sentAt: iso(now),
+            sentAt: iso(checkedAt),
             events: selected,
           });
           const serialized = JSON.stringify(batch);
@@ -1565,7 +1937,7 @@ export class LocalSpool implements Disposable {
               'replacement batch remains oversized',
             );
           this.hooks.beforeReplacementBatchInsert?.(replacements.length);
-          this.#insertBatch(batch, serialized, now);
+          this.#insertBatch(batch, serialized, checkedAt);
           replacements.push(batch);
         }
         const changed = this.#db()
@@ -1573,7 +1945,12 @@ export class LocalSpool implements Disposable {
             `UPDATE batch_work SET state='superseded',lease_token=NULL,lease_expires_at_ms=NULL,
            remote_acknowledgement=? WHERE batch_id=? AND state='leased' AND lease_token=? AND lease_expires_at_ms>?`,
           )
-          .run(JSON.stringify(safeRejection), id, leaseToken, now);
+          .run(
+            JSON.stringify(safeRejection),
+            id,
+            leaseToken,
+            now ?? Date.now(),
+          );
         if (changed.changes !== 1)
           throw new CollectorError(
             'lease-lost',
@@ -1603,12 +1980,15 @@ export class LocalSpool implements Disposable {
       nextAttemptAt?: number;
       acknowledgement?: string;
     },
-    now: number,
+    now?: number,
   ): void {
     const table = `${kind}_work`;
     const idColumn = `${kind}_id`;
-    const result = this.#immediate(() =>
-      this.#db()
+    const result = this.#immediate(() => {
+      const checkedAt = now ?? Date.now();
+      if (options.nextAttemptAt !== undefined)
+        assertRetryTimestamp(options.nextAttemptAt, checkedAt);
+      return this.#db()
         .prepare(
           `UPDATE ${table} SET state=?,lease_token=NULL,lease_expires_at_ms=NULL,
       safe_error_code=?,next_attempt_at_ms=?,remote_acknowledgement=? WHERE ${idColumn}=? AND state='leased' AND lease_token=?
@@ -1621,9 +2001,9 @@ export class LocalSpool implements Disposable {
           options.acknowledgement ?? null,
           id,
           token,
-          now,
-        ),
-    );
+          checkedAt,
+        );
+    });
     if (result.changes !== 1)
       throw new CollectorError('lease-lost', 'work lease is no longer owned');
   }
@@ -1742,6 +2122,15 @@ export class LocalSpool implements Disposable {
       count: number;
     }[])
       workErrorCodes[row.code] = row.count;
+    const unbatched = this.#db()
+      .prepare(
+        `SELECT COUNT(*) AS count FROM events e
+         WHERE NOT EXISTS (
+           SELECT 1 FROM batch_members m JOIN batch_work w USING(batch_id)
+           WHERE m.event_id=e.event_id AND w.state <> 'superseded'
+         )${runId ? ' AND e.run_id=?' : ''}`,
+      )
+      .get(...parameter) as { count: number };
     return {
       runs,
       batches,
@@ -1756,6 +2145,7 @@ export class LocalSpool implements Disposable {
         artifacts: delayedArtifacts.count,
         batches: delayedBatches.count,
       },
+      unbatchedEvents: unbatched.count,
       workErrorCodes,
     };
   }

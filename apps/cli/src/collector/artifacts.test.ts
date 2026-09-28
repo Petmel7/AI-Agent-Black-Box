@@ -63,6 +63,42 @@ function openedSession(
   );
 }
 
+function declaredArtifact(
+  spool: LocalSpool,
+  handle: { ownerToken: string; runId: string },
+  now: number,
+) {
+  const event = spool.recordCommandFinished(
+    handle,
+    {
+      commandId: randomUUID(),
+      outcome: 'succeeded',
+      stdout: Buffer.from('redacted'),
+    },
+    now,
+  );
+  if (event.kind !== 'command.finished') throw new Error('expected command');
+  if (
+    event.payload.stdout.state !== 'captured' ||
+    !event.payload.stdout.artifact
+  )
+    throw new Error('expected artifact');
+  const batch = spool.createBatch(handle.runId, now + 1)!;
+  const claim = spool.claimBatch(1_000, now + 2)!;
+  spool.acknowledgeBatchDelivery(
+    batch.batchId,
+    claim.leaseToken,
+    {
+      outcome: 'accepted',
+      batchId: batch.batchId,
+      runId: handle.runId,
+      receivedAt: '2026-09-24T10:00:00.000Z',
+    },
+    now + 3,
+  );
+  return event.payload.stdout.artifact;
+}
+
 describe('artifact durability and privacy', () => {
   it('stores exact redacted bytes and reports missing, corrupt, and orphan files', () => {
     const secret = `secret-${randomUUID()}`;
@@ -137,42 +173,157 @@ describe('artifact durability and privacy', () => {
 
   it('claims artifact work across connections and rejects stale lease owners', () => {
     using spool = opened();
-    const handle = spool.createRun();
-    const capture = spool.captureText(
-      handle,
-      'stdout',
-      Buffer.from('redacted'),
-      {
-        kind: 'command-output',
-      },
-    );
-    if (capture.state !== 'captured' || !capture.artifact)
-      throw new Error('expected artifact');
-    const reference = capture.artifact;
-    const claim = spool.claimArtifact(1_000, 1_000)!;
+    const now = Date.now();
+    const handle = spool.createRun(60_000, now);
+    const reference = declaredArtifact(spool, handle, now + 10);
+    const claim = spool.claimArtifact(1_000, now + 100)!;
     expect(claim.id).toBe(reference.artifactId);
     expect(() =>
       spool.releaseArtifact(
         reference.artifactId,
         claim.leaseToken,
         undefined,
-        2_000,
+        now + 1_100,
       ),
     ).toThrowError(
       expect.objectContaining<Partial<CollectorError>>({ code: 'lease-lost' }),
     );
-    expect(spool.recoverExpired(2_000).artifacts).toBe(1);
-    const replacement = spool.claimArtifact(1_000, 2_001)!;
+    expect(spool.recoverExpired(now + 1_100).artifacts).toBe(1);
+    const replacement = spool.claimArtifact(1_000, now + 1_101)!;
     spool.releaseArtifact(
       reference.artifactId,
       replacement.leaseToken,
-      4_000,
-      2_002,
+      now + 3_100,
+      now + 1_102,
     );
-    expect(spool.status(undefined, 3_000)).toMatchObject({
+    expect(spool.status(undefined, now + 2_100)).toMatchObject({
       retryDelayed: { artifacts: 1 },
     });
   });
+
+  it('gates artifact claims on a delivered declaration and replaces only the owned upload attempt', () => {
+    using spool = opened();
+    const now = Date.now();
+    const handle = spool.createRun(60_000, now);
+    const event = spool.recordCommandFinished(
+      handle,
+      {
+        commandId: randomUUID(),
+        outcome: 'succeeded',
+        stdout: Buffer.from('redacted'),
+      },
+      now + 1,
+    );
+    if (
+      event.kind !== 'command.finished' ||
+      event.payload.stdout.state !== 'captured' ||
+      !event.payload.stdout.artifact
+    )
+      throw new Error('expected artifact');
+    expect(spool.claimArtifact(1_000, now + 2)).toBeUndefined();
+    const batch = spool.createBatch(handle.runId, now + 3)!;
+    const batchClaim = spool.claimBatch(1_000, now + 4)!;
+    spool.acknowledgeBatchDelivery(
+      batch.batchId,
+      batchClaim.leaseToken,
+      {
+        outcome: 'accepted',
+        batchId: batch.batchId,
+        runId: handle.runId,
+        receivedAt: '2026-09-24T10:00:00.000Z',
+      },
+      now + 5,
+    );
+    const claim = spool.claimArtifact(1_000, now + 6)!;
+    const firstUpload = randomUUID();
+    const replacement = randomUUID();
+    spool.bindArtifactUpload(claim.id, claim.leaseToken, firstUpload, now + 7);
+    expect(() =>
+      spool.replaceArtifactUpload(
+        claim.id,
+        claim.leaseToken,
+        randomUUID(),
+        replacement,
+        now + 8,
+      ),
+    ).toThrow();
+    spool.replaceArtifactUpload(
+      claim.id,
+      claim.leaseToken,
+      firstUpload,
+      replacement,
+      now + 8,
+    );
+    expect(() =>
+      spool.bindArtifactUpload(
+        claim.id,
+        claim.leaseToken,
+        firstUpload,
+        now + 9,
+      ),
+    ).toThrow();
+  });
+
+  it('opens only verified ranges for an active artifact lease', async () => {
+    using spool = opened();
+    const now = Date.now();
+    const handle = spool.createRun(60_000, now);
+    const reference = declaredArtifact(spool, handle, now + 1);
+    const claim = spool.claimArtifact(1_000, Date.now())!;
+    const stream = await spool.openArtifactRange(
+      reference.artifactId,
+      claim.leaseToken,
+      1,
+      reference.byteLength - 2,
+    );
+    const chunks: Buffer[] = [];
+    for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+    expect(Buffer.concat(chunks).toString('utf8')).toBe('edacte');
+    spool.releaseArtifact(reference.artifactId, claim.leaseToken);
+    await expect(
+      spool.openArtifactRange(
+        reference.artifactId,
+        claim.leaseToken,
+        0,
+        reference.byteLength,
+      ),
+    ).rejects.toMatchObject({ code: 'lease-lost' });
+  });
+
+  it.each(['open', 'hash'] as const)(
+    'cancels delayed artifact %s preparation before returning bytes',
+    async (phase) => {
+      let releaseDelay!: () => void;
+      const delay = new Promise<void>((resolve) => {
+        releaseDelay = resolve;
+      });
+      using spool = opened(1_000_000, {
+        ...(phase === 'open'
+          ? { beforeArtifactOpen: () => delay }
+          : { afterArtifactHashChunk: () => delay }),
+      });
+      const now = Date.now();
+      const handle = spool.createRun(60_000, now);
+      const reference = declaredArtifact(spool, handle, now + 1);
+      const claim = spool.claimArtifact(1_000, now + 10)!;
+      const controller = new AbortController();
+      const startedAt = Date.now();
+      setTimeout(() => controller.abort(), 30);
+      await expect(
+        spool.openArtifactRange(
+          reference.artifactId,
+          claim.leaseToken,
+          0,
+          reference.byteLength,
+          undefined,
+          controller.signal,
+        ),
+      ).rejects.toMatchObject({ code: 'lease-lost' });
+      expect(Date.now() - startedAt).toBeLessThan(200);
+      expect(spool.status().artifacts.leased).toBe(1);
+      releaseDelay();
+    },
+  );
 
   it('requires complete immutable artifact declarations and rolls mismatches back', () => {
     using spool = opened();
@@ -307,25 +458,16 @@ describe('artifact durability and privacy', () => {
 
   it('verifies artifacts only from a matching owned upload response', () => {
     using spool = opened();
-    const handle = spool.createRun();
-    const capture = spool.captureText(
-      handle,
-      'stdout',
-      Buffer.from('redacted'),
-      {
-        kind: 'command-output',
-      },
-    );
-    if (capture.state !== 'captured' || !capture.artifact)
-      throw new Error('expected artifact');
-    const reference = capture.artifact;
-    const claim = spool.claimArtifact(1_000, 1_000)!;
+    const now = Date.now();
+    const handle = spool.createRun(60_000, now);
+    const reference = declaredArtifact(spool, handle, now + 10);
+    const claim = spool.claimArtifact(1_000, now + 100)!;
     const uploadId = randomUUID();
     spool.bindArtifactUpload(
       reference.artifactId,
       claim.leaseToken,
       uploadId,
-      1_001,
+      now + 101,
     );
     const response = {
       schemaVersion: 1 as const,
@@ -344,7 +486,7 @@ describe('artifact durability and privacy', () => {
         reference.artifactId,
         claim.leaseToken,
         { ...response, secret },
-        1_002,
+        now + 102,
       ),
     ).toThrow();
     expect(() =>
@@ -355,7 +497,7 @@ describe('artifact durability and privacy', () => {
           ...response,
           verification: { ...response.verification, secret },
         },
-        1_002,
+        now + 102,
       ),
     ).toThrow();
     const accessor = Object.defineProperty({}, 'verification', {
@@ -367,7 +509,7 @@ describe('artifact durability and privacy', () => {
         reference.artifactId,
         claim.leaseToken,
         accessor,
-        1_002,
+        now + 102,
       ),
     ).toThrow();
     expect(() =>
@@ -378,7 +520,7 @@ describe('artifact durability and privacy', () => {
           ...response,
           verification: { ...response.verification, sha256: '0'.repeat(64) },
         },
-        1_002,
+        now + 102,
       ),
     ).toThrow();
     expect(() =>
@@ -386,14 +528,14 @@ describe('artifact durability and privacy', () => {
         randomUUID(),
         claim.leaseToken,
         response,
-        1_002,
+        now + 102,
       ),
     ).toThrow();
     spool.acknowledgeArtifactVerification(
       reference.artifactId,
       claim.leaseToken,
       response,
-      1_002,
+      now + 102,
     );
     expect(() =>
       spool.acknowledgeArtifactVerification(
