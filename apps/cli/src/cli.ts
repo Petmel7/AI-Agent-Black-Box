@@ -3,6 +3,7 @@ import { UuidSchema } from '@blackbox/contracts';
 import {
   CollectorWorkSpool,
   collectorConfigFromEnvironment,
+  composeCollectorFromEnvironment,
 } from './collector/index.js';
 import { auditArtifacts } from './collector/artifacts.js';
 import {
@@ -11,6 +12,11 @@ import {
 } from './collector/coordinator.js';
 import { deliveryConfigFromEnvironment } from './collector/delivery-config.js';
 import { LocalSpool } from './collector/spool.js';
+import {
+  runWrappedProcess,
+  type ProcessRunnerDependencies,
+  type WrappedTermination,
+} from './process-runner.js';
 
 export const CLI_VERSION = '0.1.0';
 
@@ -19,6 +25,7 @@ const HELP = `AI Agent Black Box collector
 Usage: blackbox [options]
        blackbox status [--json] [--run <run-id>]
        blackbox retry [--json] [--run <run-id>]
+       blackbox run -- <command> [arguments...]
 
 Options:
   -h, --help     Show help
@@ -27,6 +34,7 @@ Options:
 Commands:
   status         Show content-free local spool health and pending work
   retry          Perform one bounded delivery drain and exit
+  run            Record one directly spawned child process
 `;
 
 export interface CliIo {
@@ -36,7 +44,10 @@ export interface CliIo {
 
 export interface CliRuntime {
   env?: NodeJS.ProcessEnv;
+  processRunnerDependencies?: ProcessRunnerDependencies;
 }
+
+export type CliTermination = number | WrappedTermination;
 
 function renderHumanStatus(
   status: ReturnType<LocalSpool['status']>,
@@ -99,13 +110,19 @@ export async function runCli(
   args: readonly string[],
   io: CliIo,
   runtime: CliRuntime = {},
-): Promise<number> {
-  if (args.includes('--help') || args.includes('-h') || args.length === 0) {
+): Promise<CliTermination> {
+  if (
+    args.length === 0 ||
+    (args[0] !== 'run' && (args.includes('--help') || args.includes('-h')))
+  ) {
     io.output(HELP);
     return 0;
   }
 
-  if (args.includes('--version') || args.includes('-v')) {
+  if (
+    args[0] !== 'run' &&
+    (args.includes('--version') || args.includes('-v'))
+  ) {
     io.output(CLI_VERSION);
     return 0;
   }
@@ -184,6 +201,37 @@ export async function runCli(
         error instanceof Error && 'code' in error
           ? `Retry unavailable: ${String(error.code)}`
           : 'Retry unavailable: collection-failed',
+      );
+      return 1;
+    }
+  }
+
+  if (args[0] === 'run') {
+    if (args[1] !== '--' || args.length < 3 || args[2] === '') {
+      io.error('Invalid run arguments');
+      return 1;
+    }
+    try {
+      const env = runtime.env ?? process.env;
+      const delivery = deliveryConfigFromEnvironment(env);
+      const composition = composeCollectorFromEnvironment(
+        env,
+        delivery.state === 'configured' ? [delivery.config.apiToken] : [],
+      );
+      return await runWrappedProcess(
+        args[2]!,
+        args.slice(3),
+        env,
+        composition,
+        delivery,
+        { warning: (message) => io.error(message) },
+        runtime.processRunnerDependencies,
+      );
+    } catch (error) {
+      io.error(
+        error instanceof Error && 'code' in error
+          ? `Run unavailable: ${String(error.code)}`
+          : 'Run unavailable: collection-failed',
       );
       return 1;
     }

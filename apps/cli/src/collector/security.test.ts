@@ -168,6 +168,7 @@ describe('complete durable-surface sentinel scan', () => {
       'observeGitDiffCaptured',
       'observeRunFinished',
       'observeRunStarted',
+      'renewLease',
       'runId',
     ]);
     expect(
@@ -246,5 +247,43 @@ describe('complete durable-surface sentinel scan', () => {
     ).toThrow();
     for (const path of allFiles(spoolRoot))
       expect(readFileSync(path).includes(Buffer.from(secret))).toBe(false);
+  });
+
+  it('keeps collector controls and credentials out of a wrapped child and every durable surface', async () => {
+    const spoolRoot = temporaryRoot();
+    const marker = join(spoolRoot, '..', `child-environment-${randomUUID()}`);
+    const sentinel = `wrapped-secret-${randomUUID()}`;
+    const errors: string[] = [];
+    const output: string[] = [];
+    const result = await runCli(
+      [
+        'run',
+        '--',
+        process.execPath,
+        '-e',
+        `require('node:fs').writeFileSync(${JSON.stringify(marker)}, JSON.stringify(process.env))`,
+      ],
+      {
+        error: (value) => errors.push(value),
+        output: (value) => output.push(value),
+      },
+      {
+        env: {
+          ...process.env,
+          BLACKBOX_INTERNAL_SECRET: sentinel,
+          BLACKBOX_REDACT_LITERAL_FILE: '',
+          BLACKBOX_SPOOL_DIR: spoolRoot,
+        },
+      },
+    );
+    expect(result).toEqual({ code: 0, kind: 'exit' });
+    const childEnvironment = readFileSync(marker, 'utf8');
+    expect(childEnvironment).not.toContain(sentinel);
+    expect(childEnvironment).not.toContain('BLACKBOX_INTERNAL_SECRET');
+    expect(childEnvironment).toContain('BLACKBOX_RUN_ID');
+    const rendered = [...errors, ...output].join('\n');
+    expect(rendered).not.toContain(sentinel);
+    for (const path of allFiles(spoolRoot))
+      expect(readFileSync(path).includes(Buffer.from(sentinel))).toBe(false);
   });
 });

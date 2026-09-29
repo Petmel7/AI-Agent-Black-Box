@@ -32,4 +32,13 @@ recovered-interrupted runs are eligible. Preparation is local and content-free;
 or process wrapping. The retry command consumes its sealed work through leased
 claims. Signed upload endpoints and capabilities are deliberately not persisted,
 so restart recovery may request a fresh attempt and resend an artifact from
-zero. Wrapped-process recovery remains BBX-006C work.
+zero.
+
+`blackbox run -- <command> [arguments...]` renews a bounded owner lease while
+its direct child is active. A hard collector stop can leave an active run with
+only `run.started`; after lease expiry, `blackbox retry` or the public recovery
+operation marks it `interrupted` without inventing `run.finished`. Its retained
+events remain eligible for sealed batch preparation. Do not manually close or
+rewrite such a run. A normally observed signal skips lifecycle delivery so the
+caller can reproduce the child signal promptly; use `blackbox retry --run
+<run-id>` later when delivery is configured.

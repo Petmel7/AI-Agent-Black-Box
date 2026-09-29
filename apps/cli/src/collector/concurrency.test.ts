@@ -395,4 +395,25 @@ describe('multi-connection SQLite contention', () => {
     },
     20_000,
   );
+
+  it('rejects a heartbeat that acquires the writer lock after run ownership expires', async () => {
+    const root = temporarySpool();
+    using spool = new LocalSpool(
+      validateCollectorConfig({ spoolRoot: root }),
+    ).open({
+      busyTimeoutMs: 1_000,
+    });
+    const handle = spool.createRun(1_000);
+    using database = new DatabaseSync(spool.databasePath);
+    database
+      .prepare('UPDATE runs SET owner_lease_expires_at_ms=? WHERE run_id=?')
+      .run(Date.now() + 50, handle.runId);
+    const lock = await holdWriterLock(spool.databasePath, 120);
+    expect(() => spool.renewRunLease(handle, 1_000)).toThrowError(
+      expect.objectContaining({ code: 'invalid-owner' }),
+    );
+    await lock.done;
+    expect(spool.recoverExpired().runs).toBe(1);
+    expect(spool.status().runs).toMatchObject({ interrupted: 1 });
+  });
 });

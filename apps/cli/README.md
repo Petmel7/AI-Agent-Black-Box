@@ -1,8 +1,8 @@
 # Local collector foundation
 
 The collector owns a versioned SQLite spool and adjacent immutable artifact
-files. It works without a backend. BBX-006B adds explicit bounded HTTP/TUS
-delivery; wrapped-process behavior remains deferred to BBX-006C.
+files. It works without a backend and can directly wrap one child process while
+preserving its outcome.
 
 The default spool is below the operating system's per-user application-data
 directory, never the captured repository. Override it with
@@ -101,3 +101,25 @@ Exit `0` means the selected scope has no ready, delayed, leased, or blocked
 delivery work. Exit `2` means remote configuration is offline or retained work
 remains. Exit `1` means arguments, configuration, or the local spool are
 invalid. Output contains aggregate counts and safe codes only.
+
+## Wrapped process
+
+Use the mandatory delimiter so child arguments remain unambiguous:
+
+```sh
+blackbox run -- <command> [arguments...]
+```
+
+The collector spawns the command directly with `shell: false`, the caller's
+working directory, and inherited stdin/stdout/stderr. Arguments are never
+joined or interpreted as shell text. All case variants of `BLACKBOX_*` are
+removed from the copied child environment; only `BLACKBOX_RUN_ID` is injected.
+
+Run identity and `run.started` are durable before launch. A bounded heartbeat
+retains ownership while the direct child is active. Normal exit records one
+terminal event with monotonic duration, closes the run, and may perform one
+run-scoped bounded drain when delivery is configured. Offline mode and delivery
+failure never replace the child's exact exit code. Supported signals are
+forwarded only to the direct child; signal completion skips remote delivery.
+The collector does not supervise descendant process trees or capture child
+stdio in this task.

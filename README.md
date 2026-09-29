@@ -39,7 +39,13 @@ pnpm --filter @blackbox/cli build
 pnpm --filter @blackbox/cli start -- --help
 pnpm --filter @blackbox/cli start -- status --json
 pnpm --filter @blackbox/cli start -- retry --json
+pnpm --filter @blackbox/cli start -- run -- <command> [arguments...]
 ```
+
+`blackbox run` directly spawns one child without a shell, preserves inherited
+stdio and the child's exit or supported-signal outcome, and stores collector
+state outside the child working directory. Git evidence capture and Codex
+telemetry integration remain separate BBX-007 and BBX-008 work.
 
 ## Validation
 

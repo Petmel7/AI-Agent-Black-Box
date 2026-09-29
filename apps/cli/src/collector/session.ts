@@ -8,7 +8,57 @@ import {
 } from './config.js';
 import { CollectorError } from './errors.js';
 import type { RedactorOptions } from './redaction.js';
-import { LocalSpool, type RunHandle } from './spool.js';
+import {
+  DEFAULT_LEASE_MS,
+  LocalSpool,
+  MAX_RUN_LEASE_MS,
+  MIN_RUN_LEASE_MS,
+  type RunHandle,
+} from './spool.js';
+
+export interface CollectorSessionOptions {
+  leaseMs?: number;
+}
+
+function sessionLease(value: unknown): number {
+  const leaseMs = value === undefined ? DEFAULT_LEASE_MS : value;
+  if (
+    !Number.isSafeInteger(leaseMs) ||
+    Number(leaseMs) < MIN_RUN_LEASE_MS ||
+    Number(leaseMs) > MAX_RUN_LEASE_MS
+  )
+    throw new CollectorError(
+      'invalid-config',
+      'run lease duration is outside its safe bounds',
+    );
+  return Number(leaseMs);
+}
+
+function parseSessionOptions(value: unknown): number {
+  if (value === undefined) return DEFAULT_LEASE_MS;
+  if (
+    value === null ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  )
+    throw new CollectorError(
+      'invalid-config',
+      'session options must be plain data',
+    );
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (
+    Reflect.ownKeys(value).some((key) => key !== 'leaseMs') ||
+    Object.values(descriptors).some(
+      (descriptor) => descriptor.get || descriptor.set,
+    )
+  )
+    throw new CollectorError(
+      'invalid-config',
+      'session options contain unsupported fields',
+    );
+  return sessionLease(descriptors.leaseMs?.value);
+}
 
 function copyRedactorOptions(value: RedactorOptions): RedactorOptions {
   if (Object.getPrototypeOf(value) !== Object.prototype)
@@ -104,7 +154,9 @@ export class CollectorSession implements Disposable {
   static open(
     configInput: CollectorConfigInput | CollectorConfig,
     redactorOptions: RedactorOptions = { environment: {} },
+    options: CollectorSessionOptions = {},
   ): CollectorSession {
+    const leaseMs = parseSessionOptions(options);
     const rawCaptureClasses = configInput.captureClasses;
     let requestedCaptureClasses: string[] | undefined;
     if (rawCaptureClasses)
@@ -129,7 +181,7 @@ export class CollectorSession implements Disposable {
       copyRedactorOptions(redactorOptions),
     ).open();
     try {
-      return new CollectorSession(spool, spool.createRun());
+      return new CollectorSession(spool, spool.createRun(leaseMs));
     } catch (cause) {
       spool.close();
       throw cause;
@@ -138,6 +190,10 @@ export class CollectorSession implements Disposable {
 
   get runId(): string {
     return this.#handle.runId;
+  }
+
+  renewLease(leaseMs = DEFAULT_LEASE_MS): void {
+    this.#spool.renewRunLease(this.#handle, sessionLease(leaseMs));
   }
 
   captureText(captureClass: CaptureClass, input: Uint8Array): ContentCapture {
@@ -178,6 +234,7 @@ export class CollectorSession implements Disposable {
   }
 
   observeRunFinished(input: {
+    durationMs?: number;
     outcome: 'cancelled' | 'failed' | 'succeeded';
   }): EvidenceEvent {
     return structuredClone(this.#spool.recordRunFinished(this.#handle, input));

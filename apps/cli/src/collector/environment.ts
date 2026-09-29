@@ -58,7 +58,7 @@ export function composeCollectorFromEnvironment(
   ];
   const redactorOptions: RedactorOptions = {
     collectorCredentials: credentials,
-    environment: env,
+    environment: { ...env },
     explicitEnvironmentNames: list(env.BLACKBOX_REDACT_ENV_NAMES),
     ...(env.BLACKBOX_REDACT_LITERAL_FILE
       ? { literalFilePath: env.BLACKBOX_REDACT_LITERAL_FILE }

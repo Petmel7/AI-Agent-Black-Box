@@ -725,36 +725,60 @@ export class LocalSpool implements Disposable {
     }
   }
 
-  createRun(leaseMs = DEFAULT_LEASE_MS, now = Date.now()): RunHandle {
-    assertLeaseDuration(leaseMs, MIN_RUN_LEASE_MS, MAX_RUN_LEASE_MS, now);
+  createRun(leaseMs = DEFAULT_LEASE_MS, now?: number): RunHandle {
+    assertLeaseDuration(
+      leaseMs,
+      MIN_RUN_LEASE_MS,
+      MAX_RUN_LEASE_MS,
+      now ?? Date.now(),
+    );
     const runId = randomUUID();
     const ownerToken = randomUUID();
-    this.#immediate(() =>
+    this.#immediate(() => {
+      const checkedAt = now ?? Date.now();
+      assertLeaseDuration(
+        leaseMs,
+        MIN_RUN_LEASE_MS,
+        MAX_RUN_LEASE_MS,
+        checkedAt,
+      );
       this.#db()
         .prepare(
           `INSERT INTO runs
       (run_id,capture_state,owner_token,owner_lease_expires_at_ms,created_at)
       VALUES (?,?,?,?,?)`,
         )
-        .run(runId, 'active', ownerToken, now + leaseMs, iso(now)),
-    );
+        .run(runId, 'active', ownerToken, checkedAt + leaseMs, iso(checkedAt));
+    });
     return { runId, ownerToken };
   }
 
   renewRunLease(
     handle: RunHandle,
     leaseMs = DEFAULT_LEASE_MS,
-    now = Date.now(),
+    now?: number,
   ): void {
-    assertLeaseDuration(leaseMs, MIN_RUN_LEASE_MS, MAX_RUN_LEASE_MS, now);
-    const result = this.#immediate(() =>
-      this.#db()
+    assertLeaseDuration(
+      leaseMs,
+      MIN_RUN_LEASE_MS,
+      MAX_RUN_LEASE_MS,
+      now ?? Date.now(),
+    );
+    const result = this.#immediate(() => {
+      const checkedAt = now ?? Date.now();
+      assertLeaseDuration(
+        leaseMs,
+        MIN_RUN_LEASE_MS,
+        MAX_RUN_LEASE_MS,
+        checkedAt,
+      );
+      return this.#db()
         .prepare(
           `UPDATE runs SET owner_lease_expires_at_ms = ?
       WHERE run_id = ? AND capture_state = 'active' AND owner_token = ? AND owner_lease_expires_at_ms > ?`,
         )
-        .run(now + leaseMs, handle.runId, handle.ownerToken, now),
-    );
+        .run(checkedAt + leaseMs, handle.runId, handle.ownerToken, checkedAt);
+    });
     if (result.changes !== 1)
       throw new CollectorError('invalid-owner', 'run ownership is not active');
   }
@@ -762,15 +786,16 @@ export class LocalSpool implements Disposable {
   #appendEvent(
     handle: RunHandle,
     factory: EventFactory,
-    now = Date.now(),
+    now?: number,
   ): EvidenceEvent {
     return this.#immediate(() => {
+      const checkedAt = now ?? Date.now();
       const row = this.#db()
         .prepare(
           `SELECT next_sequence FROM runs WHERE run_id = ? AND capture_state = 'active'
         AND owner_token = ? AND owner_lease_expires_at_ms > ?`,
         )
-        .get(handle.runId, handle.ownerToken, now) as
+        .get(handle.runId, handle.ownerToken, checkedAt) as
         { next_sequence: number } | undefined;
       if (!row)
         throw new CollectorError(
@@ -809,7 +834,13 @@ export class LocalSpool implements Disposable {
         .prepare(
           'INSERT INTO events(event_id,run_id,sequence,canonical_json,created_at) VALUES (?,?,?,?,?)',
         )
-        .run(event.eventId, event.runId, event.sequence, canonical, iso(now));
+        .run(
+          event.eventId,
+          event.runId,
+          event.sequence,
+          canonical,
+          iso(checkedAt),
+        );
       const link = this.#db().prepare(
         'INSERT INTO event_artifacts(event_id,artifact_id,reference_json) VALUES (?,?,?)',
       );
@@ -839,7 +870,7 @@ export class LocalSpool implements Disposable {
   recordRunStarted(
     handle: RunHandle,
     input: { taskDescription?: Uint8Array },
-    now = Date.now(),
+    now?: number,
   ): EvidenceEvent {
     assertPlainData(input, 'run observation');
     if (
@@ -865,7 +896,7 @@ export class LocalSpool implements Disposable {
         runId,
         sequence,
         kind: 'run.started',
-        observedAt: iso(now),
+        observedAt: iso(now ?? Date.now()),
         source: { component: 'collector' },
         payload: {
           adapter: 'codex',
@@ -879,10 +910,21 @@ export class LocalSpool implements Disposable {
 
   recordRunFinished(
     handle: RunHandle,
-    input: { outcome: 'cancelled' | 'failed' | 'succeeded' },
-    now = Date.now(),
+    input: {
+      durationMs?: number;
+      outcome: 'cancelled' | 'failed' | 'succeeded';
+    },
+    now?: number,
   ): EvidenceEvent {
     assertPlainData(input, 'run observation');
+    if (
+      input.durationMs !== undefined &&
+      (!Number.isSafeInteger(input.durationMs) || input.durationMs < 0)
+    )
+      throw new CollectorError(
+        'collection-failed',
+        'run duration is outside its safe bounds',
+      );
     return this.#appendEvent(
       handle,
       ({ eventId, runId, sequence }) => ({
@@ -891,9 +933,14 @@ export class LocalSpool implements Disposable {
         runId,
         sequence,
         kind: 'run.finished',
-        observedAt: iso(now),
+        observedAt: iso(now ?? Date.now()),
         source: { component: 'collector' },
-        payload: { outcome: input.outcome },
+        payload: {
+          outcome: input.outcome,
+          ...(input.durationMs === undefined
+            ? {}
+            : { durationMs: input.durationMs }),
+        },
       }),
       now,
     );
@@ -1015,9 +1062,10 @@ export class LocalSpool implements Disposable {
     );
   }
 
-  closeRun(handle: RunHandle, now = Date.now()): void {
-    const result = this.#immediate(() =>
-      this.#db()
+  closeRun(handle: RunHandle, now?: number): void {
+    const result = this.#immediate(() => {
+      const checkedAt = now ?? Date.now();
+      return this.#db()
         .prepare(
           `UPDATE runs SET capture_state='closed', owner_token=NULL,
       owner_lease_expires_at_ms=NULL, closed_at=? WHERE run_id=? AND capture_state='active' AND owner_token=?
@@ -1025,8 +1073,8 @@ export class LocalSpool implements Disposable {
         SELECT 1 FROM events WHERE events.run_id=runs.run_id
         AND json_extract(events.canonical_json, '$.kind')='run.finished')`,
         )
-        .run(iso(now), handle.runId, handle.ownerToken, now),
-    );
+        .run(iso(checkedAt), handle.runId, handle.ownerToken, checkedAt);
+    });
     if (result.changes !== 1)
       throw new CollectorError('invalid-owner', 'run ownership is not active');
   }

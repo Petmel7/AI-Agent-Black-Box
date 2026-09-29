@@ -1,6 +1,6 @@
 # BBX-006C: Wrapped Process and Recovery
 
-- **Status:** Approved
+- **Status:** Done
 - **Owner:** Implementation Chat
 - **Review:** Review Chat
 - **Depends on:** BBX-006B completed at `9c1d60bc71ea8eeac6e58801330631361e6bda56`
