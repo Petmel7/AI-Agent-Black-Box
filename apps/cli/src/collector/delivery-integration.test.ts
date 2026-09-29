@@ -18,7 +18,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
 import type { ArtifactReference } from '@blackbox/contracts';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { DeliveryCoordinator } from './coordinator.js';
 import type { DeliveryConfig } from './delivery-config.js';
@@ -135,6 +135,7 @@ function seedBoundArtifact(spoolRoot: string): {
 }
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(
     servers
       .splice(0)
@@ -358,6 +359,8 @@ describe('bounded delivery coordinator', () => {
   it('retries the identical batch after an ambiguous disconnect', async () => {
     const spoolRoot = root();
     const bodies: Buffer[] = [];
+    let wallNow = Date.now();
+    vi.spyOn(Date, 'now').mockImplementation(() => wallNow);
     let first = true;
     const base = await listen((request, response) => {
       void (async () => {
@@ -383,13 +386,72 @@ describe('bounded delivery coordinator', () => {
     session.observeRunFinished({ outcome: 'succeeded' });
     session.close();
     using work = CollectorWorkSpool.open({ spoolRoot });
+    let statusCalls = 0;
+    const racedWork = new Proxy(work, {
+      get(target, property) {
+        if (property === 'status')
+          return (runId?: string) => {
+            statusCalls += 1;
+            if (statusCalls === 1) wallNow += 1;
+            return target.status(runId);
+          };
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
     const result = await new DeliveryCoordinator(
-      work,
+      racedWork,
       deliveryConfig(base, randomUUID(), 'token'),
     ).drain();
     expect(result.batches).toMatchObject({ delivered: 1, retried: 1 });
+    expect(result.attempts).toBe(2);
     expect(bodies).toHaveLength(2);
     expect(bodies[1]).toEqual(bodies[0]);
+    const identities = bodies.map(
+      (body) =>
+        JSON.parse(body.toString('utf8')) as {
+          batchId: string;
+          runId: string;
+        },
+    );
+    expect(identities[1]).toEqual(identities[0]);
+    expect(work.status().batches.delivered).toBe(1);
+  });
+
+  it('bounds the ready-work recheck when claims remain unavailable', async () => {
+    const spoolRoot = root();
+    const session = CollectorSession.open({ spoolRoot });
+    session.observeRunFinished({ outcome: 'succeeded' });
+    session.close();
+    using work = CollectorWorkSpool.open({ spoolRoot });
+    let batchClaims = 0;
+    let artifactClaims = 0;
+    const unavailableWork = new Proxy(work, {
+      get(target, property) {
+        if (property === 'claimBatch')
+          return () => {
+            batchClaims += 1;
+            return undefined;
+          };
+        if (property === 'claimArtifact')
+          return () => {
+            artifactClaims += 1;
+            return undefined;
+          };
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    });
+
+    const result = await new DeliveryCoordinator(
+      unavailableWork,
+      deliveryConfig('http://127.0.0.1:1', randomUUID(), 'token'),
+    ).drain();
+
+    expect(batchClaims).toBe(2);
+    expect(artifactClaims).toBe(2);
+    expect(result.attempts).toBe(0);
+    expect(result.remaining.readyOrDelayed).toBe(1);
   });
 
   it.each(['mismatched-success', 'retry-after'] as const)(

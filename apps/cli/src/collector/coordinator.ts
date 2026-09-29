@@ -107,6 +107,7 @@ export class DeliveryCoordinator {
     const result = emptyResult(prepared.batchesCreated);
     const claimed = new Set<string>();
     let bounded = false;
+    let readyClaimRecheckUsed = false;
     while (true) {
       const claimStartedAt = this.#monotonicNow();
       if (
@@ -130,6 +131,7 @@ export class DeliveryCoordinator {
       );
       const batch = this.spool.claimBatch(leaseMs, runId, maximumWaitMs);
       if (batch) {
+        readyClaimRecheckUsed = false;
         claimed.add(`batch:${batch.id}`);
         result.attempts += 1;
         await this.#deliverBatch(batch, result, operationDeadline);
@@ -157,6 +159,7 @@ export class DeliveryCoordinator {
         ),
       );
       if (artifact) {
+        readyClaimRecheckUsed = false;
         claimed.add(`artifact:${artifact.id}`);
         result.attempts += 1;
         await this.#deliverArtifact(
@@ -169,12 +172,20 @@ export class DeliveryCoordinator {
       const status = this.spool.status(runId);
       const next = status.nextRetryAt ? Date.parse(status.nextRetryAt) : NaN;
       const retryDelay = next - this.#wallNow();
+      const readyPending =
+        status.batches.pending > status.retryDelayed.batches ||
+        status.artifacts.pending > status.retryDelayed.artifacts;
+      if (readyPending && !readyClaimRecheckUsed) {
+        readyClaimRecheckUsed = true;
+        continue;
+      }
       if (
         Number.isFinite(next) &&
         retryDelay > 0 &&
         retryDelay < deadline - this.#monotonicNow() &&
         result.attempts < this.config.drainMaxAttempts
       ) {
+        readyClaimRecheckUsed = false;
         await this.#sleep(retryDelay);
         continue;
       }
