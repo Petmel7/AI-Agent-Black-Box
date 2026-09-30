@@ -1,6 +1,12 @@
 import { spawn, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  rmSync,
+} from 'node:fs';
 import { createServer } from 'node:http';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -23,8 +29,8 @@ async function captureRun(args: readonly string[]) {
   return { errors, exitCode, output };
 }
 
-async function waitForFile(path: string): Promise<void> {
-  const deadline = Date.now() + 5_000;
+async function waitForFile(path: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
   while (!existsSync(path)) {
     if (Date.now() >= deadline) throw new Error('child marker timeout');
     await new Promise((resolve) => setTimeout(resolve, 20));
@@ -354,6 +360,15 @@ describe('blackbox executable', () => {
     async () => {
       const directory = mkdtempSync(join(tmpdir(), 'bbx-bin-signal-'));
       temporaryDirectories.push(directory);
+      const repository = join(directory, 'repository');
+      const spoolRoot = join(directory, 'spool');
+      mkdirSync(repository);
+      expect(
+        spawnSync('git', ['init', '--quiet'], {
+          cwd: repository,
+          encoding: 'utf8',
+        }).status,
+      ).toBe(0);
       const marker = join(directory, 'ready');
       const collector = spawn(
         process.execPath,
@@ -366,14 +381,15 @@ describe('blackbox executable', () => {
           `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'ready'); setInterval(() => {}, 1000)`,
         ],
         {
+          cwd: repository,
           env: {
             ...process.env,
-            BLACKBOX_SPOOL_DIR: join(directory, 'spool'),
+            BLACKBOX_SPOOL_DIR: spoolRoot,
           },
           stdio: ['ignore', 'pipe', 'pipe'],
         },
       );
-      await waitForFile(marker);
+      await waitForFile(marker, 15_000);
       const exited = new Promise<{
         code: number | null;
         signal: NodeJS.Signals | null;
@@ -384,22 +400,39 @@ describe('blackbox executable', () => {
       const result = await exited;
       expect(result).toEqual({ code: null, signal: 'SIGTERM' });
       const events = (() => {
-        using database = new DatabaseSync(
-          join(directory, 'spool', 'spool.sqlite3'),
-          { readOnly: true },
-        );
+        using database = new DatabaseSync(join(spoolRoot, 'spool.sqlite3'), {
+          readOnly: true,
+        });
         return (
           database
             .prepare('SELECT canonical_json FROM events ORDER BY sequence')
             .all() as unknown as { canonical_json: string }[]
-        ).map((row) => JSON.parse(row.canonical_json) as unknown);
+        ).map(
+          (row) =>
+            JSON.parse(row.canonical_json) as {
+              kind: string;
+              payload: Record<string, unknown>;
+            },
+        );
       })();
-      expect(events).toHaveLength(2);
-      expect(events[1]).toMatchObject({
+      expect(events.map((event) => event.kind)).toEqual([
+        'run.started',
+        'git.snapshot.captured',
+        'git.snapshot.captured',
+        'git.diff.captured',
+        'run.finished',
+      ]);
+      expect(events[1]?.payload).toMatchObject({ phase: 'before' });
+      expect(events[2]?.payload).toMatchObject({ phase: 'after' });
+      expect(events[3]?.payload).toMatchObject({
+        fromSnapshotId: events[1]?.payload.snapshotId,
+        toSnapshotId: events[2]?.payload.snapshotId,
+      });
+      expect(events[4]).toMatchObject({
         kind: 'run.finished',
         payload: { outcome: 'cancelled' },
       });
     },
-    10_000,
+    35_000,
   );
 });
