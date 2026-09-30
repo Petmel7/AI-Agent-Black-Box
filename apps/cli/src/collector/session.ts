@@ -1,4 +1,9 @@
-import type { ContentCapture, EvidenceEvent } from '@blackbox/contracts';
+import {
+  GitSnapshotPhaseSchema,
+  type ContentCapture,
+  type EvidenceEvent,
+  type GitSnapshotPhase,
+} from '@blackbox/contracts';
 
 import {
   type CaptureClass,
@@ -7,6 +12,7 @@ import {
   validateCollectorConfig,
 } from './config.js';
 import { CollectorError } from './errors.js';
+import { GitReader, type GitSnapshot } from './git.js';
 import type { RedactorOptions } from './redaction.js';
 import {
   DEFAULT_LEASE_MS,
@@ -127,6 +133,7 @@ function copyRedactorOptions(value: RedactorOptions): RedactorOptions {
     ...(value.repositoryRoot
       ? { repositoryRoot: String(value.repositoryRoot) }
       : {}),
+    ...(value.spoolRoot ? { spoolRoot: String(value.spoolRoot) } : {}),
   };
 }
 
@@ -145,10 +152,22 @@ function freezeCapture(capture: ContentCapture): ContentCapture {
 export class CollectorSession implements Disposable {
   readonly #handle: RunHandle;
   readonly #spool: LocalSpool;
+  readonly #initialCwd: string;
+  readonly #repositoryRoot: string | undefined;
+  #gitReader: GitReader | undefined;
+  #comparisonRecorded = false;
+  readonly #snapshots = new Map<GitSnapshotPhase, GitSnapshot>();
 
-  private constructor(spool: LocalSpool, handle: RunHandle) {
+  private constructor(
+    spool: LocalSpool,
+    handle: RunHandle,
+    initialCwd: string,
+    repositoryRoot: string | undefined,
+  ) {
     this.#spool = spool;
     this.#handle = handle;
+    this.#initialCwd = initialCwd;
+    this.#repositoryRoot = repositoryRoot;
   }
 
   static open(
@@ -175,13 +194,21 @@ export class CollectorSession implements Disposable {
     if (configInput.spoolRoot !== undefined)
       normalizedConfig.spoolRoot = configInput.spoolRoot;
     const config = validateCollectorConfig(normalizedConfig);
-    const spool = new LocalSpool(
-      config,
-      {},
-      copyRedactorOptions(redactorOptions),
-    ).open();
+    const copiedRedactorOptions = {
+      ...copyRedactorOptions(redactorOptions),
+      ...(config.repositoryRoot
+        ? { repositoryRoot: config.repositoryRoot }
+        : {}),
+      spoolRoot: config.spoolRoot,
+    };
+    const spool = new LocalSpool(config, {}, copiedRedactorOptions).open();
     try {
-      return new CollectorSession(spool, spool.createRun(leaseMs));
+      return new CollectorSession(
+        spool,
+        spool.createRun(leaseMs),
+        process.cwd(),
+        config.repositoryRoot,
+      );
     } catch (cause) {
       spool.close();
       throw cause;
@@ -221,16 +248,48 @@ export class CollectorSession implements Disposable {
     );
   }
 
-  observeGitDiffCaptured(input: {
-    diff: Uint8Array;
-    diffId: string;
-    fileList: Uint8Array;
-    fromSnapshotId: string;
-    toSnapshotId: string;
-  }): EvidenceEvent {
-    return structuredClone(
-      this.#spool.recordGitDiffCaptured(this.#handle, input),
+  captureGitSnapshot(phase: GitSnapshotPhase): EvidenceEvent {
+    const parsedPhase = GitSnapshotPhaseSchema.safeParse(phase);
+    if (!parsedPhase.success)
+      throw new CollectorError(
+        'collection-failed',
+        'Git snapshot phase is invalid',
+      );
+    this.#gitReader ??= GitReader.open(this.#initialCwd, this.#repositoryRoot);
+    const snapshot = this.#gitReader.capture(parsedPhase.data, (value) =>
+      this.#spool.redactGitDisplayPath(value),
     );
+    const event = this.#spool.recordGitSnapshot(this.#handle, snapshot);
+    this.#snapshots.set(parsedPhase.data, snapshot);
+    return structuredClone(event);
+  }
+
+  compareGitSnapshots(): EvidenceEvent {
+    if (this.#comparisonRecorded)
+      throw new CollectorError(
+        'collection-failed',
+        'Git comparison is already recorded',
+      );
+    const before = this.#snapshots.get('before');
+    const after = this.#snapshots.get('after');
+    if (!before || !after)
+      throw new CollectorError(
+        'collection-failed',
+        'before and after Git snapshots are required',
+      );
+    if (!this.#gitReader)
+      throw new CollectorError(
+        'collection-failed',
+        'Git reader is unavailable for comparison',
+      );
+    const event = this.#spool.recordGitComparison(
+      this.#handle,
+      before,
+      after,
+      this.#gitReader.compare(before, after),
+    );
+    this.#comparisonRecorded = true;
+    return structuredClone(event);
   }
 
   observeRunFinished(input: {

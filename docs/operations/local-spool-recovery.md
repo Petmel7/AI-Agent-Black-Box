@@ -23,7 +23,7 @@ leases and then performs one bounded delivery drain when remote configuration is
 complete. It never becomes a background service. It does not provide
 destructive repair or retention cleanup.
 Automatic deletion of pending, leased, blocked, or otherwise unacknowledged
-evidence is forbidden. Network delivery and retry commands arrive in BBX-006B.
+evidence is forbidden.
 
 After recovery, `CollectorWorkSpool.prepareBatches()` may be run repeatedly to
 form sealed delivery work from persisted events. Active, closed, and
@@ -42,3 +42,13 @@ events remain eligible for sealed batch preparation. Do not manually close or
 rewrite such a run. A normally observed signal skips lifecycle delivery so the
 caller can reproduce the child signal promptly; use `blackbox retry --run
 <run-id>` later when delivery is configured.
+
+Git collection can add immutable `git-status`, `git-diff`, and `git-file-list`
+artifacts. A before-snapshot failure prevents child launch and normally leaves a
+closed failed run with no Git event. A final snapshot or comparison failure may
+leave the valid before snapshot (and, if its own commit succeeded, the valid
+after snapshot) followed by the child's real terminal event; absence of a
+comparison is visible uncertainty and must not be repaired by synthesizing one.
+A crash or quota/ownership failure after an artifact rename but before its
+event transaction may leave a redacted orphan file. Preserve it and use the
+normal artifact audit/status path; never link or delete it manually.

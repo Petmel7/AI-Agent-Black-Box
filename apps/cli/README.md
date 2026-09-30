@@ -18,7 +18,8 @@ Inline excerpts are at most 4,096 characters. The total spool quota defaults to
 Redaction uses `collector-redaction-v1`. Conservative environment-secret names,
 names in `BLACKBOX_REDACT_ENV_NAMES`, collector credentials held in memory, and
 one-literal-per-line values from `BLACKBOX_REDACT_LITERAL_FILE` are replaced
-before excerpts, hashes, temporary files, SQLite, or batches are created.
+along with repository, user-home, and spool paths before excerpts, hashes,
+temporary files, SQLite, or batches are created.
 Arbitrary regular expressions are not supported. Short values are ignored as
 global literal rules to avoid destroying ordinary text.
 
@@ -123,3 +124,32 @@ failure never replace the child's exact exit code. Supported signals are
 forwarded only to the direct child; signal completion skips remote delivery.
 The collector does not supervise descendant process trees or capture child
 stdio in this task.
+
+### Local Git evidence
+
+`blackbox run` requires the initial working directory to resolve to a non-bare
+local Git worktree. Git must be installed. Attached branches, detached HEAD,
+unborn branches, and linked worktrees are supported. When
+`BLACKBOX_REPOSITORY_ROOT` is set, its canonical path must exactly match the
+discovered worktree root. A missing Git executable, non-repository, bare
+repository, root mismatch, unsafe or excessive output, or inconsistent read
+prevents child launch and returns collector exit `1`.
+
+The collector records `run.started`, a consistent `before` snapshot, the
+child's actual close, an `after` snapshot and conservative comparison,
+`run.finished`, and then closes the run. Final Git degradation produces the
+existing content-free warning but cannot replace the child's exit or supported
+signal result. Signal completion may perform bounded local Git finalization
+but never enables remote delivery.
+
+Git is invoked directly without a shell. Prompts, pagers, optional locks,
+external diff/textconv/fsmonitor helpers, unsafe inherited Git environment
+overrides, and network-capable operations are disabled. Collection never stages, commits,
+checks out, stashes, cleans, writes refs or objects, or recursively inspects
+submodules, nested repositories, ignored files, or symlink targets. Status,
+patch, and untracked text cross the existing redaction boundary before any
+temporary or final spool write.
+
+Artifact schema, ordering, attribution meanings, and fixed limits are defined
+in `docs/architecture/git-artifact-formats-v1.md`. In particular,
+`observed-during-run` is temporal evidence and is not a causal claim.

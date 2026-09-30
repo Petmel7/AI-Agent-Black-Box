@@ -17,7 +17,6 @@ import { auditArtifacts } from './artifacts.js';
 import { validateCollectorConfig } from './config.js';
 import { CollectorError } from './errors.js';
 import type { RedactorOptions } from './redaction.js';
-import { CollectorSession } from './session.js';
 import { LocalSpool } from './spool.js';
 
 const roots: string[] = [];
@@ -46,21 +45,6 @@ function opened(
     hooks,
     redactorOptions,
   ).open();
-}
-
-function openedSession(
-  spool: LocalSpool,
-  options: RedactorOptions = {},
-): CollectorSession {
-  return CollectorSession.open(
-    {
-      captureClasses: [...spool.config.captureClasses],
-      inputLimitBytes: spool.config.inputLimitBytes,
-      spoolQuotaBytes: spool.config.spoolQuotaBytes,
-      spoolRoot: spool.config.spoolRoot,
-    },
-    options,
-  );
 }
 
 function declaredArtifact(
@@ -327,8 +311,8 @@ describe('artifact durability and privacy', () => {
 
   it('requires complete immutable artifact declarations and rolls mismatches back', () => {
     using spool = opened();
-    using session = openedSession(spool, { environment: {} });
-    const valid = session.observeGitDiffCaptured({
+    const handle = spool.createRun();
+    const valid = spool.recordGitDiffCaptured(handle, {
       diff: Buffer.from('diff'),
       diffId: randomUUID(),
       fileList: Buffer.from('file.ts'),
@@ -357,7 +341,7 @@ describe('artifact durability and privacy', () => {
 
     if (valid.kind !== 'git.diff.captured')
       throw new Error('expected git diff');
-    const thirdEvent = session.observeCommandFinished({
+    const thirdEvent = spool.recordCommandFinished(handle, {
       commandId: randomUUID(),
       outcome: 'succeeded',
       stdout: Buffer.from('third'),
@@ -453,7 +437,7 @@ describe('artifact durability and privacy', () => {
     ).toThrow(/sealed event artifacts/);
     database.exec('ROLLBACK');
     database.close();
-    expect(spool.createBatch(session.runId)?.events).toHaveLength(2);
+    expect(spool.createBatch(handle.runId)?.events).toHaveLength(2);
   });
 
   it('verifies artifacts only from a matching owned upload response', () => {

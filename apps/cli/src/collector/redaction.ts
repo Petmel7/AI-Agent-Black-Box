@@ -16,6 +16,7 @@ export const REDACTION_RULESET_VERSION = 'collector-redaction-v1';
 export const REDACTION_MARKER = '[REDACTED]';
 export const REPOSITORY_PLACEHOLDER = '<repository-root>';
 export const HOME_PLACEHOLDER = '<user-home>';
+export const SPOOL_PLACEHOLDER = '<spool-root>';
 const MIN_LITERAL_LENGTH = 8;
 const SECRET_ENV_NAME =
   /(?:^|_)(?:API_KEY|AUTH|CREDENTIAL|DATABASE_URL|PASSWORD|PRIVATE_KEY|SECRET|TOKEN)(?:_|$)/i;
@@ -32,6 +33,7 @@ export interface RedactorOptions {
   homeDirectory?: string;
   literalFilePath?: string;
   repositoryRoot?: string;
+  spoolRoot?: string;
 }
 
 export interface RedactionResult {
@@ -153,6 +155,7 @@ export class Redactor {
   readonly homeDirectory: string;
   readonly ignoredLiteralCount: number;
   readonly repositoryRoot: string | undefined;
+  readonly spoolRoot: string | undefined;
 
   constructor(options: RedactorOptions = {}) {
     const environment = options.environment ?? process.env;
@@ -179,6 +182,7 @@ export class Redactor {
     this.ignoredLiteralCount = ignoredLiteralCount;
     this.homeDirectory = options.homeDirectory ?? homedir();
     this.repositoryRoot = options.repositoryRoot;
+    this.spoolRoot = options.spoolRoot;
   }
 
   redact(input: string): RedactionResult {
@@ -189,6 +193,8 @@ export class Redactor {
         this.repositoryRoot,
         REPOSITORY_PLACEHOLDER,
       );
+    if (this.spoolRoot)
+      text = replacePrivatePath(text, this.spoolRoot, SPOOL_PLACEHOLDER);
     if (this.homeDirectory)
       text = replacePrivatePath(text, this.homeDirectory, HOME_PLACEHOLDER);
     const matches: Match[] = [];

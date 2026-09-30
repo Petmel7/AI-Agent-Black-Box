@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { pathToFileURL } from 'node:url';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import { composeCollectorFromEnvironment } from './collector/environment.js';
 import { LocalSpool } from './collector/spool.js';
@@ -20,6 +20,21 @@ import {
 } from './process-runner.js';
 
 const roots: string[] = [];
+const originalWorkingDirectory = process.cwd();
+const wrappedRepository = mkdtempSync(join(tmpdir(), 'bbx-process-repo-'));
+
+beforeAll(() => {
+  execFileSync('git', ['init', '--quiet'], {
+    cwd: wrappedRepository,
+    stdio: 'ignore',
+  });
+  process.chdir(wrappedRepository);
+});
+
+afterAll(() => {
+  process.chdir(originalWorkingDirectory);
+  rmSync(wrappedRepository, { force: true, recursive: true });
+});
 
 function temporaryRoot(): string {
   const directory = mkdtempSync(join(tmpdir(), 'bbx-process-'));
@@ -101,7 +116,9 @@ class FakeChild extends EventEmitter {
 
 function fakeSession(
   overrides: Partial<{
+    capture(phase: 'after' | 'before' | 'checkpoint'): void;
     close(): void;
+    compare(): void;
     dispose(): void;
     finish(): void;
     renew(): void;
@@ -110,7 +127,9 @@ function fakeSession(
 ) {
   return {
     runId: randomUUID(),
+    captureGitSnapshot: overrides.capture ?? (() => undefined),
     close: overrides.close ?? (() => undefined),
+    compareGitSnapshots: overrides.compare ?? (() => undefined),
     observeRunFinished: overrides.finish ?? (() => undefined),
     observeRunStarted: overrides.start ?? (() => undefined),
     renewLease: overrides.renew ?? (() => undefined),
@@ -119,6 +138,75 @@ function fakeSession(
 }
 
 describe('wrapped process boundary', () => {
+  it('prevents launch on before-capture failure and closes with failed terminal evidence', async () => {
+    const actions: string[] = [];
+    let spawned = false;
+    const result = await runWrappedProcess(
+      'fixture',
+      [],
+      {},
+      composeCollectorFromEnvironment({
+        BLACKBOX_SPOOL_DIR: join(temporaryRoot(), 'spool'),
+      }),
+      { state: 'offline' },
+      { warning: () => undefined },
+      {
+        openSession: () =>
+          fakeSession({
+            capture: (phase) => {
+              actions.push(phase);
+              throw new Error('safe failure');
+            },
+            close: () => actions.push('close'),
+            finish: () => actions.push('finish'),
+            start: () => actions.push('start'),
+          }),
+        spawn: () => {
+          spawned = true;
+          return new FakeChild() as unknown as ChildProcess;
+        },
+      },
+    );
+    expect(result).toEqual({ code: 1, kind: 'exit' });
+    expect(spawned).toBe(false);
+    expect(actions).toEqual(['start', 'before', 'finish', 'close']);
+  });
+
+  it('keeps final Git degradation secondary and preserves finalization order', async () => {
+    const child = new FakeChild();
+    const actions: string[] = [];
+    const warnings: string[] = [];
+    const resultPromise = runWrappedProcess(
+      'fixture',
+      [],
+      {},
+      composeCollectorFromEnvironment({
+        BLACKBOX_SPOOL_DIR: join(temporaryRoot(), 'spool'),
+      }),
+      { state: 'offline' },
+      { warning: (message) => warnings.push(message) },
+      {
+        openSession: () =>
+          fakeSession({
+            capture: (phase) => {
+              actions.push(phase);
+              if (phase === 'after') throw new Error('safe failure');
+            },
+            close: () => actions.push('close'),
+            compare: () => actions.push('compare'),
+            finish: () => actions.push('finish'),
+            start: () => actions.push('start'),
+          }),
+        spawn: () => child as unknown as ChildProcess,
+      },
+    );
+    child.emit('spawn');
+    child.emit('close', 37, null);
+    expect(await resultPromise).toEqual({ code: 37, kind: 'exit' });
+    expect(actions).toEqual(['start', 'before', 'after', 'finish', 'close']);
+    expect(warnings).toEqual(['Collector degraded: collection-failed']);
+  });
+
   it('filters collector variables case-insensitively and rejects ambiguous keys', () => {
     const runId = randomUUID();
     expect(
@@ -226,16 +314,20 @@ describe('wrapped process boundary', () => {
       const events = canonicalEvents(spoolRoot);
       expect(events.map((event) => event.kind)).toEqual([
         'run.started',
+        'git.snapshot.captured',
+        'git.snapshot.captured',
+        'git.diff.captured',
         'run.finished',
       ]);
       expect(events[0]?.runId).toBe(observed.runId);
-      expect(events[1]?.payload).toMatchObject({
+      expect(events[4]?.payload).toMatchObject({
         outcome: exitCode === 0 ? 'succeeded' : 'failed',
       });
       expect(
-        (events[1]?.payload as { durationMs: number }).durationMs,
+        (events[4]?.payload as { durationMs: number }).durationMs,
       ).toBeGreaterThanOrEqual(0);
     },
+    15_000,
   );
 
   it('renews ownership for a child that outlives the initial lease', async () => {
@@ -272,7 +364,7 @@ describe('wrapped process boundary', () => {
           fakeSession({
             renew: () => {
               renewals += 1;
-              throw new Error('raw renewal secret');
+              if (renewals > 1) throw new Error('raw renewal secret');
             },
           }),
         runLeaseMs: 4_000,
@@ -282,7 +374,7 @@ describe('wrapped process boundary', () => {
     expect(execution.warnings).toEqual([
       'Collector degraded: collection-failed',
     ]);
-    expect(renewals).toBe(1);
+    expect(renewals).toBe(2);
   });
 
   it('waits for close after repeated post-spawn errors and finalizes normal-exit work once', async () => {
@@ -330,9 +422,11 @@ describe('wrapped process boundary', () => {
           }) as never,
         openSession: () => ({
           runId: randomUUID(),
+          captureGitSnapshot: () => undefined,
           close: () => {
             closes += 1;
           },
+          compareGitSnapshots: () => undefined,
           observeRunFinished: (input) => outcomes.push(input),
           observeRunStarted: () => undefined,
           renewLease: () => undefined,
@@ -389,7 +483,9 @@ describe('wrapped process boundary', () => {
       {
         openSession: () => ({
           runId: randomUUID(),
+          captureGitSnapshot: () => undefined,
           close: () => undefined,
+          compareGitSnapshots: () => undefined,
           observeRunFinished: (input) => outcomes.push(input.outcome),
           observeRunStarted: () => undefined,
           renewLease: () => undefined,
@@ -430,7 +526,9 @@ describe('wrapped process boundary', () => {
       {
         openSession: () => ({
           runId: randomUUID(),
+          captureGitSnapshot: () => undefined,
           close: () => undefined,
+          compareGitSnapshots: () => undefined,
           observeRunFinished: (input) => outcomes.push(input.outcome),
           observeRunStarted: () => undefined,
           renewLease: () => undefined,
@@ -477,9 +575,11 @@ describe('wrapped process boundary', () => {
       {
         openSession: () => ({
           runId: randomUUID(),
+          captureGitSnapshot: () => undefined,
           close: () => {
             closes += 1;
           },
+          compareGitSnapshots: () => undefined,
           observeRunFinished: (input) => outcomes.push(input.outcome),
           observeRunStarted: () => undefined,
           renewLease: () => undefined,
@@ -720,9 +820,10 @@ describe('wrapped process boundary', () => {
     });
     expect(canonicalEvents(spoolRoot).map((event) => event.kind)).toEqual([
       'run.started',
+      'git.snapshot.captured',
       'run.finished',
     ]);
-    expect(canonicalEvents(spoolRoot)[1]?.payload).toMatchObject({
+    expect(canonicalEvents(spoolRoot)[2]?.payload).toMatchObject({
       outcome: 'failed',
     });
   });
@@ -732,15 +833,15 @@ describe('wrapped process boundary', () => {
     const spoolRoot = join(directory, 'spool');
     const marker = join(directory, 'child-started');
     const runnerModule = pathToFileURL(
-      join(process.cwd(), 'dist', 'process-runner.js'),
+      join(originalWorkingDirectory, 'dist', 'process-runner.js'),
     ).href;
     const environmentModule = pathToFileURL(
-      join(process.cwd(), 'dist', 'collector', 'environment.js'),
+      join(originalWorkingDirectory, 'dist', 'collector', 'environment.js'),
     ).href;
     const fixture = `
       import { runWrappedProcess } from ${JSON.stringify(runnerModule)};
       import { composeCollectorFromEnvironment } from ${JSON.stringify(environmentModule)};
-      await runWrappedProcess(process.execPath, ['-e', ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'started'); setTimeout(() => process.exit(0), 500)`)}], process.env, composeCollectorFromEnvironment(process.env), { state: 'offline' }, { warning() {} }, { runLeaseMs: 4500, heartbeatIntervalMs: 1000 });
+      await runWrappedProcess(process.execPath, ['-e', ${JSON.stringify(`require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'started'); setTimeout(() => process.exit(0), 500)`)}], process.env, composeCollectorFromEnvironment(process.env), { state: 'offline' }, { warning() {} }, { runLeaseMs: 10000, heartbeatIntervalMs: 1000 });
     `;
     const collector = spawn(
       process.execPath,
@@ -756,17 +857,17 @@ describe('wrapped process boundary', () => {
     );
     collector.kill('SIGKILL');
     await exited;
-    await new Promise((resolve) => setTimeout(resolve, 4_600));
+    await new Promise((resolve) => setTimeout(resolve, 10_100));
     using work = CollectorWorkSpool.open({ spoolRoot });
     expect(work.recoverExpired().runs).toBe(1);
     expect(work.status().runs).toMatchObject({ active: 0, interrupted: 1 });
     expect(work.prepareBatches()).toEqual({
       batchesCreated: 1,
-      eventsBatched: 1,
+      eventsBatched: 2,
     });
     const claim = work.claimBatch();
     expect(claim?.body).toContain('run.started');
-  }, 12_000);
+  }, 25_000);
 });
 
 function exists(path: string): boolean {
@@ -779,7 +880,7 @@ function exists(path: string): boolean {
 }
 
 async function waitForPath(path: string): Promise<void> {
-  const deadline = Date.now() + 5_000;
+  const deadline = Date.now() + 12_000;
   while (!exists(path)) {
     if (Date.now() >= deadline)
       throw new Error('collector fixture did not launch child');

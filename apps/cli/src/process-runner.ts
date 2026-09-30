@@ -43,7 +43,9 @@ export interface WrappedRunIo {
 
 interface RunSession {
   readonly runId: string;
+  captureGitSnapshot(phase: 'after' | 'before' | 'checkpoint'): unknown;
   close(): void;
+  compareGitSnapshots(): unknown;
   observeRunFinished(input: {
     durationMs?: number;
     outcome: 'cancelled' | 'failed' | 'succeeded';
@@ -228,6 +230,20 @@ export async function runWrappedProcess(
     buildChildEnvironment(environment, '00000000-0000-4000-8000-000000000000');
     session = openSession(composition, leaseMs);
     session.observeRunStarted({});
+    try {
+      session.captureGitSnapshot('before');
+      session.renewLease(leaseMs);
+    } catch {
+      try {
+        session.observeRunFinished({ outcome: 'failed' });
+        session.close();
+        sessionFinalized = true;
+      } catch {
+        warn();
+        disposeSession();
+      }
+      return { code: 1, kind: 'exit' };
+    }
     const childEnvironment = buildChildEnvironment(environment, session.runId);
     try {
       child = spawnChild(command, [...args], {
@@ -342,6 +358,13 @@ export async function runWrappedProcess(
       : closed.code === 0
         ? 'succeeded'
         : 'failed';
+    if (!writesDisabled)
+      try {
+        session.captureGitSnapshot('after');
+        session.compareGitSnapshots();
+      } catch {
+        warn(false);
+      }
     let closedDurably = false;
     if (!writesDisabled)
       try {

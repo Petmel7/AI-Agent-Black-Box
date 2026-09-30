@@ -1,6 +1,6 @@
 # BBX-007: Git Before/After Evidence
 
-- **Status:** Approved
+- **Status:** Done
 - **Owner:** Implementation Chat
 - **Review:** Review Chat
 - **Depends on:** BBX-006C completed at `bd033b6eb0fa6e1e4bd9fd0b9f11b03cf6ea70e2`

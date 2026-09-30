@@ -1,4 +1,5 @@
 import { randomUUID } from 'node:crypto';
+import { execFileSync } from 'node:child_process';
 import {
   existsSync,
   mkdtempSync,
@@ -9,7 +10,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import { runCli } from '../cli.js';
 import { validateCollectorConfig } from './config.js';
@@ -18,6 +19,22 @@ import { LocalSpool } from './spool.js';
 import * as collectorApi from './index.js';
 
 const roots: string[] = [];
+const originalWorkingDirectory = process.cwd();
+const securityRepository = mkdtempSync(join(tmpdir(), 'bbx-security-repo-'));
+
+beforeAll(() => {
+  execFileSync('git', ['init', '--quiet'], {
+    cwd: securityRepository,
+    stdio: 'ignore',
+  });
+  process.chdir(securityRepository);
+});
+
+afterAll(() => {
+  process.chdir(originalWorkingDirectory);
+  rmSync(securityRepository, { force: true, recursive: true });
+});
+
 function temporaryRoot(): string {
   const path = mkdtempSync(join(tmpdir(), 'bbx-security-'));
   roots.push(path);
@@ -100,13 +117,6 @@ describe('complete durable-surface sentinel scan', () => {
       returnedEvent.payload.stdout.state === 'captured'
     )
       Object.assign(returnedEvent.payload.stdout, { excerpt: sentinel });
-    session.observeGitDiffCaptured({
-      diff: Buffer.from(`${sentinel} ${repositoryRoot}`),
-      diffId: randomUUID(),
-      fileList: Buffer.from(`${sentinel} ${homeDirectory}`),
-      fromSnapshotId: randomUUID(),
-      toSnapshotId: randomUUID(),
-    });
     session.observeRunFinished({ outcome: 'succeeded' });
     const runId = session.runId;
     session.close();
@@ -161,11 +171,12 @@ describe('complete durable-surface sentinel scan', () => {
     expect(
       Object.getOwnPropertyNames(CollectorSession.prototype).sort(),
     ).toEqual([
+      'captureGitSnapshot',
       'captureText',
       'close',
+      'compareGitSnapshots',
       'constructor',
       'observeCommandFinished',
-      'observeGitDiffCaptured',
       'observeRunFinished',
       'observeRunStarted',
       'renewLease',
@@ -241,6 +252,10 @@ describe('complete durable-surface sentinel scan', () => {
     });
     expect(() => session.observeCommandFinished(accessor as never)).toThrow();
     expect(() =>
+      session.captureGitSnapshot({ phase: 'before', secret } as never),
+    ).toThrow();
+    expect(() => session.compareGitSnapshots()).toThrow();
+    expect(() =>
       session.observeRunFinished(
         Object.assign(Object.create({ secret }), { outcome: 'succeeded' }),
       ),
@@ -285,5 +300,5 @@ describe('complete durable-surface sentinel scan', () => {
     expect(rendered).not.toContain(sentinel);
     for (const path of allFiles(spoolRoot))
       expect(readFileSync(path).includes(Buffer.from(sentinel))).toBe(false);
-  });
+  }, 15_000);
 });

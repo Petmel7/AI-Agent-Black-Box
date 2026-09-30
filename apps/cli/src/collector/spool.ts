@@ -33,6 +33,11 @@ import {
 import type { CaptureClass, CollectorConfig } from './config.js';
 import { CollectorError, type CollectorErrorCode } from './errors.js';
 import {
+  GIT_MAX_ARTIFACT_BYTES,
+  type GitComparison,
+  type GitSnapshot,
+} from './git.js';
+import {
   captureText,
   REDACTION_RULESET_VERSION,
   Redactor,
@@ -146,6 +151,11 @@ export interface EventIdentity {
 }
 
 type EventFactory = (identity: EventIdentity) => unknown;
+
+interface PreparedArtifact {
+  readonly reference: ArtifactReference;
+  readonly relativePath: string;
+}
 
 function assertPlainData(value: unknown, label: string): void {
   const visit = (item: unknown): void => {
@@ -543,7 +553,10 @@ export class LocalSpool implements Disposable {
     redactorOptions: RedactorOptions = { environment: {} },
   ) {
     this.config = config;
-    this.#redactor = new Redactor(redactorOptions);
+    this.#redactor = new Redactor({
+      ...redactorOptions,
+      spoolRoot: config.spoolRoot,
+    });
   }
 
   get databasePath(): string {
@@ -787,6 +800,7 @@ export class LocalSpool implements Disposable {
     handle: RunHandle,
     factory: EventFactory,
     now?: number,
+    preparedArtifacts: readonly PreparedArtifact[] = [],
   ): EvidenceEvent {
     return this.#immediate(() => {
       const checkedAt = now ?? Date.now();
@@ -802,6 +816,30 @@ export class LocalSpool implements Disposable {
           'invalid-owner',
           'run ownership is not active',
         );
+      for (const prepared of preparedArtifacts) {
+        const canonical = JSON.stringify(prepared.reference);
+        this.#assertQuota(
+          prepared.reference.byteLength + Buffer.byteLength(canonical),
+        );
+        this.#db()
+          .prepare(
+            `INSERT INTO artifacts
+          (artifact_id,run_id,relative_path,canonical_json,byte_length,sha256,created_at)
+          VALUES (?,?,?,?,?,?,?)`,
+          )
+          .run(
+            prepared.reference.artifactId,
+            handle.runId,
+            prepared.relativePath,
+            canonical,
+            prepared.reference.byteLength,
+            prepared.reference.sha256,
+            iso(checkedAt),
+          );
+        this.#db()
+          .prepare('INSERT INTO artifact_work(artifact_id) VALUES (?)')
+          .run(prepared.reference.artifactId);
+      }
       const event = EvidenceEventSchema.parse(
         factory({
           eventId: randomUUID(),
@@ -1020,9 +1058,7 @@ export class LocalSpool implements Disposable {
       handle,
       'file-content',
       Uint8Array.from(input.diff),
-      {
-        kind: 'git-diff',
-      },
+      { kind: 'git-diff' },
     );
     const fileList = this.captureText(
       handle,
@@ -1059,6 +1095,154 @@ export class LocalSpool implements Disposable {
         },
       }),
       now,
+    );
+  }
+
+  #prepareRedactedArtifact(
+    input: Uint8Array,
+    kind: 'git-diff' | 'git-file-list' | 'git-status',
+  ): PreparedArtifact {
+    if (input.byteLength > GIT_MAX_ARTIFACT_BYTES) {
+      this.recordDiagnostic('capture-bound-reached');
+      throw new CollectorError(
+        'quota-exceeded',
+        'Git artifact exceeds its safe bound',
+      );
+    }
+    let decoded: string;
+    try {
+      decoded = new TextDecoder('utf-8', { fatal: true }).decode(input);
+    } catch (cause) {
+      throw new CollectorError(
+        'collection-failed',
+        'Git artifact is not strict UTF-8',
+        { cause },
+      );
+    }
+    const bytes = Buffer.from(this.#redactor.redact(decoded).text, 'utf8');
+    if (bytes.byteLength > GIT_MAX_ARTIFACT_BYTES) {
+      this.recordDiagnostic('capture-bound-reached');
+      throw new CollectorError(
+        'quota-exceeded',
+        'Git artifact exceeds its safe bound',
+      );
+    }
+    if (
+      this.status().bytes.total + bytes.byteLength >
+      this.config.spoolQuotaBytes
+    ) {
+      this.recordDiagnostic('quota-exceeded');
+      throw new CollectorError(
+        'quota-exceeded',
+        'spool quota does not permit this artifact',
+      );
+    }
+    const artifactId = randomUUID();
+    const relativePath = `${randomUUID()}.artifact`;
+    const temporaryPath = join(this.artifactDirectory, `${randomUUID()}.tmp`);
+    const finalPath = join(this.artifactDirectory, relativePath);
+    const descriptor = openSync(temporaryPath, 'wx', 0o600);
+    try {
+      writeFileSync(descriptor, bytes);
+      this.hooks.afterArtifactWrite?.();
+      fsyncSync(descriptor);
+      this.hooks.afterArtifactFlush?.();
+    } finally {
+      closeSync(descriptor);
+    }
+    renameSync(temporaryPath, finalPath);
+    syncDirectory(this.artifactDirectory);
+    this.hooks.afterArtifactRename?.();
+    const observed = readFileSync(finalPath);
+    return {
+      relativePath,
+      reference: ArtifactReferenceSchema.parse({
+        artifactId,
+        kind,
+        mediaType: 'application/json',
+        byteLength: observed.byteLength,
+        sha256: sha256(observed),
+        redaction: { applied: true, rulesetVersion: REDACTION_RULESET_VERSION },
+        characterEncoding: 'utf-8',
+      }),
+    };
+  }
+
+  recordGitSnapshot(
+    handle: RunHandle,
+    snapshot: GitSnapshot,
+    now = Date.now(),
+  ): EvidenceEvent {
+    const status = this.#prepareRedactedArtifact(
+      snapshot.statusBytes,
+      'git-status',
+    );
+    return this.#appendEvent(
+      handle,
+      ({ eventId, runId, sequence }) => ({
+        schemaVersion: 1,
+        eventId,
+        runId,
+        sequence,
+        kind: 'git.snapshot.captured',
+        observedAt: iso(now),
+        source: { component: 'git' },
+        payload: {
+          snapshotId: snapshot.snapshotId,
+          phase: snapshot.phase,
+          ...(snapshot.headCommit ? { headCommit: snapshot.headCommit } : {}),
+          isDirty: snapshot.entries.length > 0,
+          stagedFileCount: snapshot.stagedFileCount,
+          unstagedFileCount: snapshot.unstagedFileCount,
+          untrackedFileCount: snapshot.untrackedFileCount,
+          statusArtifact: status.reference,
+        },
+      }),
+      now,
+      [status],
+    );
+  }
+
+  redactGitDisplayPath(value: string): string {
+    return this.#redactor.redact(value).text;
+  }
+
+  recordGitComparison(
+    handle: RunHandle,
+    before: GitSnapshot,
+    after: GitSnapshot,
+    comparison: GitComparison,
+    now = Date.now(),
+  ): EvidenceEvent {
+    const diff = this.#prepareRedactedArtifact(
+      comparison.comparisonBytes,
+      'git-diff',
+    );
+    const fileList = this.#prepareRedactedArtifact(
+      comparison.fileListBytes,
+      'git-file-list',
+    );
+    return this.#appendEvent(
+      handle,
+      ({ eventId, runId, sequence }) => ({
+        schemaVersion: 1,
+        eventId,
+        runId,
+        sequence,
+        kind: 'git.diff.captured',
+        observedAt: iso(now),
+        source: { component: 'git' },
+        payload: {
+          diffId: comparison.diffId,
+          fromSnapshotId: before.snapshotId,
+          toSnapshotId: after.snapshotId,
+          filesChanged: comparison.filesChanged,
+          diffArtifact: diff.reference,
+          fileListArtifact: fileList.reference,
+        },
+      }),
+      now,
+      [diff, fileList],
     );
   }
 

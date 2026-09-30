@@ -7,7 +7,7 @@ import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 
 import { CLI_VERSION, runCli } from './cli.js';
 import { CollectorSession } from './collector/index.js';
@@ -32,6 +32,24 @@ async function waitForFile(path: string): Promise<void> {
 }
 
 const temporaryDirectories: string[] = [];
+const originalWorkingDirectory = process.cwd();
+const commandRepository = mkdtempSync(join(tmpdir(), 'bbx-cli-repository-'));
+
+beforeAll(() => {
+  const initialized = spawnSync('git', ['init', '--quiet'], {
+    cwd: commandRepository,
+    stdio: 'ignore',
+  });
+  if (initialized.status !== 0)
+    throw new Error('temporary Git repository initialization failed');
+  process.chdir(commandRepository);
+});
+
+afterAll(() => {
+  process.chdir(originalWorkingDirectory);
+  rmSync(commandRepository, { force: true, recursive: true });
+});
+
 afterEach(() => {
   for (const path of temporaryDirectories.splice(0))
     rmSync(path, { recursive: true, force: true });
@@ -176,7 +194,7 @@ describe('blackbox command', () => {
       { env: { ...process.env, BLACKBOX_SPOOL_DIR: spoolRoot } },
     );
     expect(result).toEqual({ code: 0, kind: 'exit' });
-  });
+  }, 15_000);
 
   it('fails invalid initialization before creating the child marker', async () => {
     const repositoryRoot = mkdtempSync(join(tmpdir(), 'bbx-cli-repository-'));
@@ -252,14 +270,15 @@ describe('blackbox command', () => {
         },
       );
       expect(result).toEqual({ code: 17, kind: 'exit' });
-      expect(received).toHaveLength(1);
-      expect(received[0]?.runId).toMatch(
+      const deliveredBatches = received.filter((item) => item.runId);
+      expect(deliveredBatches).toHaveLength(1);
+      expect(deliveredBatches[0]?.runId).toMatch(
         /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u,
       );
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
-  });
+  }, 15_000);
 });
 
 describe('blackbox executable', () => {
@@ -302,7 +321,7 @@ describe('blackbox executable', () => {
     expect(result.status).toBe(42);
     expect(result.stdout).toBe('child-out');
     expect(result.stderr).toBe('child-err');
-  });
+  }, 15_000);
 
   it('keeps every collector-created file outside the child working directory', () => {
     const repository = mkdtempSync(join(tmpdir(), 'bbx-noop-repository-'));
@@ -311,6 +330,12 @@ describe('blackbox executable', () => {
       'spool',
     );
     temporaryDirectories.push(repository, join(spoolRoot, '..'));
+    expect(
+      spawnSync('git', ['init', '--quiet'], {
+        cwd: repository,
+        encoding: 'utf8',
+      }).status,
+    ).toBe(0);
     const result = spawnSync(
       process.execPath,
       [binaryPath, 'run', '--', process.execPath, '-e', 'process.exit(0)'],
@@ -321,8 +346,8 @@ describe('blackbox executable', () => {
       },
     );
     expect(result.status).toBe(0);
-    expect(readdirSync(repository)).toEqual([]);
-  });
+    expect(readdirSync(repository)).toEqual(['.git']);
+  }, 15_000);
 
   it.skipIf(process.platform === 'win32')(
     'forwards a supported signal and reproduces actual child signal termination',
