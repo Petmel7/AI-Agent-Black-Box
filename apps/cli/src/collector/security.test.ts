@@ -151,6 +151,7 @@ describe('complete durable-surface sentinel scan', () => {
     expect(existsSync(repositoryRoot)).toBe(false);
     expect('ArtifactStore' in collectorApi).toBe(false);
     expect('captureText' in collectorApi).toBe(false);
+    expect('createCodexSessionSink' in collectorApi).toBe(false);
     expect('LocalSpool' in collectorApi).toBe(false);
     expect('Redactor' in collectorApi).toBe(false);
     expect(Object.keys(collectorApi).sort()).toEqual([

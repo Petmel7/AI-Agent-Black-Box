@@ -13,6 +13,7 @@ import {
 import { deliveryConfigFromEnvironment } from './collector/delivery-config.js';
 import { LocalSpool } from './collector/spool.js';
 import {
+  runCodexProcess,
   runWrappedProcess,
   type ProcessRunnerDependencies,
   type WrappedTermination,
@@ -26,6 +27,7 @@ Usage: blackbox [options]
        blackbox status [--json] [--run <run-id>]
        blackbox retry [--json] [--run <run-id>]
        blackbox run -- <command> [arguments...]
+       blackbox codex -- [codex-exec-arguments...]
 
 Options:
   -h, --help     Show help
@@ -35,6 +37,7 @@ Commands:
   status         Show content-free local spool health and pending work
   retry          Perform one bounded delivery drain and exit
   run            Record one directly spawned child process
+  codex          Record one fresh non-interactive Codex exec session
 `;
 
 export interface CliIo {
@@ -48,6 +51,130 @@ export interface CliRuntime {
 }
 
 export type CliTermination = number | WrappedTermination;
+
+const MAX_CODEX_ARGUMENTS = 256;
+const MAX_CODEX_ARGUMENT_BYTES = 32_768;
+const MAX_CODEX_ARGUMENT_VECTOR_BYTES = 256_000;
+
+const CODEX_OPTION_ARITY = new Map<string, 1>([
+  ['--ask-for-approval', 1],
+  ['--color', 1],
+  ['--config', 1],
+  ['--disable', 1],
+  ['--enable', 1],
+  ['--image', 1],
+  ['--local-provider', 1],
+  ['--model', 1],
+  ['--output-last-message', 1],
+  ['--output-schema', 1],
+  ['--profile', 1],
+  ['--sandbox', 1],
+  ['-a', 1],
+  ['-c', 1],
+  ['-i', 1],
+  ['-m', 1],
+  ['-o', 1],
+  ['-p', 1],
+  ['-s', 1],
+]);
+
+const CODEX_FLAG_OPTIONS = new Set([
+  '--dangerously-bypass-approvals-and-sandbox',
+  '--ephemeral',
+  '--full-auto',
+  '--help',
+  '--oss',
+  '--search',
+  '--skip-git-repo-check',
+  '--version',
+  '-V',
+  '-h',
+]);
+
+function boundedCodexArgument(argument: unknown): argument is string {
+  return (
+    typeof argument === 'string' &&
+    argument.length > 0 &&
+    !argument.includes('\0') &&
+    Buffer.byteLength(argument) <= MAX_CODEX_ARGUMENT_BYTES
+  );
+}
+
+function prohibitedCodexOption(argument: string): boolean {
+  return (
+    argument === '--json' ||
+    argument.startsWith('--json=') ||
+    argument === '--cd' ||
+    argument.startsWith('--cd=') ||
+    argument === '-C' ||
+    (argument.startsWith('-C') && argument.length > 2) ||
+    argument === '--add-dir' ||
+    argument.startsWith('--add-dir=')
+  );
+}
+
+export function validateCodexArguments(args: readonly string[]): boolean {
+  if (args.length > MAX_CODEX_ARGUMENTS) return false;
+  let totalBytes = 0;
+  let promptSeen = false;
+  for (let index = 0; index < args.length; index += 1) {
+    const argument = args[index];
+    if (!boundedCodexArgument(argument)) return false;
+    totalBytes += Buffer.byteLength(argument);
+    if (totalBytes > MAX_CODEX_ARGUMENT_VECTOR_BYTES) return false;
+
+    if (argument === '--') {
+      const content = args.slice(index + 1);
+      if (content.length > (promptSeen ? 0 : 1)) return false;
+      return content.every((value) => {
+        if (!boundedCodexArgument(value)) return false;
+        totalBytes += Buffer.byteLength(value);
+        return totalBytes <= MAX_CODEX_ARGUMENT_VECTOR_BYTES;
+      });
+    }
+    if (prohibitedCodexOption(argument)) return false;
+
+    if (argument.startsWith('--')) {
+      const equals = argument.indexOf('=');
+      const option = equals < 0 ? argument : argument.slice(0, equals);
+      if (CODEX_OPTION_ARITY.get(option) === 1) {
+        if (equals >= 0) {
+          if (!boundedCodexArgument(argument.slice(equals + 1))) return false;
+          continue;
+        }
+        const value = args[++index];
+        if (!boundedCodexArgument(value) || value.startsWith('-')) return false;
+        totalBytes += Buffer.byteLength(value);
+        if (totalBytes > MAX_CODEX_ARGUMENT_VECTOR_BYTES) return false;
+        continue;
+      }
+      if (equals >= 0 || !CODEX_FLAG_OPTIONS.has(argument)) return false;
+      continue;
+    }
+
+    if (argument.startsWith('-') && argument !== '-') {
+      const option = argument.slice(0, 2);
+      if (CODEX_FLAG_OPTIONS.has(argument)) continue;
+      if (CODEX_OPTION_ARITY.get(option) !== 1) return false;
+      let value = argument.slice(2);
+      if (value.startsWith('=')) value = value.slice(1);
+      if (value.length === 0) {
+        const next = args[++index];
+        if (!boundedCodexArgument(next) || next.startsWith('-')) return false;
+        value = next;
+        totalBytes += Buffer.byteLength(value);
+        if (totalBytes > MAX_CODEX_ARGUMENT_VECTOR_BYTES) return false;
+      } else if (!boundedCodexArgument(value)) return false;
+      continue;
+    }
+
+    if (!promptSeen && (argument === 'resume' || argument === 'review'))
+      return false;
+    if (promptSeen) return false;
+    promptSeen = true;
+  }
+  return true;
+}
 
 function renderHumanStatus(
   status: ReturnType<LocalSpool['status']>,
@@ -113,7 +240,9 @@ export async function runCli(
 ): Promise<CliTermination> {
   if (
     args.length === 0 ||
-    (args[0] !== 'run' && (args.includes('--help') || args.includes('-h')))
+    (args[0] !== 'run' &&
+      args[0] !== 'codex' &&
+      (args.includes('--help') || args.includes('-h')))
   ) {
     io.output(HELP);
     return 0;
@@ -121,6 +250,7 @@ export async function runCli(
 
   if (
     args[0] !== 'run' &&
+    args[0] !== 'codex' &&
     (args.includes('--version') || args.includes('-v'))
   ) {
     io.output(CLI_VERSION);
@@ -232,6 +362,37 @@ export async function runCli(
         error instanceof Error && 'code' in error
           ? `Run unavailable: ${String(error.code)}`
           : 'Run unavailable: collection-failed',
+      );
+      return 1;
+    }
+  }
+
+  if (args[0] === 'codex') {
+    const codexArgs = args.slice(2);
+    if (args[1] !== '--' || !validateCodexArguments(codexArgs)) {
+      io.error('Invalid codex arguments');
+      return 1;
+    }
+    try {
+      const env = runtime.env ?? process.env;
+      const delivery = deliveryConfigFromEnvironment(env);
+      const composition = composeCollectorFromEnvironment(
+        env,
+        delivery.state === 'configured' ? [delivery.config.apiToken] : [],
+      );
+      return await runCodexProcess(
+        codexArgs,
+        env,
+        composition,
+        delivery,
+        { warning: (message) => io.error(message) },
+        runtime.processRunnerDependencies,
+      );
+    } catch (error) {
+      io.error(
+        error instanceof Error && 'code' in error
+          ? `Codex unavailable: ${String(error.code)}`
+          : 'Codex unavailable: collection-failed',
       );
       return 1;
     }

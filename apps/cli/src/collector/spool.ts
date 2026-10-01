@@ -34,6 +34,7 @@ import type { CaptureClass, CollectorConfig } from './config.js';
 import { CollectorError, type CollectorErrorCode } from './errors.js';
 import {
   GIT_MAX_ARTIFACT_BYTES,
+  type GitCheckpointObservation,
   type GitComparison,
   type GitSnapshot,
 } from './git.js';
@@ -550,13 +551,16 @@ export class LocalSpool implements Disposable {
   constructor(
     config: CollectorConfig,
     private readonly hooks: SpoolHooks = {},
-    redactorOptions: RedactorOptions = { environment: {} },
+    redactorOptions: RedactorOptions | Redactor = { environment: {} },
   ) {
     this.config = config;
-    this.#redactor = new Redactor({
-      ...redactorOptions,
-      spoolRoot: config.spoolRoot,
-    });
+    this.#redactor =
+      redactorOptions instanceof Redactor
+        ? redactorOptions
+        : new Redactor({
+            ...redactorOptions,
+            spoolRoot: config.spoolRoot,
+          });
   }
 
   get databasePath(): string {
@@ -984,6 +988,291 @@ export class LocalSpool implements Disposable {
     );
   }
 
+  recordCodexCommandStarted(
+    handle: RunHandle,
+    input: {
+      command: Uint8Array;
+      commandId: string;
+      nativeEventId: string;
+      nativeSessionId: string;
+      occurredAt?: string;
+      workingDirectory?: Uint8Array;
+    },
+    now = Date.now(),
+  ): EvidenceEvent {
+    const command = this.captureText(handle, 'command', input.command);
+    const workingDirectory = input.workingDirectory
+      ? this.captureText(handle, 'working-directory', input.workingDirectory)
+      : ({ state: 'unavailable', reason: 'not-exposed' } as const);
+    return this.#appendEvent(
+      handle,
+      ({ eventId, runId, sequence }) => ({
+        schemaVersion: 1,
+        eventId,
+        runId,
+        sequence,
+        kind: 'command.started',
+        observedAt: iso(now),
+        ...(input.occurredAt ? { occurredAt: input.occurredAt } : {}),
+        source: {
+          component: 'agent-adapter',
+          provider: 'codex',
+          nativeSessionId: input.nativeSessionId,
+          nativeEventId: input.nativeEventId,
+        },
+        payload: { commandId: input.commandId, command, workingDirectory },
+      }),
+      now,
+    );
+  }
+
+  recordCodexCommandFinished(
+    handle: RunHandle,
+    input: {
+      commandId: string;
+      durationMs?: number;
+      exitCode?: number;
+      nativeEventId: string;
+      nativeSessionId: string;
+      occurredAt?: string;
+      outcome: 'cancelled' | 'failed' | 'succeeded' | 'unknown';
+      stderr?: Uint8Array;
+      stdout?: Uint8Array;
+      terminationSignal?: string;
+    },
+    now = Date.now(),
+  ): EvidenceEvent {
+    const stdout = input.stdout
+      ? this.captureText(handle, 'stdout', input.stdout)
+      : ({ state: 'unavailable', reason: 'not-exposed' } as const);
+    const stderr = input.stderr
+      ? this.captureText(handle, 'stderr', input.stderr)
+      : ({ state: 'unavailable', reason: 'not-exposed' } as const);
+    return this.#appendEvent(
+      handle,
+      ({ eventId, runId, sequence }) => ({
+        schemaVersion: 1,
+        eventId,
+        runId,
+        sequence,
+        kind: 'command.finished',
+        observedAt: iso(now),
+        ...(input.occurredAt ? { occurredAt: input.occurredAt } : {}),
+        source: {
+          component: 'agent-adapter',
+          provider: 'codex',
+          nativeSessionId: input.nativeSessionId,
+          nativeEventId: input.nativeEventId,
+        },
+        payload: {
+          commandId: input.commandId,
+          outcome: input.outcome,
+          ...(input.exitCode === undefined ? {} : { exitCode: input.exitCode }),
+          ...(input.terminationSignal
+            ? { terminationSignal: input.terminationSignal }
+            : {}),
+          ...(input.durationMs === undefined
+            ? {}
+            : { durationMs: input.durationMs }),
+          stdout,
+          stderr,
+        },
+      }),
+      now,
+    );
+  }
+
+  recordCodexToolStarted(
+    handle: RunHandle,
+    input: {
+      input?: Uint8Array;
+      nativeEventId: string;
+      nativeSessionId: string;
+      occurredAt?: string;
+      toolCallId: string;
+      toolName: string;
+    },
+    now = Date.now(),
+  ): EvidenceEvent {
+    const capturedInput = input.input
+      ? this.captureText(handle, 'tool-input', input.input)
+      : ({ state: 'unavailable', reason: 'not-exposed' } as const);
+    return this.#appendEvent(
+      handle,
+      ({ eventId, runId, sequence }) => ({
+        schemaVersion: 1,
+        eventId,
+        runId,
+        sequence,
+        kind: 'tool.call.started',
+        observedAt: iso(now),
+        ...(input.occurredAt ? { occurredAt: input.occurredAt } : {}),
+        source: {
+          component: 'agent-adapter',
+          provider: 'codex',
+          nativeSessionId: input.nativeSessionId,
+          nativeEventId: input.nativeEventId,
+        },
+        payload: {
+          toolCallId: input.toolCallId,
+          toolName: input.toolName,
+          input: capturedInput,
+        },
+      }),
+      now,
+    );
+  }
+
+  recordCodexToolFinished(
+    handle: RunHandle,
+    input: {
+      durationMs?: number;
+      nativeEventId: string;
+      nativeSessionId: string;
+      occurredAt?: string;
+      outcome: 'cancelled' | 'failed' | 'succeeded' | 'unknown';
+      output?: Uint8Array;
+      toolCallId: string;
+      toolName: string;
+    },
+    now = Date.now(),
+  ): EvidenceEvent {
+    const output = input.output
+      ? this.captureText(handle, 'tool-output', input.output)
+      : ({ state: 'unavailable', reason: 'not-exposed' } as const);
+    return this.#appendEvent(
+      handle,
+      ({ eventId, runId, sequence }) => ({
+        schemaVersion: 1,
+        eventId,
+        runId,
+        sequence,
+        kind: 'tool.call.finished',
+        observedAt: iso(now),
+        ...(input.occurredAt ? { occurredAt: input.occurredAt } : {}),
+        source: {
+          component: 'agent-adapter',
+          provider: 'codex',
+          nativeSessionId: input.nativeSessionId,
+          nativeEventId: input.nativeEventId,
+        },
+        payload: {
+          toolCallId: input.toolCallId,
+          toolName: input.toolName,
+          outcome: input.outcome,
+          ...(input.durationMs === undefined
+            ? {}
+            : { durationMs: input.durationMs }),
+          output,
+        },
+      }),
+      now,
+    );
+  }
+
+  recordCodexError(
+    handle: RunHandle,
+    input: {
+      code: string;
+      message?: Uint8Array;
+      nativeEventId?: string;
+      nativeSessionId?: string;
+      occurredAt?: string;
+      relatedOperationId?: string;
+      retryable?: boolean;
+    },
+    now = Date.now(),
+  ): EvidenceEvent {
+    const message = input.message
+      ? this.captureText(handle, 'provider-payload', input.message)
+      : ({ state: 'unavailable', reason: 'not-exposed' } as const);
+    return this.#appendEvent(
+      handle,
+      ({ eventId, runId, sequence }) => ({
+        schemaVersion: 1,
+        eventId,
+        runId,
+        sequence,
+        kind: 'error.observed',
+        observedAt: iso(now),
+        ...(input.occurredAt ? { occurredAt: input.occurredAt } : {}),
+        source: {
+          component: 'agent-adapter',
+          provider: 'codex',
+          ...(input.nativeSessionId
+            ? { nativeSessionId: input.nativeSessionId }
+            : {}),
+          ...(input.nativeEventId
+            ? { nativeEventId: input.nativeEventId }
+            : {}),
+        },
+        payload: {
+          errorId: randomUUID(),
+          category:
+            input.code.startsWith('codex-adapter-') ||
+            input.code.startsWith('codex-checkpoint-')
+              ? 'collection'
+              : 'provider',
+          code: input.code,
+          ...(input.retryable === undefined
+            ? {}
+            : { retryable: input.retryable }),
+          message,
+          ...(input.relatedOperationId
+            ? { relatedOperationId: input.relatedOperationId }
+            : {}),
+        },
+      }),
+      now,
+    );
+  }
+
+  recordCodexUsage(
+    handle: RunHandle,
+    input: {
+      cachedInputTokens?: number;
+      inputTokens?: number;
+      model?: string;
+      nativeSessionId: string;
+      occurredAt?: string;
+      outputTokens?: number;
+      reasoningTokens?: number;
+    },
+    now = Date.now(),
+  ): EvidenceEvent {
+    const measurement = (value: number | undefined) =>
+      value === undefined
+        ? ({ state: 'unavailable', reason: 'not-reported' } as const)
+        : ({ state: 'reported', value } as const);
+    return this.#appendEvent(
+      handle,
+      ({ eventId, runId, sequence }) => ({
+        schemaVersion: 1,
+        eventId,
+        runId,
+        sequence,
+        kind: 'usage.observed',
+        observedAt: iso(now),
+        ...(input.occurredAt ? { occurredAt: input.occurredAt } : {}),
+        source: {
+          component: 'agent-adapter',
+          provider: 'codex',
+          nativeSessionId: input.nativeSessionId,
+        },
+        payload: {
+          provider: 'codex',
+          ...(input.model ? { model: input.model } : {}),
+          inputTokens: measurement(input.inputTokens),
+          outputTokens: measurement(input.outputTokens),
+          cachedInputTokens: measurement(input.cachedInputTokens),
+          reasoningTokens: measurement(input.reasoningTokens),
+          totalTokens: { state: 'unavailable', reason: 'not-reported' },
+        },
+      }),
+      now,
+    );
+  }
+
   recordCommandFinished(
     handle: RunHandle,
     input: {
@@ -1195,6 +1484,43 @@ export class LocalSpool implements Disposable {
           stagedFileCount: snapshot.stagedFileCount,
           unstagedFileCount: snapshot.unstagedFileCount,
           untrackedFileCount: snapshot.untrackedFileCount,
+          statusArtifact: status.reference,
+        },
+      }),
+      now,
+      [status],
+    );
+  }
+
+  recordGitCheckpoint(
+    handle: RunHandle,
+    checkpoint: GitCheckpointObservation,
+    now = Date.now(),
+  ): EvidenceEvent {
+    const status = this.#prepareRedactedArtifact(
+      checkpoint.statusBytes,
+      'git-status',
+    );
+    return this.#appendEvent(
+      handle,
+      ({ eventId, runId, sequence }) => ({
+        schemaVersion: 1,
+        eventId,
+        runId,
+        sequence,
+        kind: 'git.snapshot.captured',
+        observedAt: iso(now),
+        source: { component: 'git' },
+        payload: {
+          snapshotId: checkpoint.snapshotId,
+          phase: 'checkpoint',
+          ...(checkpoint.headCommit
+            ? { headCommit: checkpoint.headCommit }
+            : {}),
+          isDirty: checkpoint.isDirty,
+          stagedFileCount: checkpoint.stagedFileCount,
+          unstagedFileCount: checkpoint.unstagedFileCount,
+          untrackedFileCount: checkpoint.untrackedFileCount,
           statusArtifact: status.reference,
         },
       }),

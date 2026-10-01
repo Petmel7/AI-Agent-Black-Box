@@ -153,3 +153,13 @@ temporary or final spool write.
 Artifact schema, ordering, attribution meanings, and fixed limits are defined
 in `docs/architecture/git-artifact-formats-v1.md`. In particular,
 `observed-during-run` is temporal evidence and is not a causal claim.
+
+## Codex wrapped run
+
+Use `blackbox codex -- [codex-exec-arguments...]` for one fresh documented
+`codex exec --json` session. Black Box forwards the original JSONL stdout bytes
+without storing them, maps only supported observable facts, and retains the
+actual Codex outcome when adapter or telemetry work degrades. Argument
+restrictions, mappings, capture classes, privacy guarantees, fixed bounds,
+checkpoint behavior, recovery, and compatibility policy are documented in
+`docs/operations/codex-wrapped-run.md`.

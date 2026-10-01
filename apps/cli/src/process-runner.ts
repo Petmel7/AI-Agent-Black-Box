@@ -20,11 +20,18 @@ import {
   MAX_RUN_LEASE_MS,
   MIN_RUN_LEASE_MS,
 } from './collector/spool.js';
+import { CodexJsonlAdapter, type CodexAdapterSink } from './codex-adapter.js';
+import {
+  captureCodexCheckpoint,
+  createCodexSessionSink,
+} from './collector/session.js';
 
 export const DEFAULT_WRAPPED_RUN_LEASE_MS = 30_000;
 export const DEFAULT_HEARTBEAT_INTERVAL_MS = 10_000;
 export const RUN_TRANSITION_MARGIN_MS = 1_000;
 export const MIN_HEARTBEAT_INTERVAL_MS = 100;
+export const MAX_SUCCESSFUL_CODEX_CHECKPOINTS = 8;
+export const MAX_FAILED_CODEX_CHECKPOINTS = 8;
 
 export type SupportedProcessSignal =
   'SIGBREAK' | 'SIGHUP' | 'SIGINT' | 'SIGTERM';
@@ -60,7 +67,18 @@ interface SignalHost {
   removeListener(signal: SupportedProcessSignal, listener: () => void): unknown;
 }
 
+interface ByteOutput {
+  on(event: 'error', listener: () => void): unknown;
+  once(event: 'close' | 'drain', listener: () => void): unknown;
+  removeListener(
+    event: 'close' | 'drain' | 'error',
+    listener: () => void,
+  ): unknown;
+  write(chunk: Uint8Array): boolean;
+}
+
 export interface ProcessRunnerDependencies {
+  captureCodexCheckpoint?(session: CollectorSession): Promise<void>;
   clearInterval?(timer: NodeJS.Timeout): void;
   createCoordinator?(
     spool: CollectorWorkSpool,
@@ -75,11 +93,16 @@ export interface ProcessRunnerDependencies {
   runLeaseMs?: number;
   setInterval?(callback: () => void, milliseconds: number): NodeJS.Timeout;
   signalHost?: SignalHost;
+  stdout?: ByteOutput;
   spawn?(
     command: string,
     args: readonly string[],
     options: SpawnOptions,
   ): ChildProcess;
+}
+
+interface WrappedProcessMode {
+  codexJsonl?: boolean;
 }
 
 function deliverySpoolConfig(config: CollectorComposition['config']) {
@@ -156,7 +179,7 @@ function fallbackSignalCode(signal: SupportedProcessSignal): number {
   return 128 + numbers[signal];
 }
 
-export async function runWrappedProcess(
+async function runProcess(
   command: string,
   args: readonly string[],
   environment: NodeJS.ProcessEnv,
@@ -164,6 +187,7 @@ export async function runWrappedProcess(
   delivery: DeliveryConfiguration,
   io: WrappedRunIo,
   dependencies: ProcessRunnerDependencies = {},
+  mode: WrappedProcessMode = {},
 ): Promise<WrappedTermination> {
   const leaseMs = dependencies.runLeaseMs ?? DEFAULT_WRAPPED_RUN_LEASE_MS;
   const heartbeatMs =
@@ -188,6 +212,68 @@ export async function runWrappedProcess(
   let warned = false;
   let active = false;
   let sessionFinalized = false;
+  let adapter: CodexJsonlAdapter | undefined;
+  let adapterSink: CodexAdapterSink | undefined;
+  let adapterEnabled = mode.codexJsonl === true;
+  let checkpointPending = false;
+  let checkpointTask: Promise<void> | undefined;
+  let checkpoints = 0;
+  let checkpointFailures = 0;
+  let checkpointAbandonmentRecorded = false;
+  const recordCheckpointDiagnostic = (
+    code: 'codex-checkpoint-abandoned' | 'codex-checkpoint-failed',
+  ) => {
+    try {
+      adapterSink?.diagnostic(code);
+    } catch {
+      warn(false);
+    }
+  };
+  const abandonCheckpoints = (): void => {
+    checkpointPending = false;
+    if (checkpointAbandonmentRecorded) return;
+    checkpointAbandonmentRecorded = true;
+    recordCheckpointDiagnostic('codex-checkpoint-abandoned');
+  };
+  const scheduleCheckpoint = (): void => {
+    if (
+      checkpointFailures >= MAX_FAILED_CODEX_CHECKPOINTS ||
+      checkpoints >= MAX_SUCCESSFUL_CODEX_CHECKPOINTS
+    ) {
+      abandonCheckpoints();
+      return;
+    }
+    checkpointPending = true;
+    if (checkpointTask) return;
+    checkpointTask = new Promise<void>((resolve) => setImmediate(resolve))
+      .then(async () => {
+        while (
+          checkpointPending &&
+          checkpointFailures < MAX_FAILED_CODEX_CHECKPOINTS &&
+          checkpoints < MAX_SUCCESSFUL_CODEX_CHECKPOINTS
+        ) {
+          checkpointPending = false;
+          try {
+            await (
+              dependencies.captureCodexCheckpoint ?? captureCodexCheckpoint
+            )(session as CollectorSession);
+            checkpoints += 1;
+          } catch {
+            checkpointFailures += 1;
+            recordCheckpointDiagnostic('codex-checkpoint-failed');
+            warn(false);
+          }
+        }
+        if (
+          checkpointPending ||
+          checkpointFailures >= MAX_FAILED_CODEX_CHECKPOINTS
+        )
+          abandonCheckpoints();
+      })
+      .finally(() => {
+        checkpointTask = undefined;
+      });
+  };
   const listeners = new Map<SupportedProcessSignal, () => void>();
   const warn = (disableWrites = true): void => {
     if (disableWrites) writesDisabled = true;
@@ -245,12 +331,18 @@ export async function runWrappedProcess(
       return { code: 1, kind: 'exit' };
     }
     const childEnvironment = buildChildEnvironment(environment, session.runId);
+    if (mode.codexJsonl) {
+      if (!(session instanceof CollectorSession))
+        throw new TypeError('Codex adapter requires a collector session');
+      adapterSink = createCodexSessionSink(session, scheduleCheckpoint);
+      adapter = new CodexJsonlAdapter(adapterSink);
+    }
     try {
       child = spawnChild(command, [...args], {
         cwd: process.cwd(),
         env: childEnvironment,
         shell: false,
-        stdio: 'inherit',
+        stdio: mode.codexJsonl ? ['inherit', 'pipe', 'inherit'] : 'inherit',
       });
     } catch {
       try {
@@ -262,6 +354,67 @@ export async function runWrappedProcess(
         disposeSession();
       }
       return { code: 1, kind: 'exit' };
+    }
+
+    const output = dependencies.stdout ?? process.stdout;
+    let outputFailed = false;
+    let stdoutEnded = !mode.codexJsonl;
+    const source = child.stdout;
+    const onOutputDrain = () => child?.stdout?.resume();
+    const onOutputFailure = () => {
+      outputFailed = true;
+      output.removeListener('drain', onOutputDrain);
+      warn(false);
+      child?.stdout?.resume();
+    };
+    const onSourceData = (chunk: Buffer) => {
+      if (adapterEnabled)
+        try {
+          adapter!.push(chunk);
+        } catch {
+          adapterEnabled = false;
+          warn(false);
+        }
+      if (!outputFailed)
+        try {
+          if (!output.write(chunk)) {
+            source!.pause();
+            output.once('drain', onOutputDrain);
+          }
+        } catch {
+          onOutputFailure();
+        }
+    };
+    const onSourceEnd = () => {
+      stdoutEnded = true;
+      if (adapterEnabled)
+        try {
+          adapter!.finish();
+        } catch {
+          adapterEnabled = false;
+          warn(false);
+        }
+    };
+    const onSourceFailure = () => {
+      if (!stdoutEnded && adapterEnabled)
+        try {
+          adapter!.transportFailure();
+        } catch {
+          adapterEnabled = false;
+        }
+      warn(false);
+      source?.resume();
+    };
+    const onSourceClose = () => {
+      if (!stdoutEnded) onSourceFailure();
+    };
+    if (mode.codexJsonl) {
+      output.on('error', onOutputFailure);
+      output.once('close', onOutputFailure);
+      source?.on('data', onSourceData);
+      source?.once('end', onSourceEnd);
+      source?.on('error', onSourceFailure);
+      source?.once('close', onSourceClose);
     }
 
     const closed = await new Promise<
@@ -333,6 +486,15 @@ export async function runWrappedProcess(
       child!.on('error', onError);
       child!.once('close', onClose);
     });
+    if (mode.codexJsonl) {
+      output.removeListener('error', onOutputFailure);
+      output.removeListener('close', onOutputFailure);
+      output.removeListener('drain', onOutputDrain);
+      source?.removeListener('data', onSourceData);
+      source?.removeListener('end', onSourceEnd);
+      source?.removeListener('error', onSourceFailure);
+      source?.removeListener('close', onSourceClose);
+    }
     cleanup();
 
     if (closed.kind === 'launch-error') {
@@ -358,6 +520,7 @@ export async function runWrappedProcess(
       : closed.code === 0
         ? 'succeeded'
         : 'failed';
+    if (checkpointTask) await checkpointTask;
     if (!writesDisabled)
       try {
         session.captureGitSnapshot('after');
@@ -414,4 +577,44 @@ export async function runWrappedProcess(
     cleanup();
     if (!child) disposeSession();
   }
+}
+
+export async function runWrappedProcess(
+  command: string,
+  args: readonly string[],
+  environment: NodeJS.ProcessEnv,
+  composition: CollectorComposition,
+  delivery: DeliveryConfiguration,
+  io: WrappedRunIo,
+  dependencies: ProcessRunnerDependencies = {},
+): Promise<WrappedTermination> {
+  return runProcess(
+    command,
+    args,
+    environment,
+    composition,
+    delivery,
+    io,
+    dependencies,
+  );
+}
+
+export async function runCodexProcess(
+  args: readonly string[],
+  environment: NodeJS.ProcessEnv,
+  composition: CollectorComposition,
+  delivery: DeliveryConfiguration,
+  io: WrappedRunIo,
+  dependencies: ProcessRunnerDependencies = {},
+): Promise<WrappedTermination> {
+  return runProcess(
+    'codex',
+    ['exec', '--json', ...args],
+    environment,
+    composition,
+    delivery,
+    io,
+    dependencies,
+    { codexJsonl: true },
+  );
 }

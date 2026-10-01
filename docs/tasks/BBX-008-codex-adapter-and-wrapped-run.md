@@ -1,6 +1,6 @@
 # BBX-008: Codex Adapter and Wrapped Run
 
-- **Status:** Approved
+- **Status:** Done
 - **Owner:** Implementation Chat
 - **Review:** Review Chat
 - **Depends on:** BBX-007 completed at `6fb7cdde8140b9b12e9f8f46f98ab10e306747ee`

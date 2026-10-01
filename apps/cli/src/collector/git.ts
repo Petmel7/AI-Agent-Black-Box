@@ -103,6 +103,22 @@ export interface GitComparison {
   readonly filesChanged: number;
 }
 
+export interface GitCheckpointObservation {
+  readonly snapshotId: string;
+  readonly phase: 'checkpoint';
+  readonly headCommit?: string;
+  readonly isDirty: boolean;
+  readonly stagedFileCount: number;
+  readonly unstagedFileCount: number;
+  readonly untrackedFileCount: number;
+  readonly statusBytes: Uint8Array;
+}
+
+export interface GitCheckpointWorkerMessage extends GitCheckpointObservation {
+  readonly kind: 'git-checkpoint';
+  readonly nonce: string;
+}
+
 export interface GitCommandInvocation {
   readonly args: readonly string[];
   readonly cwd: string;
@@ -452,6 +468,308 @@ function stableJson(value: unknown): Uint8Array {
   const bytes = Buffer.from(`${JSON.stringify(value)}\n`, 'utf8');
   if (bytes.byteLength > GIT_MAX_ARTIFACT_BYTES) return fail();
   return bytes;
+}
+
+function plainRecord(value: unknown): Record<string, unknown> | undefined {
+  if (
+    value === null ||
+    typeof value !== 'object' ||
+    Array.isArray(value) ||
+    Object.getPrototypeOf(value) !== Object.prototype
+  )
+    return;
+  const descriptors = Object.getOwnPropertyDescriptors(value);
+  if (Object.values(descriptors).some((item) => item.get || item.set)) return;
+  return value as Record<string, unknown>;
+}
+
+function publicPath(
+  value: unknown,
+  redactDisplay: (value: string) => string,
+): string {
+  if (
+    typeof value !== 'string' ||
+    value.length === 0 ||
+    Buffer.byteLength(value) > GIT_MAX_PATH_BYTES ||
+    value.includes('\0') ||
+    /[\r\n]/u.test(value) ||
+    isAbsolute(value) ||
+    /^[A-Za-z]:[\\/]/u.test(value) ||
+    value.split(/[\\/]/u).some((part) => part === '' || part === '..') ||
+    redactDisplay(value) !== value
+  )
+    return fail();
+  return value;
+}
+
+function optionalPublicString(
+  value: unknown,
+  expression: RegExp,
+): string | undefined {
+  if (value === undefined) return;
+  if (typeof value !== 'string' || !expression.test(value)) return fail();
+  return value;
+}
+
+function publicManifestEntry(
+  value: unknown,
+  redactDisplay: (value: string) => string,
+): Record<string, unknown> {
+  const item = plainRecord(value);
+  if (!item) return fail();
+  const entryId = optionalPublicString(item.entryId, /^[a-f0-9]{64}$/u);
+  const path = publicPath(item.path, redactDisplay);
+  const originalPath =
+    item.originalPath === undefined
+      ? undefined
+      : publicPath(item.originalPath, redactDisplay);
+  const kind = optionalPublicString(
+    item.kind,
+    /^(?:ordinary|rename-or-copy|unmerged|untracked)$/u,
+  );
+  const indexStatus = optionalPublicString(item.indexStatus, /^[.?MADRCUT]$/u);
+  const worktreeStatus = optionalPublicString(
+    item.worktreeStatus,
+    /^[.?MADRCUT]$/u,
+  );
+  const submodule = optionalPublicString(
+    item.submodule,
+    /^(?:N\.\.\.|S[.C][.M][.U])$/u,
+  );
+  if (!entryId || !kind || !indexStatus || !worktreeStatus || !submodule)
+    return fail();
+  if (
+    (kind === 'untracked' && (indexStatus !== '?' || worktreeStatus !== '?')) ||
+    (kind !== 'untracked' && (indexStatus === '?' || worktreeStatus === '?')) ||
+    (kind === 'rename-or-copy') !== Boolean(originalPath)
+  )
+    return fail();
+  const modeHead = optionalPublicString(item.modeHead, /^[0-7]{6}$/u);
+  const modeIndex = optionalPublicString(item.modeIndex, /^[0-7]{6}$/u);
+  const modeWorktree = optionalPublicString(item.modeWorktree, /^[0-7]{6}$/u);
+  const unavailableReason = optionalPublicString(
+    item.unavailableReason,
+    /^(?:entry-size-limit|read-failed|read-race|unsupported-file-type)$/u,
+  );
+  if (item.binary !== undefined && item.binary !== true) return fail();
+  return {
+    entryId,
+    path,
+    ...(originalPath ? { originalPath } : {}),
+    kind,
+    indexStatus,
+    worktreeStatus,
+    submodule,
+    ...(modeHead ? { modeHead } : {}),
+    ...(modeIndex ? { modeIndex } : {}),
+    ...(modeWorktree ? { modeWorktree } : {}),
+    ...(item.binary === true ? { binary: true } : {}),
+    ...(unavailableReason ? { unavailableReason } : {}),
+  };
+}
+
+function publicManifestHeadEntry(
+  value: unknown,
+  redactDisplay: (value: string) => string,
+): Record<string, unknown> {
+  const item = plainRecord(value);
+  if (!item) return fail();
+  const entryId = optionalPublicString(item.entryId, /^[a-f0-9]{64}$/u);
+  const path = publicPath(item.path, redactDisplay);
+  const mode = optionalPublicString(item.mode, /^[0-7]{6}$/u);
+  const objectId = optionalPublicString(
+    item.objectId,
+    /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u,
+  );
+  const type = optionalPublicString(item.type, /^(?:blob|commit)$/u);
+  if (!entryId || !mode || !objectId || !type) return fail();
+  return { entryId, path, mode, objectId, type };
+}
+
+function annotatePublicCollisions(
+  entries: readonly Record<string, unknown>[],
+): Record<string, unknown>[] {
+  const counts = new Map<string, number>();
+  for (const entry of entries) {
+    const path = String(entry.path);
+    counts.set(path, (counts.get(path) ?? 0) + 1);
+  }
+  return entries.map((entry) => ({
+    ...entry,
+    ...(counts.get(String(entry.path))! > 1
+      ? {
+          displayAmbiguous: true,
+          displayReason: 'redaction-collision',
+        }
+      : {}),
+  }));
+}
+
+export function createGitCheckpointWorkerMessage(
+  snapshot: GitSnapshot,
+  nonce: string,
+): GitCheckpointWorkerMessage {
+  if (snapshot.phase !== 'checkpoint') return fail();
+  return {
+    kind: 'git-checkpoint',
+    nonce,
+    snapshotId: snapshot.snapshotId,
+    phase: 'checkpoint',
+    ...(snapshot.headCommit ? { headCommit: snapshot.headCommit } : {}),
+    isDirty: snapshot.entries.length > 0,
+    stagedFileCount: snapshot.stagedFileCount,
+    unstagedFileCount: snapshot.unstagedFileCount,
+    untrackedFileCount: snapshot.untrackedFileCount,
+    statusBytes: snapshot.statusBytes,
+  };
+}
+
+export function validateGitCheckpointWorkerMessage(
+  value: unknown,
+  nonce: string,
+  redactDisplay: (value: string) => string,
+): GitCheckpointObservation {
+  const message = plainRecord(value);
+  const messageKeys = message ? Object.keys(message).sort() : [];
+  const expectedMessageKeys = [
+    'headCommit',
+    'isDirty',
+    'kind',
+    'nonce',
+    'phase',
+    'snapshotId',
+    'stagedFileCount',
+    'statusBytes',
+    'unstagedFileCount',
+    'untrackedFileCount',
+  ].filter((key) => key !== 'headCommit' || message?.headCommit !== undefined);
+  if (
+    !message ||
+    messageKeys.join('\0') !== expectedMessageKeys.sort().join('\0') ||
+    message.kind !== 'git-checkpoint' ||
+    message.nonce !== nonce ||
+    message.phase !== 'checkpoint' ||
+    typeof message.snapshotId !== 'string' ||
+    !/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(
+      message.snapshotId,
+    ) ||
+    typeof message.isDirty !== 'boolean' ||
+    !(message.statusBytes instanceof Uint8Array) ||
+    message.statusBytes.byteLength > GIT_MAX_ARTIFACT_BYTES
+  )
+    return fail();
+  const headCommit = optionalPublicString(
+    message.headCommit,
+    /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u,
+  );
+  const counts = [
+    message.stagedFileCount,
+    message.unstagedFileCount,
+    message.untrackedFileCount,
+  ];
+  if (
+    counts.some(
+      (count) =>
+        !Number.isSafeInteger(count) ||
+        Number(count) < 0 ||
+        Number(count) > GIT_MAX_ENTRIES,
+    )
+  )
+    return fail();
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(
+      new TextDecoder('utf-8', { fatal: true }).decode(message.statusBytes),
+    );
+  } catch {
+    return fail();
+  }
+  const manifest = plainRecord(parsed);
+  const repository = plainRecord(manifest?.repository);
+  if (
+    !manifest ||
+    manifest.schemaVersion !== 1 ||
+    manifest.snapshotId !== message.snapshotId ||
+    manifest.phase !== 'checkpoint' ||
+    !repository ||
+    !['attached', 'detached', 'unborn'].includes(
+      String(repository.headState),
+    ) ||
+    !Array.isArray(manifest.entries) ||
+    !Array.isArray(manifest.headTree) ||
+    manifest.entries.length > GIT_MAX_ENTRIES ||
+    manifest.headTree.length > GIT_MAX_ENTRIES
+  )
+    return fail();
+  const manifestHeadCommit = optionalPublicString(
+    repository.headCommit,
+    /^(?:[a-f0-9]{40}|[a-f0-9]{64})$/u,
+  );
+  const branch = optionalPublicString(
+    repository.branch,
+    /^[^\0\r\n]{1,1024}$/u,
+  );
+  if (
+    manifestHeadCommit !== headCommit ||
+    (repository.headState === 'unborn') !== (headCommit === undefined) ||
+    (repository.headState === 'detached' && branch !== undefined) ||
+    (repository.headState !== 'detached' && branch === undefined)
+  )
+    return fail();
+  const entries = annotatePublicCollisions(
+    manifest.entries.map((entry) => publicManifestEntry(entry, redactDisplay)),
+  );
+  const headTree = annotatePublicCollisions(
+    manifest.headTree.map((entry) =>
+      publicManifestHeadEntry(entry, redactDisplay),
+    ),
+  );
+  if (repository.headState === 'unborn' && headTree.length > 0) return fail();
+  if (
+    new Set(entries.map((entry) => entry.entryId)).size !== entries.length ||
+    new Set(headTree.map((entry) => entry.entryId)).size !== headTree.length
+  )
+    return fail();
+  const reconstructed = stableJson({
+    schemaVersion: 1,
+    snapshotId: message.snapshotId,
+    phase: 'checkpoint',
+    repository: {
+      headState: repository.headState,
+      ...(headCommit ? { headCommit } : {}),
+      ...(branch ? { branch } : {}),
+    },
+    entries,
+    headTree,
+  });
+  if (!Buffer.from(reconstructed).equals(Buffer.from(message.statusBytes)))
+    return fail();
+  const stagedFileCount = entries.filter(
+    (entry) => !['.', '?'].includes(String(entry.indexStatus)),
+  ).length;
+  const unstagedFileCount = entries.filter(
+    (entry) => !['.', '?'].includes(String(entry.worktreeStatus)),
+  ).length;
+  const untrackedFileCount = entries.filter(
+    (entry) => entry.kind === 'untracked',
+  ).length;
+  if (
+    message.isDirty !== entries.length > 0 ||
+    message.stagedFileCount !== stagedFileCount ||
+    message.unstagedFileCount !== unstagedFileCount ||
+    message.untrackedFileCount !== untrackedFileCount
+  )
+    return fail();
+  return {
+    snapshotId: message.snapshotId,
+    phase: 'checkpoint',
+    ...(headCommit ? { headCommit } : {}),
+    isDirty: message.isDirty,
+    stagedFileCount,
+    unstagedFileCount,
+    untrackedFileCount,
+    statusBytes: Uint8Array.from(message.statusBytes),
+  };
 }
 
 function observationDigest(observation: CompleteObservation): string {

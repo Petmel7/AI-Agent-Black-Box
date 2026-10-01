@@ -40,12 +40,14 @@ pnpm --filter @blackbox/cli start -- --help
 pnpm --filter @blackbox/cli start -- status --json
 pnpm --filter @blackbox/cli start -- retry --json
 pnpm --filter @blackbox/cli start -- run -- <command> [arguments...]
+pnpm --filter @blackbox/cli start -- codex -- [codex-exec-arguments...]
 ```
 
 `blackbox run` directly spawns one child without a shell, preserves inherited
 stdio and the child's exit or supported-signal outcome, and stores collector
-state outside the child working directory. Git evidence capture and Codex
-telemetry integration remain separate BBX-007 and BBX-008 work.
+state outside the child working directory. `blackbox codex` adds the documented
+fresh `codex exec --json` adapter while preserving the same outcome-isolation
+and local Git lifecycle.
 
 ## Validation
 
@@ -75,7 +77,8 @@ validating persistence changes.
 Environment variable names and connection guidance for the database boundary are documented in `packages/database/README.md`.
 Local collector capture, privacy, and spool configuration are documented in
 `apps/cli/README.md`; non-destructive recovery is documented in
-`docs/operations/local-spool-recovery.md`.
+`docs/operations/local-spool-recovery.md`, and the Codex adapter contract is
+documented in `docs/operations/codex-wrapped-run.md`.
 
 ## Ingestion API
 

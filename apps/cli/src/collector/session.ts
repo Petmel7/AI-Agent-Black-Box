@@ -4,6 +4,8 @@ import {
   type EvidenceEvent,
   type GitSnapshotPhase,
 } from '@blackbox/contracts';
+import { randomUUID } from 'node:crypto';
+import { Worker } from 'node:worker_threads';
 
 import {
   type CaptureClass,
@@ -12,8 +14,13 @@ import {
   validateCollectorConfig,
 } from './config.js';
 import { CollectorError } from './errors.js';
-import { GitReader, type GitSnapshot } from './git.js';
-import type { RedactorOptions } from './redaction.js';
+import {
+  GitReader,
+  validateGitCheckpointWorkerMessage,
+  type GitCheckpointObservation,
+  type GitSnapshot,
+} from './git.js';
+import { Redactor, type RedactorOptions } from './redaction.js';
 import {
   DEFAULT_LEASE_MS,
   LocalSpool,
@@ -21,6 +28,35 @@ import {
   MIN_RUN_LEASE_MS,
   type RunHandle,
 } from './spool.js';
+import type {
+  CodexAdapterSink,
+  CodexDiagnosticCode,
+} from '../codex-adapter.js';
+
+const CODEX_SINK = Symbol('codex-adapter-sink');
+const CODEX_CHECKPOINT = Symbol('codex-checkpoint');
+
+interface CheckpointWorkerLike {
+  on(event: 'error', listener: () => void): unknown;
+  once(event: 'exit', listener: (code: number) => void): unknown;
+  once(event: 'message', listener: (value: unknown) => void): unknown;
+  removeListener(event: 'error', listener: () => void): unknown;
+  removeListener(event: 'exit', listener: (code: number) => void): unknown;
+  removeListener(event: 'message', listener: (value: unknown) => void): unknown;
+  terminate(): Promise<number>;
+}
+
+export type CheckpointWorkerFactory = (
+  url: URL,
+  options: {
+    workerData: {
+      initialCwd: string;
+      nonce: string;
+      redactorOptions: RedactorOptions;
+      repositoryRoot?: string;
+    };
+  },
+) => CheckpointWorkerLike;
 
 export interface CollectorSessionOptions {
   leaseMs?: number;
@@ -154,6 +190,7 @@ export class CollectorSession implements Disposable {
   readonly #spool: LocalSpool;
   readonly #initialCwd: string;
   readonly #repositoryRoot: string | undefined;
+  readonly #workerRedactorOptions: RedactorOptions;
   #gitReader: GitReader | undefined;
   #comparisonRecorded = false;
   readonly #snapshots = new Map<GitSnapshotPhase, GitSnapshot>();
@@ -163,11 +200,13 @@ export class CollectorSession implements Disposable {
     handle: RunHandle,
     initialCwd: string,
     repositoryRoot: string | undefined,
+    workerRedactorOptions: RedactorOptions,
   ) {
     this.#spool = spool;
     this.#handle = handle;
     this.#initialCwd = initialCwd;
     this.#repositoryRoot = repositoryRoot;
+    this.#workerRedactorOptions = workerRedactorOptions;
   }
 
   static open(
@@ -201,13 +240,24 @@ export class CollectorSession implements Disposable {
         : {}),
       spoolRoot: config.spoolRoot,
     };
-    const spool = new LocalSpool(config, {}, copiedRedactorOptions).open();
+    const redactor = new Redactor(copiedRedactorOptions);
+    const workerRedactorOptions: RedactorOptions = {
+      collectorCredentials: [...redactor.literals],
+      environment: {},
+      homeDirectory: redactor.homeDirectory,
+      ...(redactor.repositoryRoot
+        ? { repositoryRoot: redactor.repositoryRoot }
+        : {}),
+      ...(redactor.spoolRoot ? { spoolRoot: redactor.spoolRoot } : {}),
+    };
+    const spool = new LocalSpool(config, {}, redactor).open();
     try {
       return new CollectorSession(
         spool,
         spool.createRun(leaseMs),
         process.cwd(),
         config.repositoryRoot,
+        workerRedactorOptions,
       );
     } catch (cause) {
       spool.close();
@@ -299,6 +349,119 @@ export class CollectorSession implements Disposable {
     return structuredClone(this.#spool.recordRunFinished(this.#handle, input));
   }
 
+  [CODEX_SINK](requestCheckpoint: () => void): CodexAdapterSink {
+    const clone = <T>(value: T): T => structuredClone(value);
+    return {
+      commandStarted: (input) => {
+        this.#spool.recordCodexCommandStarted(this.#handle, clone(input));
+      },
+      commandFinished: (input) => {
+        this.#spool.recordCodexCommandFinished(this.#handle, clone(input));
+      },
+      toolStarted: (input) => {
+        this.#spool.recordCodexToolStarted(this.#handle, clone(input));
+      },
+      toolFinished: (input) => {
+        this.#spool.recordCodexToolFinished(this.#handle, clone(input));
+      },
+      fileChangeCompleted: (input) => {
+        this.#spool.recordCodexToolFinished(this.#handle, {
+          nativeEventId: input.nativeEventId,
+          nativeSessionId: input.nativeSessionId,
+          ...(input.occurredAt ? { occurredAt: input.occurredAt } : {}),
+          outcome: 'succeeded',
+          toolCallId: input.toolCallId,
+          toolName: 'file-change',
+        });
+      },
+      errorObserved: (input) => {
+        this.#spool.recordCodexError(this.#handle, clone(input));
+      },
+      usageObserved: (input) => {
+        this.#spool.recordCodexUsage(this.#handle, clone(input));
+      },
+      diagnostic: (code: CodexDiagnosticCode, nativeSessionId?: string) => {
+        this.#spool.recordCodexError(this.#handle, {
+          code,
+          ...(nativeSessionId ? { nativeSessionId } : {}),
+        });
+      },
+      requestCheckpoint,
+    };
+  }
+
+  async [CODEX_CHECKPOINT](
+    workerFactory: CheckpointWorkerFactory = (url, options) =>
+      new Worker(url, options),
+  ): Promise<void> {
+    const nonce = randomUUID();
+    const worker = workerFactory(
+      new URL('../../dist/collector/checkpoint-worker.js', import.meta.url),
+      {
+        workerData: {
+          initialCwd: this.#initialCwd,
+          nonce,
+          redactorOptions: this.#workerRedactorOptions,
+          ...(this.#repositoryRoot
+            ? { repositoryRoot: this.#repositoryRoot }
+            : {}),
+        },
+      },
+    );
+    const checkpoint = await new Promise<GitCheckpointObservation>(
+      (resolve, reject) => {
+        let settled = false;
+        const cleanup = () => {
+          worker.removeListener('message', onMessage);
+          worker.removeListener('error', onError);
+          worker.removeListener('exit', onExit);
+        };
+        const terminate = (callback: () => void) => {
+          void worker
+            .terminate()
+            .catch(() => undefined)
+            .then(() => {
+              cleanup();
+              callback();
+            });
+        };
+        const fail = () => {
+          if (settled) return;
+          settled = true;
+          terminate(() =>
+            reject(
+              new CollectorError(
+                'collection-failed',
+                'Git checkpoint capture failed',
+              ),
+            ),
+          );
+        };
+        const onMessage = (value: unknown) => {
+          if (settled) return;
+          let parsed: GitCheckpointObservation;
+          try {
+            parsed = validateGitCheckpointWorkerMessage(value, nonce, (path) =>
+              this.#spool.redactGitDisplayPath(path),
+            );
+          } catch {
+            return fail();
+          }
+          settled = true;
+          terminate(() => resolve(parsed));
+        };
+        const onError = () => fail();
+        const onExit = (code: number) => {
+          if (code !== 0 || !settled) fail();
+        };
+        worker.once('message', onMessage);
+        worker.on('error', onError);
+        worker.once('exit', onExit);
+      },
+    );
+    this.#spool.recordGitCheckpoint(this.#handle, checkpoint);
+  }
+
   close(): void {
     this.#spool.closeRun(this.#handle);
     this.#spool.close();
@@ -307,4 +470,20 @@ export class CollectorSession implements Disposable {
   [Symbol.dispose](): void {
     this.#spool.close();
   }
+}
+
+/** Internal adapter composition seam; intentionally not re-exported publicly. */
+export function createCodexSessionSink(
+  session: CollectorSession,
+  requestCheckpoint: () => void,
+): CodexAdapterSink {
+  return session[CODEX_SINK](requestCheckpoint);
+}
+
+/** Internal checkpoint seam; Git reads run in a worker and persistence stays owner-bound. */
+export function captureCodexCheckpoint(
+  session: CollectorSession,
+  workerFactory?: CheckpointWorkerFactory,
+): Promise<void> {
+  return session[CODEX_CHECKPOINT](workerFactory);
 }
