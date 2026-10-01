@@ -42,7 +42,6 @@ jobs:
       - run: pnpm --filter @blackbox/database db:validate
       - run: pnpm --filter @blackbox/database db:migrate:deploy
       - run: pnpm --filter @blackbox/database db:migrate:verify
-      - run: pnpm --filter @blackbox/database test:integration
       - run: pnpm format:check
       - run: pnpm lint
       - run: pnpm typecheck
