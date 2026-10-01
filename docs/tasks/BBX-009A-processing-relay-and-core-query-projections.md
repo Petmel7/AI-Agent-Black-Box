@@ -1,6 +1,6 @@
 # BBX-009A: Processing Relay and Core Query Projections
 
-- **Status:** Approved
+- **Status:** Done
 - **Owner:** Implementation Chat
 - **Review:** Review Chat
 - **Depends on:** BBX-008 completed at `5bb54a7c936eb2642c11463994c6a070bce0a74c`

@@ -21,6 +21,7 @@
     "lint": "eslint .",
     "test": "node ./scripts/run-integration-if-configured.mjs",
     "test:integration": "node ./scripts/require-test-database-url.mjs && vitest run --config vitest.integration.config.ts",
+    "test:queue": "node ./scripts/require-test-database-url.mjs && vitest run --config vitest.queue.config.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

@@ -8,6 +8,7 @@
     "src/**/*.ts",
     "tests/**/*.ts",
     "prisma.config.ts",
-    "vitest.integration.config.ts"
+    "vitest.integration.config.ts",
+    "vitest.queue.config.ts"
   ]
 }

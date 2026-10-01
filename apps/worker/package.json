@@ -7,10 +7,13 @@
     "build": "tsc -p tsconfig.build.json",
     "dev": "tsx watch src/main.ts",
     "lint": "eslint .",
-    "pretest": "pnpm run build",
     "start": "node --enable-source-maps dist/main.js",
+    "queue:provision": "node --enable-source-maps dist/provision-queue.js",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@blackbox/database": "workspace:*"
   },
   "devDependencies": {
     "@blackbox/config": "workspace:*",

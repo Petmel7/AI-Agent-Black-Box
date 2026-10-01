@@ -8,47 +8,56 @@ datasource db {
 }
 
 model Organization {
-  id           String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  createdAt    DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
-  repositories Repository[]
-  runs         Run[]
-  batches      EvidenceBatch[]
-  events       EvidenceEvent[]
-  memberships  EvidenceBatchEvent[]
-  artifacts    ArtifactDeclaration[]
-  references   EvidenceEventArtifact[]
-  processingIntents ProcessingIntent[]
+  id                     String                         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  createdAt              DateTime                       @default(now()) @map("created_at") @db.Timestamptz(3)
+  repositories           Repository[]
+  runs                   Run[]
+  batches                EvidenceBatch[]
+  events                 EvidenceEvent[]
+  memberships            EvidenceBatchEvent[]
+  artifacts              ArtifactDeclaration[]
+  references             EvidenceEventArtifact[]
+  processingIntents      ProcessingIntent[]
+  processingReceipts     ProcessingApplicationReceipt[]
+  processingStates       RunProcessingState[]
+  processingFailures     ProcessingAttemptFailure[]
+  coreRunProjections     CoreRunProjection[]
   artifactUploadAttempts ArtifactUploadAttempt[]
 
   @@map("organizations")
 }
 
 model Repository {
-  id             String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  organizationId String       @map("organization_id") @db.Uuid
-  createdAt      DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
-  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "repositories_organization_id_fkey")
-  runs           Run[]
+  id                 String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId     String              @map("organization_id") @db.Uuid
+  createdAt          DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
+  organization       Organization        @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "repositories_organization_id_fkey")
+  runs               Run[]
+  coreRunProjections CoreRunProjection[]
 
   @@unique([organizationId, id], map: "repositories_org_id_key")
   @@map("repositories")
 }
 
 model Run {
-  id             String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  organizationId String                @map("organization_id") @db.Uuid
-  repositoryId   String                @map("repository_id") @db.Uuid
-  canonicalRunId String                @map("canonical_run_id") @db.Uuid
-  createdAt      DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
-  organization   Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "runs_organization_id_fkey")
-  repository     Repository            @relation(fields: [organizationId, repositoryId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "runs_org_repository_fkey")
-  batches        EvidenceBatch[]
-  events         EvidenceEvent[]
-  memberships    EvidenceBatchEvent[]
-  artifacts      ArtifactDeclaration[]
-  references     EvidenceEventArtifact[]
-  processingIntents ProcessingIntent[]
+  id                     String                         @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId         String                         @map("organization_id") @db.Uuid
+  repositoryId           String                         @map("repository_id") @db.Uuid
+  canonicalRunId         String                         @map("canonical_run_id") @db.Uuid
+  createdAt              DateTime                       @default(now()) @map("created_at") @db.Timestamptz(3)
+  organization           Organization                   @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "runs_organization_id_fkey")
+  repository             Repository                     @relation(fields: [organizationId, repositoryId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "runs_org_repository_fkey")
+  batches                EvidenceBatch[]
+  events                 EvidenceEvent[]
+  memberships            EvidenceBatchEvent[]
+  artifacts              ArtifactDeclaration[]
+  references             EvidenceEventArtifact[]
+  processingIntents      ProcessingIntent[]
+  processingReceipts     ProcessingApplicationReceipt[]
+  processingStates       RunProcessingState[]
+  processingFailures     ProcessingAttemptFailure[]
   artifactUploadAttempts ArtifactUploadAttempt[]
+  coreRunProjection      CoreRunProjection?
 
   @@unique([organizationId, canonicalRunId], map: "runs_org_canonical_run_id_key")
   @@unique([organizationId, id], map: "runs_org_id_key")
@@ -56,17 +65,17 @@ model Run {
 }
 
 model EvidenceBatch {
-  id               String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  organizationId   String               @map("organization_id") @db.Uuid
-  runId            String               @map("run_id") @db.Uuid
-  canonicalBatchId String               @map("canonical_batch_id") @db.Uuid
-  schemaVersion    Int                  @map("schema_version")
-  sentAt           DateTime             @map("sent_at") @db.Timestamptz(3)
-  receivedAt       DateTime             @default(now()) @map("received_at") @db.Timestamptz(3)
-  rawBatch         Json                 @map("raw_batch") @db.JsonB
-  organization     Organization         @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "batches_organization_id_fkey")
-  run              Run                  @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "batches_org_run_fkey")
-  memberships      EvidenceBatchEvent[]
+  id                String               @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId    String               @map("organization_id") @db.Uuid
+  runId             String               @map("run_id") @db.Uuid
+  canonicalBatchId  String               @map("canonical_batch_id") @db.Uuid
+  schemaVersion     Int                  @map("schema_version")
+  sentAt            DateTime             @map("sent_at") @db.Timestamptz(3)
+  receivedAt        DateTime             @default(now()) @map("received_at") @db.Timestamptz(3)
+  rawBatch          Json                 @map("raw_batch") @db.JsonB
+  organization      Organization         @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "batches_organization_id_fkey")
+  run               Run                  @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "batches_org_run_fkey")
+  memberships       EvidenceBatchEvent[]
   processingIntents ProcessingIntent[]
 
   @@unique([organizationId, canonicalBatchId], map: "batches_org_canonical_batch_id_key")
@@ -199,27 +208,289 @@ enum ProcessingIntentState {
   PENDING   @map("pending")
   LEASED    @map("leased")
   DELIVERED @map("delivered")
+  BLOCKED   @map("blocked")
 }
 
 model ProcessingIntent {
-  id             String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  organizationId String                @map("organization_id") @db.Uuid
-  runId          String                @map("run_id") @db.Uuid
-  batchId        String                @map("batch_id") @db.Uuid
-  kind           ProcessingIntentKind
-  state          ProcessingIntentState @default(PENDING)
-  createdAt      DateTime              @default(now()) @map("created_at") @db.Timestamptz(3)
-  availableAt    DateTime              @default(now()) @map("available_at") @db.Timestamptz(3)
-  attemptCount   Int                   @default(0) @map("attempt_count")
-  lastAttemptAt  DateTime?             @map("last_attempt_at") @db.Timestamptz(3)
-  leaseExpiresAt DateTime?             @map("lease_expires_at") @db.Timestamptz(3)
-  deliveredAt    DateTime?             @map("delivered_at") @db.Timestamptz(3)
-  lastErrorCode  String?               @map("last_error_code")
-  organization   Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "processing_intents_organization_id_fkey")
-  run            Run                   @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "processing_intents_org_run_fkey")
-  batch          EvidenceBatch         @relation(fields: [organizationId, runId, batchId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "processing_intents_org_run_batch_fkey")
+  id                 String                     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId     String                     @map("organization_id") @db.Uuid
+  runId              String                     @map("run_id") @db.Uuid
+  batchId            String                     @map("batch_id") @db.Uuid
+  kind               ProcessingIntentKind
+  state              ProcessingIntentState      @default(PENDING)
+  createdAt          DateTime                   @default(now()) @map("created_at") @db.Timestamptz(3)
+  availableAt        DateTime                   @default(now()) @map("available_at") @db.Timestamptz(3)
+  attemptCount       Int                        @default(0) @map("attempt_count")
+  lastAttemptAt      DateTime?                  @map("last_attempt_at") @db.Timestamptz(3)
+  leaseExpiresAt     DateTime?                  @map("lease_expires_at") @db.Timestamptz(3)
+  leaseId            String?                    @map("lease_id") @db.Uuid
+  queueMessageId     BigInt?                    @map("queue_message_id")
+  deliveredAt        DateTime?                  @map("delivered_at") @db.Timestamptz(3)
+  lastErrorCode      String?                    @map("last_error_code")
+  organization       Organization               @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "processing_intents_organization_id_fkey")
+  run                Run                        @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "processing_intents_org_run_fkey")
+  batch              EvidenceBatch              @relation(fields: [organizationId, runId, batchId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "processing_intents_org_run_batch_fkey")
+  processingFailures ProcessingAttemptFailure[]
 
   @@unique([batchId, kind], map: "processing_intents_batch_kind_key")
+  @@unique([organizationId, runId, id], map: "processing_intents_org_run_id_key")
   @@index([state, availableAt], map: "processing_intents_state_available_idx")
   @@map("processing_intents")
+}
+
+enum RunProcessingStatus {
+  PENDING    @map("pending")
+  PROCESSING @map("processing")
+  RETRYING   @map("retrying")
+  READY      @map("ready")
+  FAILED     @map("failed")
+}
+
+model ProcessingApplicationReceipt {
+  id               String       @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId   String       @map("organization_id") @db.Uuid
+  runId            String       @map("run_id") @db.Uuid
+  intentId         String       @map("intent_id") @db.Uuid
+  projectorName    String       @map("projector_name")
+  projectorVersion Int          @map("projector_version")
+  appliedAt        DateTime     @default(now()) @map("applied_at") @db.Timestamptz(3)
+  organization     Organization @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "processing_receipts_organization_id_fkey")
+  run              Run          @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "processing_receipts_org_run_fkey")
+
+  @@unique([intentId, projectorName, projectorVersion], map: "processing_receipts_intent_projector_key")
+  @@map("processing_application_receipts")
+}
+
+model RunProcessingState {
+  id                 String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId     String              @map("organization_id") @db.Uuid
+  runId              String              @map("run_id") @db.Uuid
+  projectorName      String              @map("projector_name")
+  projectorVersion   Int                 @map("projector_version")
+  state              RunProcessingStatus @default(PENDING)
+  leaseId            String?             @map("lease_id") @db.Uuid
+  leaseExpiresAt     DateTime?           @map("lease_expires_at") @db.Timestamptz(3)
+  attemptDeadlineAt  DateTime?           @map("attempt_deadline_at") @db.Timestamptz(3)
+  activeIntentId     String?             @map("active_intent_id") @db.Uuid
+  attemptFingerprint String?             @map("attempt_source_fingerprint")
+  attemptCount       Int                 @default(0) @map("attempt_count")
+  availableAt        DateTime            @default(now()) @map("available_at") @db.Timestamptz(3)
+  sourceEventCount   Int?                @map("source_event_count")
+  sourceMaxSequence  BigInt?             @map("source_max_sequence")
+  sourceFingerprint  String?             @map("source_fingerprint")
+  completedAt        DateTime?           @map("completed_at") @db.Timestamptz(3)
+  lastErrorCode      String?             @map("last_error_code")
+  organization       Organization        @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "processing_states_organization_id_fkey")
+  run                Run                 @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "processing_states_org_run_fkey")
+
+  @@unique([organizationId, runId, projectorName], map: "processing_states_org_run_projector_key")
+  @@map("run_processing_states")
+}
+
+model ProcessingAttemptFailure {
+  id                String           @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId    String           @map("organization_id") @db.Uuid
+  runId             String           @map("run_id") @db.Uuid
+  intentId          String           @map("intent_id") @db.Uuid
+  projectorName     String           @map("projector_name")
+  projectorVersion  Int              @map("projector_version")
+  sourceFingerprint String?          @map("source_fingerprint")
+  attemptCount      Int              @map("attempt_count")
+  errorCode         String           @map("error_code")
+  failedAt          DateTime         @default(now()) @map("failed_at") @db.Timestamptz(3)
+  organization      Organization     @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "processing_attempt_failures_organization_id_fkey")
+  run               Run              @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "processing_attempt_failures_org_run_fkey")
+  intent            ProcessingIntent @relation(fields: [organizationId, runId, intentId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "processing_attempt_failures_org_run_intent_fkey")
+
+  @@unique([intentId, projectorName, projectorVersion], map: "processing_attempt_failures_intent_projector_key")
+  @@index([organizationId, runId, failedAt], map: "processing_attempt_failures_org_run_failed_idx")
+  @@map("processing_attempt_failures")
+}
+
+model CoreRunProjection {
+  id                   String                      @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId       String                      @map("organization_id") @db.Uuid
+  repositoryId         String                      @map("repository_id") @db.Uuid
+  runId                String                      @unique(map: "core_run_projections_run_id_key") @map("run_id") @db.Uuid
+  projectorName        String                      @map("projector_name")
+  projectorVersion     Int                         @map("projector_version")
+  sourceEventCount     Int                         @map("source_event_count")
+  sourceMaxSequence    BigInt?                     @map("source_max_sequence")
+  sourceFingerprint    String                      @map("source_fingerprint")
+  startedEventId       String?                     @map("started_event_id") @db.Uuid
+  startedSequence      BigInt?                     @map("started_sequence")
+  finishedEventId      String?                     @map("finished_event_id") @db.Uuid
+  finishedSequence     BigInt?                     @map("finished_sequence")
+  adapter              String?
+  provider             String?
+  observedOutcome      String?                     @map("observed_outcome")
+  durationMs           BigInt?                     @map("duration_ms")
+  evidenceCompleteness String                      @map("evidence_completeness")
+  completenessReasons  Json                        @map("completeness_reasons") @db.JsonB
+  commandCount         Int?                        @map("command_count")
+  toolCallCount        Int?                        @map("tool_call_count")
+  testObservationState String                      @map("test_observation_state")
+  testCounts           Json                        @map("test_counts") @db.JsonB
+  tokenAggregates      Json                        @map("token_aggregates") @db.JsonB
+  filesChanged         BigInt?                     @map("files_changed")
+  updatedAt            DateTime                    @default(now()) @map("updated_at") @db.Timestamptz(3)
+  organization         Organization                @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "core_run_projections_organization_id_fkey")
+  repository           Repository                  @relation(fields: [organizationId, repositoryId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "core_run_projections_org_repository_fkey")
+  run                  Run                         @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "core_run_projections_org_run_fkey")
+  commands             CoreCommandProjection[]
+  tools                CoreToolProjection[]
+  tests                CoreTestProjection[]
+  gitSnapshots         CoreGitSnapshotProjection[]
+  gitDiffs             CoreGitDiffProjection[]
+  errors               CoreErrorProjection[]
+  usage                CoreUsageProjection[]
+
+  @@unique([organizationId, runId], map: "core_runs_org_run_key")
+  @@index([organizationId, repositoryId, updatedAt, runId], map: "core_runs_org_repository_cursor_idx")
+  @@map("core_run_projections")
+}
+
+model CoreCommandProjection {
+  id                String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId    String            @map("organization_id") @db.Uuid
+  runId             String            @map("run_id") @db.Uuid
+  operationId       String            @map("operation_id") @db.Uuid
+  startEventId      String?           @map("start_event_id") @db.Uuid
+  startSequence     BigInt?           @map("start_sequence")
+  finishEventId     String?           @map("finish_event_id") @db.Uuid
+  finishSequence    BigInt?           @map("finish_sequence")
+  state             String
+  outcome           String?
+  durationMs        BigInt?           @map("duration_ms")
+  exitCode          BigInt?           @map("exit_code")
+  terminationSignal String?           @map("termination_signal")
+  commandCapture    Json?             @map("command_capture") @db.JsonB
+  workingDirectory  Json?             @map("working_directory") @db.JsonB
+  stdoutCapture     Json?             @map("stdout_capture") @db.JsonB
+  stderrCapture     Json?             @map("stderr_capture") @db.JsonB
+  runProjection     CoreRunProjection @relation(fields: [organizationId, runId], references: [organizationId, runId], onDelete: Cascade, onUpdate: Restrict, map: "core_commands_org_run_projection_fkey")
+
+  @@unique([runId, operationId], map: "core_commands_run_operation_key")
+  @@index([organizationId, runId, startSequence], map: "core_commands_org_run_sequence_idx")
+  @@map("core_command_projections")
+}
+
+model CoreToolProjection {
+  id             String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String            @map("organization_id") @db.Uuid
+  runId          String            @map("run_id") @db.Uuid
+  operationId    String            @map("operation_id") @db.Uuid
+  startEventId   String?           @map("start_event_id") @db.Uuid
+  startSequence  BigInt?           @map("start_sequence")
+  finishEventId  String?           @map("finish_event_id") @db.Uuid
+  finishSequence BigInt?           @map("finish_sequence")
+  state          String
+  toolName       String?           @map("tool_name")
+  outcome        String?
+  durationMs     BigInt?           @map("duration_ms")
+  inputCapture   Json?             @map("input_capture") @db.JsonB
+  outputCapture  Json?             @map("output_capture") @db.JsonB
+  runProjection  CoreRunProjection @relation(fields: [organizationId, runId], references: [organizationId, runId], onDelete: Cascade, onUpdate: Restrict, map: "core_tools_org_run_projection_fkey")
+
+  @@unique([runId, operationId], map: "core_tools_run_operation_key")
+  @@index([organizationId, runId, startSequence], map: "core_tools_org_run_sequence_idx")
+  @@map("core_tool_projections")
+}
+
+model CoreTestProjection {
+  id               String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId   String            @map("organization_id") @db.Uuid
+  runId            String            @map("run_id") @db.Uuid
+  testRunId        String            @map("test_run_id") @db.Uuid
+  sourceEventId    String            @map("source_event_id") @db.Uuid
+  sourceSequence   BigInt            @map("source_sequence")
+  commandId        String?           @map("command_id") @db.Uuid
+  framework        String
+  outcome          String
+  counts           Json?             @db.JsonB
+  durationMs       BigInt?           @map("duration_ms")
+  reportArtifactId String?           @map("report_artifact_id") @db.Uuid
+  runProjection    CoreRunProjection @relation(fields: [organizationId, runId], references: [organizationId, runId], onDelete: Cascade, onUpdate: Restrict, map: "core_tests_org_run_projection_fkey")
+
+  @@unique([runId, testRunId], map: "core_tests_run_test_key")
+  @@index([organizationId, runId, sourceSequence], map: "core_tests_org_run_sequence_idx")
+  @@map("core_test_projections")
+}
+
+model CoreGitSnapshotProjection {
+  id                 String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId     String            @map("organization_id") @db.Uuid
+  runId              String            @map("run_id") @db.Uuid
+  snapshotId         String            @map("snapshot_id") @db.Uuid
+  sourceEventId      String            @map("source_event_id") @db.Uuid
+  sourceSequence     BigInt            @map("source_sequence")
+  phase              String
+  headCommit         String?           @map("head_commit")
+  isDirty            Boolean           @map("is_dirty")
+  stagedFileCount    BigInt?           @map("staged_file_count")
+  unstagedFileCount  BigInt?           @map("unstaged_file_count")
+  untrackedFileCount BigInt?           @map("untracked_file_count")
+  statusArtifactId   String?           @map("status_artifact_id") @db.Uuid
+  runProjection      CoreRunProjection @relation(fields: [organizationId, runId], references: [organizationId, runId], onDelete: Cascade, onUpdate: Restrict, map: "core_git_snapshots_org_run_projection_fkey")
+
+  @@unique([runId, snapshotId], map: "core_git_snapshots_run_snapshot_key")
+  @@index([organizationId, runId, sourceSequence], map: "core_git_snapshots_org_run_sequence_idx")
+  @@map("core_git_snapshot_projections")
+}
+
+model CoreGitDiffProjection {
+  id                 String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId     String            @map("organization_id") @db.Uuid
+  runId              String            @map("run_id") @db.Uuid
+  diffId             String            @map("diff_id") @db.Uuid
+  sourceEventId      String            @map("source_event_id") @db.Uuid
+  sourceSequence     BigInt            @map("source_sequence")
+  fromSnapshotId     String            @map("from_snapshot_id") @db.Uuid
+  toSnapshotId       String            @map("to_snapshot_id") @db.Uuid
+  filesChanged       BigInt?           @map("files_changed")
+  linesAdded         BigInt?           @map("lines_added")
+  linesDeleted       BigInt?           @map("lines_deleted")
+  diffArtifactId     String            @map("diff_artifact_id") @db.Uuid
+  fileListArtifactId String            @map("file_list_artifact_id") @db.Uuid
+  runProjection      CoreRunProjection @relation(fields: [organizationId, runId], references: [organizationId, runId], onDelete: Cascade, onUpdate: Restrict, map: "core_git_diffs_org_run_projection_fkey")
+
+  @@unique([runId, diffId], map: "core_git_diffs_run_diff_key")
+  @@index([organizationId, runId, sourceSequence], map: "core_git_diffs_org_run_sequence_idx")
+  @@map("core_git_diff_projections")
+}
+
+model CoreErrorProjection {
+  id                 String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId     String            @map("organization_id") @db.Uuid
+  runId              String            @map("run_id") @db.Uuid
+  errorId            String            @map("error_id") @db.Uuid
+  sourceEventId      String            @map("source_event_id") @db.Uuid
+  sourceSequence     BigInt            @map("source_sequence")
+  category           String
+  code               String
+  retryable          Boolean?
+  messageCapture     Json              @map("message_capture") @db.JsonB
+  relatedOperationId String?           @map("related_operation_id") @db.Uuid
+  relatedEventId     String?           @map("related_event_id") @db.Uuid
+  runProjection      CoreRunProjection @relation(fields: [organizationId, runId], references: [organizationId, runId], onDelete: Cascade, onUpdate: Restrict, map: "core_errors_org_run_projection_fkey")
+
+  @@unique([runId, errorId], map: "core_errors_run_error_key")
+  @@index([organizationId, runId, sourceSequence], map: "core_errors_org_run_sequence_idx")
+  @@map("core_error_projections")
+}
+
+model CoreUsageProjection {
+  id             String            @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId String            @map("organization_id") @db.Uuid
+  runId          String            @map("run_id") @db.Uuid
+  sourceEventId  String            @map("source_event_id") @db.Uuid
+  sourceSequence BigInt            @map("source_sequence")
+  provider       String?
+  model          String?
+  measurements   Json              @db.JsonB
+  runProjection  CoreRunProjection @relation(fields: [organizationId, runId], references: [organizationId, runId], onDelete: Cascade, onUpdate: Restrict, map: "core_usage_org_run_projection_fkey")
+
+  @@unique([runId, sourceEventId], map: "core_usage_run_event_key")
+  @@index([organizationId, runId, sourceSequence], map: "core_usage_org_run_sequence_idx")
+  @@map("core_usage_projections")
 }

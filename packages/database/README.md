@@ -22,8 +22,10 @@ variable. Callers must pass either a connection string or a created adapter to
 
 The BBX-004 migration adds mutable processing-intent records. The ingestion
 transaction commits exactly one pending `evidence_batch.accepted` intent with
-each new batch. A later relay may update delivery metadata; it must not mutate
-raw evidence. No queue connection is made by this package.
+each new batch. BBX-009A adds leased delivery, application receipts, processing
+state, and current core projections without weakening raw append-only guards.
+Queue access is explicit and injected; importing or constructing a client does
+not connect.
 
 The BBX-005 migration adds mutable artifact-upload attempts, bounded verification
 leases, terminal integrity observations, partial uniqueness for active and
@@ -47,6 +49,18 @@ pnpm --filter @blackbox/database db:migrate:deploy
 pnpm --filter @blackbox/database db:migrate:verify
 pnpm --filter @blackbox/database test:integration
 ```
+
+On a separately authorized isolated database whose PostgreSQL installation has
+`pgmq` available, the private queue suite is explicit:
+
+```sh
+pnpm --filter @blackbox/database test:queue
+```
+
+It provisions, exercises, drops, and re-provisions only the fixed
+`bbx_processing_v1` queue in that isolated database. The ordinary migration
+suite remains valid on standard PostgreSQL without the extension. See
+`docs/operations/processing.md` for production provisioning and recovery.
 
 ## Local PostgreSQL integration workflow
 
