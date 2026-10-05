@@ -1,27 +1,27 @@
 {
-  "name": "@blackbox/ingest",
+  "name": "@blackbox/artifact-storage",
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
   "scripts": {
     "build": "tsc -p tsconfig.build.json",
-    "dev": "tsx watch src/server.ts",
     "lint": "eslint .",
-    "start": "node --enable-source-maps dist/server.js",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
-  },
-  "dependencies": {
-    "@blackbox/artifact-storage": "workspace:*",
-    "@blackbox/contracts": "workspace:*",
-    "@blackbox/database": "workspace:*",
-    "fastify": "5.12.5"
   },
   "devDependencies": {
     "@blackbox/config": "workspace:*",
     "@types/node": "24.13.6",
     "eslint": "9.39.5",
-    "tsx": "4.23.15",
     "typescript": "6.0.3",
     "vitest": "5.0.1"
   }

@@ -2,7 +2,12 @@
   "extends": "@blackbox/config/typescript/node.json",
   "compilerOptions": {
     "noEmit": true,
-    "rootDir": "src"
+    "rootDir": "src",
+    "paths": {
+      "@blackbox/artifact-storage": [
+        "../../packages/artifact-storage/dist/index.d.ts"
+      ]
+    }
   },
   "include": ["src/**/*.ts"]
 }

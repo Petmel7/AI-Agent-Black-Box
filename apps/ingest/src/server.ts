@@ -14,11 +14,21 @@ const maximumArtifactBytes = Number.parseInt(
   process.env.ARTIFACT_MAX_BYTES ?? '50000000',
   10,
 );
+const verificationInactivityTimeoutMs = Number.parseInt(
+  process.env.INGEST_ARTIFACT_VERIFICATION_INACTIVITY_TIMEOUT_MS ?? '30000',
+  10,
+);
+const verificationAttemptTimeoutMs = Number.parseInt(
+  process.env.INGEST_ARTIFACT_VERIFICATION_ATTEMPT_TIMEOUT_MS ?? '240000',
+  10,
+);
 const artifactService = database
   ? new ArtifactTransportService({
       database: database.client,
       storage: createEnvironmentArtifactStorage(),
       maximumBytes: maximumArtifactBytes,
+      verificationInactivityTimeoutMs,
+      verificationAttemptTimeoutMs,
     })
   : undefined;
 const app = database
@@ -27,7 +37,10 @@ const app = database
         ingest: (input) => ingestEvidenceBatch(database.client, input),
       },
       artifactService: artifactService!,
-      onClose: database.dispose,
+      onClose: async () => {
+        artifactService!.close();
+        await database.dispose();
+      },
     })
   : buildApp();
 

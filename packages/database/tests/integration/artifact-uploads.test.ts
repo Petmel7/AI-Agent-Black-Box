@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
 
 import { EvidenceBatchSchema } from '@blackbox/contracts';
 import { Pool } from 'pg';
@@ -8,6 +9,7 @@ import {
   ArtifactDeclarationLimitError,
   ArtifactNotFoundError,
   authorizeArtifactUpload,
+  backfillArtifactVerifiedIntents,
   claimArtifactVerification,
   createDatabaseClient,
   finalizeArtifactVerification,
@@ -87,7 +89,80 @@ async function seedArtifact(bytes = Buffer.from('artifact')) {
     repositoryId,
     batch,
   });
-  return { handle, organizationId, repositoryId, artifactId, bytes };
+  return { handle, organizationId, repositoryId, runId, artifactId, bytes };
+}
+
+async function seedFileListArtifact() {
+  const diffId = randomUUID();
+  const fromSnapshotId = randomUUID();
+  const toSnapshotId = randomUUID();
+  const bytes = Buffer.from(
+    `${JSON.stringify({
+      schemaVersion: 1,
+      diffId,
+      fromSnapshotId,
+      toSnapshotId,
+      attributionIsTemporalNotCausal: true,
+      files: [],
+    })}\n`,
+  );
+  const organizationId = (
+    await pool.query<{ id: string }>(
+      'INSERT INTO organizations DEFAULT VALUES RETURNING id',
+    )
+  ).rows[0]!.id;
+  const repositoryId = (
+    await pool.query<{ id: string }>(
+      'INSERT INTO repositories (organization_id) VALUES ($1) RETURNING id',
+      [organizationId],
+    )
+  ).rows[0]!.id;
+  const runId = randomUUID();
+  const artifactId = randomUUID();
+  const reference = {
+    artifactId,
+    kind: 'git-file-list',
+    mediaType: 'application/json',
+    byteLength: bytes.length,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    redaction: { applied: true, rulesetVersion: 'v1' },
+    characterEncoding: 'utf-8',
+  };
+  const batch = EvidenceBatchSchema.parse({
+    schemaVersion: 1,
+    batchId: randomUUID(),
+    runId,
+    sentAt: new Date().toISOString(),
+    events: [
+      {
+        schemaVersion: 1,
+        eventId: randomUUID(),
+        runId,
+        sequence: 0,
+        kind: 'git.diff.captured',
+        observedAt: new Date().toISOString(),
+        source: { component: 'git' },
+        payload: {
+          diffId,
+          fromSnapshotId,
+          toSnapshotId,
+          diffArtifact: {
+            ...reference,
+            artifactId: randomUUID(),
+            kind: 'git-diff',
+          },
+          fileListArtifact: reference,
+        },
+      },
+    ],
+  });
+  const handle = createDatabaseClient({ connectionString });
+  await ingestEvidenceBatch(handle.client, {
+    organizationId,
+    repositoryId,
+    batch,
+  });
+  return { handle, organizationId, repositoryId, runId, artifactId, bytes };
 }
 
 function authorizationInput(
@@ -122,11 +197,176 @@ async function waitForDatabaseTime(seconds: number) {
 }
 
 describe('artifact upload persistence', () => {
+  it('rolls verification and intent creation back together on an injected failure', async () => {
+    const seed = await seedFileListArtifact();
+    const authorized = await authorize(seed);
+    const claimed = await claimArtifactVerification(seed.handle.client, {
+      organizationId: seed.organizationId,
+      repositoryId: seed.repositoryId,
+      artifactId: seed.artifactId,
+      uploadId: authorized.attempt.id,
+      leaseDurationMs: 60_000,
+    });
+    if (claimed.outcome !== 'claimed') throw new Error('Expected claim.');
+    await expect(
+      finalizeArtifactVerification(
+        seed.handle.client,
+        {
+          uploadId: authorized.attempt.id,
+          leaseId: claimed.leaseId,
+          byteLength: BigInt(seed.bytes.length),
+          sha256: createHash('sha256').update(seed.bytes).digest('hex'),
+          verifiedAt: new Date(),
+        },
+        {
+          afterRunSourceLock: () => {
+            throw new Error('injected rollback');
+          },
+        },
+      ),
+    ).rejects.toThrow('injected rollback');
+    expect(
+      await seed.handle.client.artifactUploadAttempt.findUniqueOrThrow({
+        where: { id: authorized.attempt.id },
+        select: { state: true },
+      }),
+    ).toEqual({ state: 'VERIFYING' });
+    expect(
+      await seed.handle.client.processingIntent.count({
+        where: { artifactDeclarationId: claimed.declaration.id },
+      }),
+    ).toBe(0);
+    await seed.handle.dispose();
+  });
+
+  it('serializes ingestion and artifact verification through the shared run source lock', async () => {
+    const seed = await seedFileListArtifact();
+    const authorized = await authorize(seed);
+    const claimed = await claimArtifactVerification(seed.handle.client, {
+      organizationId: seed.organizationId,
+      repositoryId: seed.repositoryId,
+      artifactId: seed.artifactId,
+      uploadId: authorized.attempt.id,
+      leaseDurationMs: 60_000,
+    });
+    if (claimed.outcome !== 'claimed') throw new Error('Expected claim.');
+    const second = createDatabaseClient({ connectionString });
+    const locker = await pool.connect();
+    await locker.query('BEGIN');
+    await locker.query(
+      'SELECT id FROM runs WHERE organization_id = $1 AND canonical_run_id = $2 FOR UPDATE',
+      [seed.organizationId, seed.runId],
+    );
+    let verificationLocked = false;
+    let ingestionLocked = false;
+    const verification = finalizeArtifactVerification(
+      seed.handle.client,
+      {
+        uploadId: authorized.attempt.id,
+        leaseId: claimed.leaseId,
+        byteLength: BigInt(seed.bytes.length),
+        sha256: createHash('sha256').update(seed.bytes).digest('hex'),
+        verifiedAt: new Date(),
+      },
+      {
+        afterRunSourceLock: () => {
+          verificationLocked = true;
+        },
+      },
+    );
+    const ingestion = ingestEvidenceBatch(
+      second.client,
+      {
+        organizationId: seed.organizationId,
+        repositoryId: seed.repositoryId,
+        batch: EvidenceBatchSchema.parse({
+          schemaVersion: 1,
+          batchId: randomUUID(),
+          runId: seed.runId,
+          sentAt: new Date().toISOString(),
+          events: [
+            {
+              schemaVersion: 1,
+              eventId: randomUUID(),
+              runId: seed.runId,
+              sequence: 1,
+              kind: 'test.run.finished',
+              observedAt: new Date().toISOString(),
+              source: { component: 'test-parser' },
+              payload: {
+                testRunId: randomUUID(),
+                framework: 'vitest',
+                outcome: 'passed',
+              },
+            },
+          ],
+        }),
+      },
+      {
+        afterRunSourceLock: () => {
+          ingestionLocked = true;
+        },
+      },
+    );
+    await delay(50);
+    expect({ verificationLocked, ingestionLocked }).toEqual({
+      verificationLocked: false,
+      ingestionLocked: false,
+    });
+    await locker.query('ROLLBACK');
+    locker.release();
+    await expect(Promise.all([verification, ingestion])).resolves.toHaveLength(
+      2,
+    );
+    expect(verificationLocked).toBe(true);
+    expect(ingestionLocked).toBe(true);
+    await Promise.all([seed.handle.dispose(), second.dispose()]);
+  });
+
+  it('atomically creates one artifact intent and backfills only a missing intent', async () => {
+    const seed = await seedFileListArtifact();
+    const authorized = await authorize(seed);
+    const claimed = await claimArtifactVerification(seed.handle.client, {
+      organizationId: seed.organizationId,
+      repositoryId: seed.repositoryId,
+      artifactId: seed.artifactId,
+      uploadId: authorized.attempt.id,
+      leaseDurationMs: 60_000,
+    });
+    if (claimed.outcome !== 'claimed') throw new Error('Expected claim.');
+    await finalizeArtifactVerification(seed.handle.client, {
+      uploadId: authorized.attempt.id,
+      leaseId: claimed.leaseId,
+      byteLength: BigInt(seed.bytes.length),
+      sha256: createHash('sha256').update(seed.bytes).digest('hex'),
+      verifiedAt: new Date(),
+    });
+    const intents = await seed.handle.client.processingIntent.findMany({
+      where: { artifactDeclarationId: claimed.declaration.id },
+    });
+    expect(intents).toHaveLength(1);
+    expect(intents[0]).toMatchObject({
+      kind: 'ARTIFACT_VERIFIED',
+      batchId: null,
+      artifactDeclarationId: claimed.declaration.id,
+    });
+    await seed.handle.client.processingIntent.delete({
+      where: { id: intents[0]!.id },
+    });
+    await expect(
+      backfillArtifactVerifiedIntents(seed.handle.client, 100),
+    ).resolves.toBe(1);
+    await expect(
+      backfillArtifactVerifiedIntents(seed.handle.client, 100),
+    ).resolves.toBe(0);
+    await seed.handle.dispose();
+  });
+
   it('deploys the migration and enforces active, object-key, ownership, and append-only boundaries', async () => {
     const migration = await pool.query(
-      `SELECT 1 FROM _prisma_migrations WHERE migration_name IN ('20260924140000_artifact_upload_attempts', '20260925120000_artifact_lease_expiry_guard', '20260925130000_artifact_active_lease_expiry_guard') AND finished_at IS NOT NULL`,
+      `SELECT 1 FROM _prisma_migrations WHERE migration_name IN ('20260924140000_artifact_upload_attempts', '20260925120000_artifact_lease_expiry_guard', '20260925130000_artifact_active_lease_expiry_guard', '20261002120000_verified_artifact_file_projections') AND finished_at IS NOT NULL`,
     );
-    expect(migration.rows).toHaveLength(3);
+    expect(migration.rows).toHaveLength(4);
     const seed = await seedArtifact();
     const authorized = await authorize(seed);
     await expect(
@@ -139,6 +379,16 @@ describe('artifact upload persistence', () => {
       pool.query(
         'UPDATE artifact_upload_attempts SET object_key = $1 WHERE id = $2',
         ['client-selected', authorized.attempt.id],
+      ),
+    ).rejects.toMatchObject({ code: '23514' });
+    await expect(
+      pool.query(
+        `INSERT INTO processing_intents (organization_id, run_id, batch_id, artifact_declaration_id, kind)
+         SELECT b.organization_id, b.run_id, b.id, a.id, 'artifact.verified'
+           FROM evidence_batches b JOIN artifact_declarations a
+             ON a.organization_id = b.organization_id AND a.run_id = b.run_id
+          WHERE b.organization_id = $1 LIMIT 1`,
+        [seed.organizationId],
       ),
     ).rejects.toMatchObject({ code: '23514' });
     await seed.handle.dispose();

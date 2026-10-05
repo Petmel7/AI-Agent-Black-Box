@@ -1,6 +1,6 @@
 # BBX-009B: Verified Artifact and File Projections
 
-- **Status:** Approved
+- **Status:** Done
 - **Owner:** Implementation Chat
 - **Review:** Review Chat
 - **Depends on:** BBX-009A completed at `b80c1553ae4dc66b84027c2cb44503cda9696a2a`

@@ -242,6 +242,16 @@ describe('processing migration and core persistence', () => {
     const own = await seed();
     const handle = createDatabaseClient({ connectionString });
     await ingestEvidenceBatch(handle.client, { ...own, batch: batch() });
+    const target = await handle.client.processingIntent.findFirstOrThrow({
+      where: { organizationId: own.organizationId },
+      select: { id: true },
+    });
+    const targetRelayOptions = { ...relayOptions, batchSize: 1 };
+    const makeTargetAvailable = () =>
+      pool.query(
+        `UPDATE processing_intents SET available_at = to_timestamp(0) WHERE id = $1`,
+        [target.id],
+      );
     const sent: Array<{ schemaVersion: 1; intentId: string }> = [];
     let failSend = false;
     const queue: ProcessingQueue = {
@@ -255,42 +265,41 @@ describe('processing migration and core persistence', () => {
       archive: async () => true,
     };
 
-    await relayProcessingCycle(handle.client, queue, relayOptions, {
-      beforeSend: () => {
-        throw new Error('before send');
+    await makeTargetAvailable();
+    await relayProcessingCycle(handle.client, queue, targetRelayOptions, {
+      beforeSend: (claim) => {
+        if (claim.intentId === target.id) throw new Error('before send');
       },
     });
-    expect(sent).toHaveLength(0);
-    await pool.query(
-      `UPDATE processing_intents SET available_at = clock_timestamp() WHERE organization_id = $1`,
-      [own.organizationId],
+    expect(sent.filter(({ intentId }) => intentId === target.id)).toHaveLength(
+      0,
     );
+    await makeTargetAvailable();
     failSend = true;
-    await relayProcessingCycle(handle.client, queue, relayOptions);
-    expect(sent).toHaveLength(0);
-    failSend = false;
-    await pool.query(
-      `UPDATE processing_intents SET available_at = clock_timestamp() WHERE organization_id = $1`,
-      [own.organizationId],
+    await relayProcessingCycle(handle.client, queue, targetRelayOptions);
+    expect(sent.filter(({ intentId }) => intentId === target.id)).toHaveLength(
+      0,
     );
-    await relayProcessingCycle(handle.client, queue, relayOptions, {
-      afterSend: () => {
-        throw new Error('after send');
+    failSend = false;
+    await makeTargetAvailable();
+    await relayProcessingCycle(handle.client, queue, targetRelayOptions, {
+      afterSend: (claim) => {
+        if (claim.intentId === target.id) throw new Error('after send');
       },
     });
-    expect(sent).toHaveLength(1);
-    await pool.query(
-      `UPDATE processing_intents SET available_at = clock_timestamp() WHERE organization_id = $1`,
-      [own.organizationId],
+    expect(sent.filter(({ intentId }) => intentId === target.id)).toHaveLength(
+      1,
     );
-    await relayProcessingCycle(handle.client, queue, relayOptions);
-    expect(sent).toHaveLength(2);
-    const state = await handle.client.processingIntent.findFirstOrThrow({
-      where: { organizationId: own.organizationId },
+    await makeTargetAvailable();
+    await relayProcessingCycle(handle.client, queue, targetRelayOptions);
+    const targetSends = sent.filter(({ intentId }) => intentId === target.id);
+    expect(targetSends).toHaveLength(2);
+    const state = await handle.client.processingIntent.findUniqueOrThrow({
+      where: { id: target.id },
       select: { state: true, queueMessageId: true },
     });
     expect(state).toMatchObject({ state: 'DELIVERED', queueMessageId: 2n });
-    expect(sent[0]).toEqual(sent[1]);
+    expect(targetSends[0]).toEqual(targetSends[1]);
     await handle.dispose();
   });
 

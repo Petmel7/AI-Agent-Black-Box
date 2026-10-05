@@ -6,6 +6,7 @@ import {
   type PrismaClient,
   type ProcessingIntentKind,
 } from './generated/client/client.js';
+import { lockRunSourceSet } from './run-source-lock.js';
 
 export type IngestionDatabaseClient = PrismaClient;
 
@@ -24,6 +25,8 @@ export interface IngestEvidenceBatchResult {
 
 export interface IngestionFailureHooks {
   beforeRunCreate?(): void | Promise<void>;
+  beforeRunSourceLock?(): void | Promise<void>;
+  afterRunSourceLock?(): void | Promise<void>;
   beforeIntent?(): void | Promise<void>;
   beforeCommit?(): void | Promise<void>;
 }
@@ -187,6 +190,10 @@ async function insertNewBatch(
           throw error;
         }
       }
+
+      await hooks.beforeRunSourceLock?.();
+      await lockRunSourceSet(transaction, run.id);
+      await hooks.afterRunSourceLock?.();
 
       const accepted = await transaction.evidenceBatch.create({
         data: {

@@ -22,18 +22,22 @@ model Organization {
   processingStates       RunProcessingState[]
   processingFailures     ProcessingAttemptFailure[]
   coreRunProjections     CoreRunProjection[]
+  fileRunProjections     FileRunProjection[]
+  fileChangeProjections  FileChangeProjection[]
   artifactUploadAttempts ArtifactUploadAttempt[]
 
   @@map("organizations")
 }
 
 model Repository {
-  id                 String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  organizationId     String              @map("organization_id") @db.Uuid
-  createdAt          DateTime            @default(now()) @map("created_at") @db.Timestamptz(3)
-  organization       Organization        @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "repositories_organization_id_fkey")
-  runs               Run[]
-  coreRunProjections CoreRunProjection[]
+  id                    String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId        String                 @map("organization_id") @db.Uuid
+  createdAt             DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
+  organization          Organization           @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "repositories_organization_id_fkey")
+  runs                  Run[]
+  coreRunProjections    CoreRunProjection[]
+  fileRunProjections    FileRunProjection[]
+  fileChangeProjections FileChangeProjection[]
 
   @@unique([organizationId, id], map: "repositories_org_id_key")
   @@map("repositories")
@@ -58,6 +62,8 @@ model Run {
   processingFailures     ProcessingAttemptFailure[]
   artifactUploadAttempts ArtifactUploadAttempt[]
   coreRunProjection      CoreRunProjection?
+  fileRunProjection      FileRunProjection?
+  fileChangeProjections  FileChangeProjection[]
 
   @@unique([organizationId, canonicalRunId], map: "runs_org_canonical_run_id_key")
   @@unique([organizationId, id], map: "runs_org_id_key")
@@ -126,24 +132,26 @@ model EvidenceBatchEvent {
 }
 
 model ArtifactDeclaration {
-  id                  String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  organizationId      String                  @map("organization_id") @db.Uuid
-  runId               String                  @map("run_id") @db.Uuid
-  canonicalArtifactId String                  @map("canonical_artifact_id") @db.Uuid
-  kind                String
-  mediaType           String                  @map("media_type")
-  byteLength          BigInt                  @map("byte_length")
-  sha256              String
-  redactionApplied    Boolean                 @map("redaction_applied")
-  redactionRuleset    String?                 @map("redaction_ruleset_version")
-  compression         String?
-  characterEncoding   String?                 @map("character_encoding")
-  receivedAt          DateTime                @default(now()) @map("received_at") @db.Timestamptz(3)
-  rawReference        Json                    @map("raw_reference") @db.JsonB
-  organization        Organization            @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "artifacts_organization_id_fkey")
-  run                 Run                     @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "artifacts_org_run_fkey")
-  eventLinks          EvidenceEventArtifact[]
-  uploadAttempts      ArtifactUploadAttempt[]
+  id                    String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId        String                  @map("organization_id") @db.Uuid
+  runId                 String                  @map("run_id") @db.Uuid
+  canonicalArtifactId   String                  @map("canonical_artifact_id") @db.Uuid
+  kind                  String
+  mediaType             String                  @map("media_type")
+  byteLength            BigInt                  @map("byte_length")
+  sha256                String
+  redactionApplied      Boolean                 @map("redaction_applied")
+  redactionRuleset      String?                 @map("redaction_ruleset_version")
+  compression           String?
+  characterEncoding     String?                 @map("character_encoding")
+  receivedAt            DateTime                @default(now()) @map("received_at") @db.Timestamptz(3)
+  rawReference          Json                    @map("raw_reference") @db.JsonB
+  organization          Organization            @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "artifacts_organization_id_fkey")
+  run                   Run                     @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "artifacts_org_run_fkey")
+  eventLinks            EvidenceEventArtifact[]
+  uploadAttempts        ArtifactUploadAttempt[]
+  processingIntents     ProcessingIntent[]
+  fileChangeProjections FileChangeProjection[]
 
   @@unique([organizationId, canonicalArtifactId], map: "artifacts_org_canonical_artifact_id_key")
   @@unique([organizationId, runId, id], map: "artifacts_org_run_id_key")
@@ -160,26 +168,29 @@ enum ArtifactUploadState {
 }
 
 model ArtifactUploadAttempt {
-  id                    String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  organizationId        String              @map("organization_id") @db.Uuid
-  runId                 String              @map("run_id") @db.Uuid
-  artifactDeclarationId String              @map("artifact_declaration_id") @db.Uuid
-  objectKey             String              @unique(map: "artifact_upload_attempts_object_key_key") @map("object_key")
-  state                 ArtifactUploadState @default(ISSUED)
-  issuedAt              DateTime            @default(now()) @map("issued_at") @db.Timestamptz(3)
-  expiresAt             DateTime            @map("expires_at") @db.Timestamptz(3)
-  verificationLeaseId   String?             @map("verification_lease_id") @db.Uuid
-  leaseExpiresAt        DateTime?           @map("lease_expires_at") @db.Timestamptz(3)
-  observedByteLength    BigInt?             @map("observed_byte_length")
-  observedSha256        String?             @map("observed_sha256")
-  verifiedAt            DateTime?           @map("verified_at") @db.Timestamptz(3)
-  rejectedAt            DateTime?           @map("rejected_at") @db.Timestamptz(3)
-  expiredAt             DateTime?           @map("expired_at") @db.Timestamptz(3)
-  lastErrorCode         String?             @map("last_error_code")
-  organization          Organization        @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "artifact_upload_attempts_organization_id_fkey")
-  run                   Run                 @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "artifact_upload_attempts_org_run_fkey")
-  artifactDeclaration   ArtifactDeclaration @relation(fields: [organizationId, runId, artifactDeclarationId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "artifact_upload_attempts_org_run_artifact_fkey")
+  id                    String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId        String                 @map("organization_id") @db.Uuid
+  runId                 String                 @map("run_id") @db.Uuid
+  artifactDeclarationId String                 @map("artifact_declaration_id") @db.Uuid
+  objectKey             String                 @unique(map: "artifact_upload_attempts_object_key_key") @map("object_key")
+  state                 ArtifactUploadState    @default(ISSUED)
+  issuedAt              DateTime               @default(now()) @map("issued_at") @db.Timestamptz(3)
+  expiresAt             DateTime               @map("expires_at") @db.Timestamptz(3)
+  verificationLeaseId   String?                @map("verification_lease_id") @db.Uuid
+  leaseExpiresAt        DateTime?              @map("lease_expires_at") @db.Timestamptz(3)
+  observedByteLength    BigInt?                @map("observed_byte_length")
+  observedSha256        String?                @map("observed_sha256")
+  verifiedAt            DateTime?              @map("verified_at") @db.Timestamptz(3)
+  rejectedAt            DateTime?              @map("rejected_at") @db.Timestamptz(3)
+  expiredAt             DateTime?              @map("expired_at") @db.Timestamptz(3)
+  lastErrorCode         String?                @map("last_error_code")
+  organization          Organization           @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "artifact_upload_attempts_organization_id_fkey")
+  run                   Run                    @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "artifact_upload_attempts_org_run_fkey")
+  artifactDeclaration   ArtifactDeclaration    @relation(fields: [organizationId, runId, artifactDeclarationId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "artifact_upload_attempts_org_run_artifact_fkey")
+  fileChangeProjections FileChangeProjection[]
 
+  @@unique([organizationId, runId, id], map: "artifact_upload_attempts_org_run_id_key")
+  @@unique([organizationId, runId, artifactDeclarationId, id], map: "artifact_upload_attempts_org_run_artifact_id_key")
   @@index([organizationId, artifactDeclarationId, state], map: "artifact_upload_attempts_artifact_state_idx")
   @@map("artifact_upload_attempts")
 }
@@ -202,6 +213,7 @@ model EvidenceEventArtifact {
 
 enum ProcessingIntentKind {
   EVIDENCE_BATCH_ACCEPTED @map("evidence_batch.accepted")
+  ARTIFACT_VERIFIED       @map("artifact.verified")
 }
 
 enum ProcessingIntentState {
@@ -212,27 +224,28 @@ enum ProcessingIntentState {
 }
 
 model ProcessingIntent {
-  id                 String                     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  organizationId     String                     @map("organization_id") @db.Uuid
-  runId              String                     @map("run_id") @db.Uuid
-  batchId            String                     @map("batch_id") @db.Uuid
-  kind               ProcessingIntentKind
-  state              ProcessingIntentState      @default(PENDING)
-  createdAt          DateTime                   @default(now()) @map("created_at") @db.Timestamptz(3)
-  availableAt        DateTime                   @default(now()) @map("available_at") @db.Timestamptz(3)
-  attemptCount       Int                        @default(0) @map("attempt_count")
-  lastAttemptAt      DateTime?                  @map("last_attempt_at") @db.Timestamptz(3)
-  leaseExpiresAt     DateTime?                  @map("lease_expires_at") @db.Timestamptz(3)
-  leaseId            String?                    @map("lease_id") @db.Uuid
-  queueMessageId     BigInt?                    @map("queue_message_id")
-  deliveredAt        DateTime?                  @map("delivered_at") @db.Timestamptz(3)
-  lastErrorCode      String?                    @map("last_error_code")
-  organization       Organization               @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "processing_intents_organization_id_fkey")
-  run                Run                        @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "processing_intents_org_run_fkey")
-  batch              EvidenceBatch              @relation(fields: [organizationId, runId, batchId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "processing_intents_org_run_batch_fkey")
-  processingFailures ProcessingAttemptFailure[]
+  id                    String                     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId        String                     @map("organization_id") @db.Uuid
+  runId                 String                     @map("run_id") @db.Uuid
+  batchId               String?                    @map("batch_id") @db.Uuid
+  artifactDeclarationId String?                    @map("artifact_declaration_id") @db.Uuid
+  kind                  ProcessingIntentKind
+  state                 ProcessingIntentState      @default(PENDING)
+  createdAt             DateTime                   @default(now()) @map("created_at") @db.Timestamptz(3)
+  availableAt           DateTime                   @default(now()) @map("available_at") @db.Timestamptz(3)
+  attemptCount          Int                        @default(0) @map("attempt_count")
+  lastAttemptAt         DateTime?                  @map("last_attempt_at") @db.Timestamptz(3)
+  leaseExpiresAt        DateTime?                  @map("lease_expires_at") @db.Timestamptz(3)
+  leaseId               String?                    @map("lease_id") @db.Uuid
+  queueMessageId        BigInt?                    @map("queue_message_id")
+  deliveredAt           DateTime?                  @map("delivered_at") @db.Timestamptz(3)
+  lastErrorCode         String?                    @map("last_error_code")
+  organization          Organization               @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "processing_intents_organization_id_fkey")
+  run                   Run                        @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "processing_intents_org_run_fkey")
+  batch                 EvidenceBatch?             @relation(fields: [organizationId, runId, batchId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "processing_intents_org_run_batch_fkey")
+  artifactDeclaration   ArtifactDeclaration?       @relation(fields: [organizationId, runId, artifactDeclarationId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "processing_intents_org_run_artifact_fkey")
+  processingFailures    ProcessingAttemptFailure[]
 
-  @@unique([batchId, kind], map: "processing_intents_batch_kind_key")
   @@unique([organizationId, runId, id], map: "processing_intents_org_run_id_key")
   @@index([state, availableAt], map: "processing_intents_state_available_idx")
   @@map("processing_intents")
@@ -493,4 +506,63 @@ model CoreUsageProjection {
   @@unique([runId, sourceEventId], map: "core_usage_run_event_key")
   @@index([organizationId, runId, sourceSequence], map: "core_usage_org_run_sequence_idx")
   @@map("core_usage_projections")
+}
+
+model FileRunProjection {
+  id                 String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId     String                 @map("organization_id") @db.Uuid
+  repositoryId       String                 @map("repository_id") @db.Uuid
+  runId              String                 @unique(map: "file_run_projections_run_id_key") @map("run_id") @db.Uuid
+  projectorName      String                 @map("projector_name")
+  projectorVersion   Int                    @map("projector_version")
+  sourceEventCount   Int                    @map("source_event_count")
+  sourceMaxSequence  BigInt?                @map("source_max_sequence")
+  sourceFingerprint  String                 @map("source_fingerprint")
+  completeness       String
+  completenessReason String?                @map("completeness_reason")
+  fileCount          Int                    @map("file_count")
+  updatedAt          DateTime               @default(now()) @map("updated_at") @db.Timestamptz(3)
+  organization       Organization           @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "file_run_projections_organization_id_fkey")
+  repository         Repository             @relation(fields: [organizationId, repositoryId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "file_run_projections_org_repository_fkey")
+  run                Run                    @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "file_run_projections_org_run_fkey")
+  files              FileChangeProjection[]
+
+  @@unique([organizationId, runId], map: "file_runs_org_run_key")
+  @@map("file_run_projections")
+}
+
+model FileChangeProjection {
+  id                    String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId        String                @map("organization_id") @db.Uuid
+  repositoryId          String                @map("repository_id") @db.Uuid
+  runId                 String                @map("run_id") @db.Uuid
+  sourceEventId         String                @map("source_event_id") @db.Uuid
+  sourceSequence        BigInt                @map("source_sequence")
+  diffId                String                @map("diff_id") @db.Uuid
+  fromSnapshotId        String                @map("from_snapshot_id") @db.Uuid
+  toSnapshotId          String                @map("to_snapshot_id") @db.Uuid
+  artifactDeclarationId String                @map("artifact_declaration_id") @db.Uuid
+  uploadAttemptId       String                @map("upload_attempt_id") @db.Uuid
+  ordinal               Int
+  entryId               String                @map("entry_id")
+  originalEntryId       String?               @map("original_entry_id")
+  displayPath           String                @map("display_path")
+  originalDisplayPath   String?               @map("original_display_path")
+  displayAmbiguous      Boolean               @default(false) @map("display_ambiguous")
+  displayReason         String?               @map("display_reason")
+  beforeState           Json?                 @map("before_state") @db.JsonB
+  afterState            Json?                 @map("after_state") @db.JsonB
+  attribution           String
+  reason                String?
+  runProjection         FileRunProjection     @relation(fields: [organizationId, runId], references: [organizationId, runId], onDelete: Cascade, onUpdate: Restrict, map: "file_changes_org_run_projection_fkey")
+  organization          Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "file_changes_organization_id_fkey")
+  repository            Repository            @relation(fields: [organizationId, repositoryId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "file_changes_org_repository_fkey")
+  run                   Run                   @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "file_changes_org_run_fkey")
+  artifactDeclaration   ArtifactDeclaration   @relation(fields: [organizationId, runId, artifactDeclarationId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "file_changes_org_run_artifact_fkey")
+  uploadAttempt         ArtifactUploadAttempt @relation(fields: [organizationId, runId, artifactDeclarationId, uploadAttemptId], references: [organizationId, runId, artifactDeclarationId, id], onDelete: Restrict, onUpdate: Restrict, map: "file_changes_org_run_upload_fkey")
+
+  @@unique([runId, sourceEventId, ordinal], map: "file_changes_run_event_ordinal_key")
+  @@unique([runId, sourceEventId, entryId], map: "file_changes_run_event_entry_key")
+  @@index([organizationId, runId, sourceSequence, ordinal], map: "file_changes_org_run_cursor_idx")
+  @@map("file_change_projections")
 }

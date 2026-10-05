@@ -7,6 +7,7 @@ import {
   MalformedQueueMessageError,
   PROCESSING_QUEUE_NAME,
   provisionProcessingQueue,
+  relayProcessingCycle,
 } from '../../src/index.js';
 
 const connectionString = process.env.TEST_DATABASE_URL!;
@@ -23,6 +24,75 @@ afterAll(async () => {
 });
 
 describe('private pgmq processing queue', () => {
+  it('relays a real artifact intent through the unchanged opaque payload', async () => {
+    const organization = await handle.client.organization.create({ data: {} });
+    const repository = await handle.client.repository.create({
+      data: { organizationId: organization.id },
+    });
+    const run = await handle.client.run.create({
+      data: {
+        organizationId: organization.id,
+        repositoryId: repository.id,
+        canonicalRunId: randomUUID(),
+      },
+    });
+    const canonicalArtifactId = randomUUID();
+    const reference = {
+      artifactId: canonicalArtifactId,
+      kind: 'git-file-list',
+      mediaType: 'application/json',
+      byteLength: 2,
+      sha256: 'a'.repeat(64),
+      redaction: { applied: false },
+      characterEncoding: 'utf-8',
+    };
+    const artifact = await handle.client.artifactDeclaration.create({
+      data: {
+        organizationId: organization.id,
+        runId: run.id,
+        canonicalArtifactId,
+        kind: reference.kind,
+        mediaType: reference.mediaType,
+        byteLength: 2n,
+        sha256: reference.sha256,
+        redactionApplied: false,
+        characterEncoding: 'utf-8',
+        rawReference: reference,
+      },
+    });
+    const targetIntent = await handle.client.processingIntent.create({
+      data: {
+        organizationId: organization.id,
+        runId: run.id,
+        artifactDeclarationId: artifact.id,
+        kind: 'ARTIFACT_VERIFIED',
+        availableAt: new Date(0),
+      },
+    });
+    await relayProcessingCycle(handle.client, queue, {
+      batchSize: 1,
+      leaseSeconds: 10,
+      maxAttempts: 2,
+      retryBaseSeconds: 1,
+      retryMaxSeconds: 2,
+    });
+    const messages = await queue.read(2, 1);
+    expect(messages[0]?.payload).toEqual({
+      schemaVersion: 1,
+      intentId: targetIntent.id,
+    });
+    expect(
+      await handle.client.processingIntent.findUniqueOrThrow({
+        where: { id: targetIntent.id },
+        select: { state: true, queueMessageId: true },
+      }),
+    ).toEqual({
+      state: 'DELIVERED',
+      queueMessageId: BigInt(messages[0]!.messageId),
+    });
+    expect(await queue.archive(messages[0]!.messageId)).toBe(true);
+  });
+
   it('provisions idempotently and sends, reads, and archives strict v1 messages', async () => {
     await provisionProcessingQueue(handle.client);
     const intentId = randomUUID();

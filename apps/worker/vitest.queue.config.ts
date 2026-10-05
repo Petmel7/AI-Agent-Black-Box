@@ -21,7 +21,9 @@ export default defineConfig({
     },
   },
   test: {
-    include: ['src/**/*.test.ts'],
-    exclude: ['src/**/*.integration.test.ts'],
+    include: ['src/**/*.integration.test.ts'],
+    testTimeout: 30_000,
+    hookTimeout: 30_000,
+    fileParallelism: false,
   },
 });

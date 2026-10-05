@@ -6,6 +6,7 @@ import {
   type ArtifactStorageStatusResponse,
   type ArtifactUploadSessionResponse,
 } from '@blackbox/contracts';
+import { ArtifactReadError } from '@blackbox/artifact-storage';
 import {
   ArtifactDeclarationLimitError,
   authorizeArtifactUpload,
@@ -32,7 +33,7 @@ export interface ArtifactStoragePort {
     expiresAt: Date;
     requiredChunkSize?: number;
   }>;
-  openReadable(objectKey: string): Promise<Readable>;
+  openReadable(objectKey: string, signal?: AbortSignal): Promise<Readable>;
   deleteObject(objectKey: string): Promise<void>;
 }
 
@@ -46,6 +47,8 @@ export interface ArtifactTransportServiceOptions {
   storage: ArtifactStoragePort;
   maximumBytes?: number;
   verificationLeaseMs?: number;
+  verificationInactivityTimeoutMs?: number;
+  verificationAttemptTimeoutMs?: number;
   now?: () => Date;
 }
 
@@ -82,11 +85,18 @@ function verified(
 export class ArtifactTransportService {
   private readonly maximumBytes: number;
   private readonly verificationLeaseMs: number;
+  private readonly verificationInactivityTimeoutMs: number;
+  private readonly verificationAttemptTimeoutMs: number;
   private readonly now: () => Date;
+  private readonly shutdown = new AbortController();
 
   constructor(private readonly options: ArtifactTransportServiceOptions) {
     this.maximumBytes = options.maximumBytes ?? DEFAULT_MAX_ARTIFACT_BYTES;
     this.verificationLeaseMs = options.verificationLeaseMs ?? 5 * 60_000;
+    this.verificationInactivityTimeoutMs =
+      options.verificationInactivityTimeoutMs ?? 30_000;
+    this.verificationAttemptTimeoutMs =
+      options.verificationAttemptTimeoutMs ?? 4 * 60_000;
     this.now = options.now ?? (() => new Date());
     if (
       !Number.isSafeInteger(this.maximumBytes) ||
@@ -95,6 +105,21 @@ export class ArtifactTransportService {
     ) {
       throw new Error('Artifact maximum must be between 1 and 50000000 bytes.');
     }
+    for (const [name, value] of [
+      ['verificationInactivityTimeoutMs', this.verificationInactivityTimeoutMs],
+      ['verificationAttemptTimeoutMs', this.verificationAttemptTimeoutMs],
+      ['verificationLeaseMs', this.verificationLeaseMs],
+    ] as const)
+      if (!Number.isSafeInteger(value) || value < 1)
+        throw new Error(`${name} must be a positive safe integer.`);
+    if (this.verificationLeaseMs <= this.verificationAttemptTimeoutMs)
+      throw new Error(
+        'Artifact verification lease must exceed the attempt timeout.',
+      );
+  }
+
+  close(): void {
+    this.shutdown.abort();
   }
 
   async createSession(
@@ -168,6 +193,7 @@ export class ArtifactTransportService {
 
   async complete(
     scope: ArtifactScope & { uploadId: string },
+    context: { signal?: AbortSignal } = {},
   ): Promise<ArtifactCompletionResponse> {
     const claim = await claimArtifactVerification(this.options.database, {
       ...scope,
@@ -202,16 +228,45 @@ export class ArtifactTransportService {
     let rejection:
       'integrity_mismatch' | 'object_missing' | 'payload_too_large' | undefined;
     try {
-      const stream = await this.options.storage.openReadable(
-        claim.attempt.objectKey,
+      const controller = new AbortController();
+      const cancel = () => controller.abort(context.signal?.reason);
+      const shutdown = () => controller.abort(this.shutdown.signal.reason);
+      context.signal?.addEventListener('abort', cancel, { once: true });
+      this.shutdown.signal.addEventListener('abort', shutdown, { once: true });
+      if (context.signal?.aborted) cancel();
+      if (this.shutdown.signal.aborted) shutdown();
+      const timeout = setTimeout(
+        () =>
+          controller.abort(
+            new ArtifactReadError('artifact_read_timeout', true),
+          ),
+        this.verificationAttemptTimeoutMs,
       );
-      const observation = await observeArtifactStream(
-        stream,
-        this.maximumBytes,
-      );
-      observedLength = observation.byteLength;
-      observedSha256 = observation.sha256;
-      if (observation.exceededLimit) rejection = 'payload_too_large';
+      let stream: Readable | undefined;
+      try {
+        if (controller.signal.aborted)
+          throw new ArtifactReadError('artifact_read_cancelled', true);
+        stream = await this.options.storage.openReadable(
+          claim.attempt.objectKey,
+          controller.signal,
+        );
+        const observation = await observeArtifactStream(
+          stream,
+          this.maximumBytes,
+          {
+            inactivityTimeoutMs: this.verificationInactivityTimeoutMs,
+            signal: controller.signal,
+          },
+        );
+        observedLength = observation.byteLength;
+        observedSha256 = observation.sha256;
+        if (observation.exceededLimit) rejection = 'payload_too_large';
+      } finally {
+        clearTimeout(timeout);
+        context.signal?.removeEventListener('abort', cancel);
+        this.shutdown.signal.removeEventListener('abort', shutdown);
+        if (controller.signal.aborted) stream?.destroy();
+      }
     } catch (error) {
       if (error instanceof ArtifactObjectMissingError) {
         rejection = 'object_missing';

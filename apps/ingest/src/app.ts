@@ -270,12 +270,19 @@ export function buildApp(options: BuildAppOptions = {}) {
         return reply.code(422).send(artifactErrorBody('invalid_request'));
       if (!options.artifactService)
         return reply.code(500).send(artifactErrorBody('internal_error'));
+      const operation = new AbortController();
+      const abort = () => operation.abort();
+      request.raw.once('aborted', abort);
+      reply.raw.once('close', abort);
       try {
         const result = ArtifactCompletionResponseSchema.parse(
-          await options.artifactService.complete({
-            organizationId: identity.organizationId,
-            ...params.data,
-          }),
+          await options.artifactService.complete(
+            {
+              organizationId: identity.organizationId,
+              ...params.data,
+            },
+            { signal: operation.signal },
+          ),
         );
         return reply
           .code(
@@ -300,6 +307,9 @@ export function buildApp(options: BuildAppOptions = {}) {
           'Artifact completion failed',
         );
         return reply.code(500).send(artifactErrorBody('internal_error'));
+      } finally {
+        request.raw.off('aborted', abort);
+        reply.raw.off('close', abort);
       }
     },
   );

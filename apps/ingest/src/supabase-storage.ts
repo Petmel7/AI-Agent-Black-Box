@@ -1,6 +1,11 @@
 import { Readable } from 'node:stream';
 
 import {
+  ArtifactReadError,
+  SupabaseArtifactReader,
+} from '@blackbox/artifact-storage';
+
+import {
   ArtifactObjectMissingError,
   type ArtifactStoragePort,
 } from './artifact-service.js';
@@ -9,6 +14,7 @@ export interface SupabaseStorageConfig {
   url: string | undefined;
   serviceRoleKey: string | undefined;
   bucket: string | undefined;
+  connectTimeoutMs?: number;
   fetch?: typeof fetch;
   now?: () => Date;
 }
@@ -60,6 +66,7 @@ export class SupabaseArtifactStorage implements ArtifactStoragePort {
   private readonly bucket: string;
   private readonly request: typeof fetch;
   private readonly now: () => Date;
+  private readonly reader: SupabaseArtifactReader;
 
   constructor(config: SupabaseStorageConfig) {
     const rawUrl = required(config.url, 'URL');
@@ -76,6 +83,15 @@ export class SupabaseArtifactStorage implements ArtifactStoragePort {
     this.bucket = required(config.bucket, 'bucket');
     this.request = config.fetch ?? fetch;
     this.now = config.now ?? (() => new Date());
+    this.reader = new SupabaseArtifactReader({
+      url: rawUrl,
+      serviceRoleKey: this.serviceRoleKey,
+      bucket: this.bucket,
+      ...(config.connectTimeoutMs === undefined
+        ? {}
+        : { connectTimeoutMs: config.connectTimeoutMs }),
+      fetch: this.request,
+    });
   }
 
   private headers(): Record<string, string> {
@@ -151,15 +167,23 @@ export class SupabaseArtifactStorage implements ArtifactStoragePort {
     };
   }
 
-  async openReadable(objectKey: string): Promise<Readable> {
-    const response = await this.request(
-      `${this.baseUrl}/storage/v1/object/authenticated/${path(this.bucket)}/${path(objectKey)}`,
-      { headers: this.headers(), redirect: 'error' },
-    );
-    if (response.status === 404) throw new ArtifactObjectMissingError();
-    if (!response.ok || !response.body)
-      throw new Error('Storage object read failed.');
-    return Readable.fromWeb(response.body);
+  async openReadable(
+    objectKey: string,
+    signal?: AbortSignal,
+  ): Promise<Readable> {
+    try {
+      return await this.reader.open({
+        objectKey,
+        ...(signal ? { signal } : {}),
+      });
+    } catch (error) {
+      if (
+        error instanceof ArtifactReadError &&
+        error.code === 'artifact_object_missing'
+      )
+        throw new ArtifactObjectMissingError();
+      throw error;
+    }
   }
 
   async deleteObject(objectKey: string): Promise<void> {
@@ -179,5 +203,9 @@ export function createEnvironmentArtifactStorage(
     url: environment.SUPABASE_URL,
     serviceRoleKey: environment.SUPABASE_SERVICE_ROLE_KEY,
     bucket: environment.ARTIFACT_STORAGE_BUCKET,
+    connectTimeoutMs: Number.parseInt(
+      environment.INGEST_ARTIFACT_VERIFICATION_CONNECT_TIMEOUT_MS ?? '10000',
+      10,
+    ),
   });
 }

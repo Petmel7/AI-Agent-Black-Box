@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "diffId": "00000000-0000-4000-8000-000000000001",
+  "fromSnapshotId": "00000000-0000-4000-8000-000000000002",
+  "toSnapshotId": "00000000-0000-4000-8000-000000000003",
+  "attributionIsTemporalNotCausal": true,
+  "files": [
+    {
+      "entryId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "path": "[REDACTED]",
+      "displayAmbiguous": true,
+      "displayReason": "redaction-collision",
+      "attribution": "mixed-or-uncertain",
+      "reason": "pre-existing-state-changed",
+      "before": {
+        "entryId": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "path": "old.txt",
+        "kind": "ordinary",
+        "indexStatus": "R",
+        "worktreeStatus": ".",
+        "submodule": "N..."
+      },
+      "after": {
+        "entryId": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "path": "[REDACTED]",
+        "originalPath": "old.txt",
+        "kind": "rename-or-copy",
+        "indexStatus": "R",
+        "worktreeStatus": ".",
+        "submodule": "N...",
+        "binary": true,
+        "displayAmbiguous": true,
+        "displayReason": "redaction-collision"
+      }
+    },
+    {
+      "entryId": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "path": "new.txt",
+      "attribution": "observed-during-run",
+      "before": null,
+      "after": {
+        "entryId": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "path": "new.txt",
+        "kind": "untracked",
+        "indexStatus": "?",
+        "worktreeStatus": "?",
+        "submodule": "N..."
+      }
+    }
+  ]
+}

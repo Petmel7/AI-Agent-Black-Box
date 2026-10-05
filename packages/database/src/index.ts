@@ -18,6 +18,7 @@ export {
   ArtifactNotFoundError,
   ArtifactUploadIllegalStateError,
   authorizeArtifactUpload,
+  backfillArtifactVerifiedIntents,
   claimArtifactVerification,
   finalizeArtifactVerification,
   getArtifactStorageRecord,
@@ -47,9 +48,24 @@ export {
   type CoreProcessingResult,
 } from './core-processing.js';
 export {
+  FILES_PROJECTOR_NAME,
+  FILES_PROJECTOR_VERSION,
+  FileProcessingError,
+  parseGitFileListArtifact,
+  processFilesIntent,
+  replayFilesIntent,
+  type FileArtifactReader,
+  type FileProcessingContext,
+  type FileProcessingOptions,
+  type FileProcessingResult,
+} from './file-processing.js';
+export {
   getCoreRunDetail,
+  listFileChanges,
   listCoreRuns,
+  type FileChangeListInput,
   type QueryProcessingState,
+  type QueryConsistencyHooks,
   type RunDetailInput,
   type RunListInput,
 } from './core-queries.js';

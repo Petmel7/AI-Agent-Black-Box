@@ -74,11 +74,19 @@ function storage(read: () => Promise<Readable>): ArtifactStoragePort {
   };
 }
 
-function service(value: ArtifactStoragePort) {
+function service(
+  value: ArtifactStoragePort,
+  overrides: Partial<{
+    verificationInactivityTimeoutMs: number;
+    verificationAttemptTimeoutMs: number;
+    verificationLeaseMs: number;
+  }> = {},
+) {
   return new ArtifactTransportService({
     database: {} as never,
     storage: value,
     maximumBytes: 100,
+    ...overrides,
   });
 }
 
@@ -141,7 +149,10 @@ describe('artifact transport verification', () => {
         sha256: digest,
       }),
     );
-    expect(fake.openReadable).toHaveBeenCalledWith('server/owned/key');
+    expect(fake.openReadable).toHaveBeenCalledWith(
+      'server/owned/key',
+      expect.any(AbortSignal),
+    );
   });
 
   it.each([
@@ -192,6 +203,104 @@ describe('artifact transport verification', () => {
     );
     expect(releaseArtifactVerification).toHaveBeenCalled();
     expect(rejectArtifactVerification).not.toHaveBeenCalled();
+  });
+
+  it('times out a stalled response body, destroys it, and releases the lease', async () => {
+    vi.useFakeTimers();
+    const stream = new Readable({ read() {} });
+    let opened!: () => void;
+    const active = new Promise<void>((resolve) => (opened = resolve));
+    const pending = service(
+      storage(async () => {
+        opened();
+        return stream;
+      }),
+      {
+        verificationInactivityTimeoutMs: 10,
+        verificationAttemptTimeoutMs: 100,
+        verificationLeaseMs: 1_000,
+      },
+    ).complete(scope);
+    const rejection = expect(pending).rejects.toBeInstanceOf(
+      ArtifactStorageUnavailableError,
+    );
+    await active;
+    await vi.advanceTimersByTimeAsync(11);
+    await rejection;
+    expect(stream.destroyed).toBe(true);
+    expect(releaseArtifactVerification).toHaveBeenCalledOnce();
+    vi.useRealTimers();
+  });
+
+  it('enforces the absolute verification deadline while the body remains active', async () => {
+    vi.useFakeTimers();
+    const stream = new Readable({
+      read() {
+        setTimeout(() => this.push(Buffer.from('x')), 5);
+      },
+    });
+    let opened!: () => void;
+    const active = new Promise<void>((resolve) => (opened = resolve));
+    const pending = service(
+      storage(async () => {
+        opened();
+        return stream;
+      }),
+      {
+        verificationInactivityTimeoutMs: 20,
+        verificationAttemptTimeoutMs: 30,
+        verificationLeaseMs: 1_000,
+      },
+    ).complete(scope);
+    const rejection = expect(pending).rejects.toBeInstanceOf(
+      ArtifactStorageUnavailableError,
+    );
+    await active;
+    await vi.advanceTimersByTimeAsync(31);
+    await rejection;
+    expect(stream.destroyed).toBe(true);
+    expect(releaseArtifactVerification).toHaveBeenCalledOnce();
+    vi.useRealTimers();
+  });
+
+  it('honors operation cancellation and destroys the active response body', async () => {
+    const stream = new Readable({ read() {} });
+    let opened!: () => void;
+    const active = new Promise<void>((resolve) => (opened = resolve));
+    const controller = new AbortController();
+    const pending = service(
+      storage(async () => {
+        opened();
+        return stream;
+      }),
+    ).complete(scope, { signal: controller.signal });
+    await active;
+    controller.abort();
+    await expect(pending).rejects.toBeInstanceOf(
+      ArtifactStorageUnavailableError,
+    );
+    expect(stream.destroyed).toBe(true);
+    expect(releaseArtifactVerification).toHaveBeenCalledOnce();
+  });
+
+  it('cancels active verification on service shutdown', async () => {
+    const stream = new Readable({ read() {} });
+    let opened!: () => void;
+    const active = new Promise<void>((resolve) => (opened = resolve));
+    const transport = service(
+      storage(async () => {
+        opened();
+        return stream;
+      }),
+    );
+    const pending = transport.complete(scope);
+    await active;
+    transport.close();
+    await expect(pending).rejects.toBeInstanceOf(
+      ArtifactStorageUnavailableError,
+    );
+    expect(stream.destroyed).toBe(true);
+    expect(releaseArtifactVerification).toHaveBeenCalledOnce();
   });
 
   it('keeps durable rejection even when best-effort deletion fails', async () => {

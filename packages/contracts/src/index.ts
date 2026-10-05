@@ -3,6 +3,7 @@ import { z } from 'zod';
 export * from './evidence/index.js';
 export * from './ingestion.js';
 export * from './artifacts.js';
+export * from './git-file-list.js';
 
 export const HealthResponseSchema = z.object({
   status: z.literal('ok'),

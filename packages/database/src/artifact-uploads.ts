@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 
 import { Prisma, type PrismaClient } from './generated/client/client.js';
+import { lockRunSourceSet } from './run-source-lock.js';
 
 export type ArtifactRejectionCode =
   'integrity_mismatch' | 'object_missing' | 'payload_too_large';
@@ -391,8 +392,19 @@ export async function finalizeArtifactVerification(
     sha256: string;
     verifiedAt: Date;
   },
+  hooks: {
+    beforeRunSourceLock?(): void | Promise<void>;
+    afterRunSourceLock?(): void | Promise<void>;
+  } = {},
 ): Promise<ArtifactTerminalMutationResult> {
   return client.$transaction(async (transaction) => {
+    const owner = await transaction.$queryRaw<Array<{ runId: string }>>(
+      Prisma.sql`SELECT run_id AS "runId" FROM artifact_upload_attempts WHERE id = ${input.uploadId}::uuid`,
+    );
+    if (!owner[0]) throw new ArtifactUploadIllegalStateError();
+    await hooks.beforeRunSourceLock?.();
+    await lockRunSourceSet(transaction, owner[0].runId);
+    await hooks.afterRunSourceLock?.();
     const rows = await transaction.$queryRaw<AttemptRow[]>(Prisma.sql`
       UPDATE artifact_upload_attempts
          SET state = 'verified', verification_lease_id = NULL,
@@ -405,7 +417,10 @@ export async function finalizeArtifactVerification(
          AND lease_expires_at > clock_timestamp()
       RETURNING ${attemptColumns}
     `);
-    if (rows[0]) return { outcome: 'applied', attempt: attempt(rows[0]) };
+    if (rows[0]) {
+      await createArtifactVerifiedIntent(transaction, input.uploadId);
+      return { outcome: 'applied', attempt: attempt(rows[0]) };
+    }
     const winning = await transaction.$queryRaw<AttemptRow[]>(Prisma.sql`
       SELECT ${attemptColumns}
         FROM artifact_upload_attempts
@@ -413,6 +428,84 @@ export async function finalizeArtifactVerification(
     `);
     if (!winning[0]) throw new ArtifactUploadIllegalStateError();
     return { outcome: 'lease_lost', attempt: attempt(winning[0]) };
+  });
+}
+
+async function createArtifactVerifiedIntent(
+  transaction: Prisma.TransactionClient,
+  uploadId: string,
+): Promise<void> {
+  await transaction.$executeRaw(Prisma.sql`
+    INSERT INTO processing_intents (
+      organization_id, run_id, batch_id, artifact_declaration_id, kind
+    )
+    SELECT attempt.organization_id, attempt.run_id, NULL, artifact.id,
+           'artifact.verified'::"ProcessingIntentKind"
+      FROM artifact_upload_attempts AS attempt
+      JOIN artifact_declarations AS artifact
+        ON artifact.organization_id = attempt.organization_id
+       AND artifact.run_id = attempt.run_id
+       AND artifact.id = attempt.artifact_declaration_id
+      JOIN evidence_event_artifacts AS link
+        ON link.organization_id = artifact.organization_id
+       AND link.run_id = artifact.run_id
+       AND link.artifact_id = artifact.id
+       AND link.json_pointer = '/payload/fileListArtifact'
+      JOIN evidence_events AS event
+        ON event.organization_id = link.organization_id
+       AND event.run_id = link.run_id
+       AND event.id = link.event_id
+       AND event.kind = 'git.diff.captured'
+     WHERE attempt.id = CAST(${uploadId} AS uuid)
+       AND attempt.state = 'verified'
+       AND artifact.kind = 'git-file-list'
+       AND event.raw_event #> '{payload,fileListArtifact}' = artifact.raw_reference
+    ON CONFLICT DO NOTHING
+  `);
+}
+
+/** Bounded metadata-only replay for verified canonical Git file-list declarations. */
+export async function backfillArtifactVerifiedIntents(
+  client: PrismaClient,
+  limit: number,
+): Promise<number> {
+  if (!Number.isSafeInteger(limit) || limit < 1 || limit > 10_000)
+    throw new TypeError('Backfill limit must be between 1 and 10000.');
+  return client.$transaction(async (transaction) => {
+    const rows = await transaction.$queryRaw<Array<{ uploadId: string }>>(
+      Prisma.sql`
+        SELECT attempt.id AS "uploadId"
+          FROM artifact_upload_attempts AS attempt
+          JOIN artifact_declarations AS artifact
+            ON artifact.organization_id = attempt.organization_id
+           AND artifact.run_id = attempt.run_id
+           AND artifact.id = attempt.artifact_declaration_id
+          JOIN evidence_event_artifacts AS link
+            ON link.organization_id = artifact.organization_id
+           AND link.run_id = artifact.run_id
+           AND link.artifact_id = artifact.id
+           AND link.json_pointer = '/payload/fileListArtifact'
+          JOIN evidence_events AS event
+            ON event.organization_id = link.organization_id
+           AND event.run_id = link.run_id
+           AND event.id = link.event_id
+           AND event.kind = 'git.diff.captured'
+         WHERE attempt.state = 'verified'
+           AND artifact.kind = 'git-file-list'
+           AND event.raw_event #> '{payload,fileListArtifact}' = artifact.raw_reference
+           AND NOT EXISTS (
+             SELECT 1 FROM processing_intents AS intent
+              WHERE intent.artifact_declaration_id = artifact.id
+                AND intent.kind::text = 'artifact.verified'
+           )
+         ORDER BY attempt.verified_at, attempt.id
+         LIMIT ${limit}
+         FOR UPDATE OF attempt SKIP LOCKED
+      `,
+    );
+    for (const row of rows)
+      await createArtifactVerifiedIntent(transaction, row.uploadId);
+    return rows.length;
   });
 }
 
