@@ -71,12 +71,16 @@ describe('bounded artifact reads', () => {
 
 describe('SupabaseArtifactReader', () => {
   it('uses private credentials only on a redirect-disabled authenticated request', async () => {
-    const request = vi.fn(async () => new Response(bytes));
+    const request = vi.fn<typeof fetch>(async (input, init) => {
+      void input;
+      void init;
+      return new Response(bytes);
+    });
     const value = new SupabaseArtifactReader({
       url: 'https://example.supabase.co',
       serviceRoleKey: 'secret',
       bucket: 'private',
-      fetch: request as typeof fetch,
+      fetch: request,
     });
     await value.open({ objectKey: 'server/key' });
     const [url, init] = request.mock.calls[0]!;
@@ -85,6 +89,7 @@ describe('SupabaseArtifactReader', () => {
     expect((init?.headers as Record<string, string>).authorization).toBe(
       'Bearer secret',
     );
+    expect((init?.headers as Record<string, string>).apikey).toBe('secret');
   });
 
   it('classifies missing and provider failures without exposing provider bodies', async () => {
