@@ -10,7 +10,7 @@
     "start": "node --enable-source-maps dist/main.js",
     "queue:provision": "node --enable-source-maps dist/provision-queue.js",
     "artifact-intents:backfill": "node --enable-source-maps dist/backfill-artifact-intents.js",
-    "test": "vitest run && node ./scripts/run-queue-if-configured.mjs",
+    "test": "vitest run",
     "test:queue": "node ../../packages/database/scripts/require-test-database-url.mjs && vitest run --config vitest.queue.config.ts",
     "typecheck": "tsc --noEmit"
   },

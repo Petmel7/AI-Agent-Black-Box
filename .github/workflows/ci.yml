@@ -79,3 +79,4 @@ jobs:
       - run: pnpm --filter @blackbox/database db:generate
       - run: pnpm --filter @blackbox/database db:migrate:deploy
       - run: pnpm --filter @blackbox/database test:queue
+      - run: pnpm --filter @blackbox/worker test:queue
