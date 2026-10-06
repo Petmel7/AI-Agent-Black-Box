@@ -13,6 +13,7 @@ Review the declared diff or commit without modifying it.
 2. Read `AGENTS.md`, the approved task, only its referenced architecture documents, and `docs/review-guidelines.md`.
 3. Treat the repository sources identified by `AGENTS.md` and the approved task as authoritative. If this guidance conflicts with a higher-priority source, stop and report the conflict.
 4. Report unavailable inputs as validation gaps; do not infer them.
+5. Read the task's declared delivery risk and execution profile. Briefly report a known model/reasoning mismatch, but do not treat that mismatch alone as blocking an otherwise authorized independent review.
 
 ## Review independently
 
@@ -20,9 +21,11 @@ Review the declared diff or commit without modifying it.
 - Independently reproduce checks for affected behavior and high-risk boundaries, and tie claims to the exact state on which commands completed.
 - Do not repeat the full deterministic suite by default. Run it for migrations, authentication, tenant isolation, evidence integrity, concurrency, dependency or build-system changes, or another documented high-risk reason; otherwise use the task's focused review checks.
 - Broaden validation for failures, unexplained warnings, a changed relevant diff, or risk discovered during review.
+- Use the assurance level in the canonical matrix in `docs/tasks/README.md`. If review discovers a materially higher-risk boundary than the declared profile, report the changed risk and recommend escalation rather than silently continuing under the lower profile.
 - Prioritize correctness, evidence integrity, tenant isolation, secret safety, idempotency, migration risk, contract compatibility, and missing behavioral tests.
 - Remain read-only. Do not fix files unless the user separately requests and authorizes a fix task.
 - On repeat review, audit every earlier finding and state whether it is resolved, remains open, or cannot be verified.
+- Model selection remains advisory and never weakens independence, evidence, validation, authorization, or finalization gates.
 
 ## Report the verdict
 

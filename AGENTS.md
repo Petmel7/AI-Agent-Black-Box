@@ -114,6 +114,13 @@ Use the versions committed in the lockfile. Do not upgrade dependencies or add p
 - Commit, push, and hosted-CI inspection are user-managed by default. Agents stop after the applicable approval, implementation, review, or mechanical task-status step and provide the compact manual handoff defined in `docs/tasks/README.md`.
 - Agent-executed Git or network finalization is allowed only when the approved task defines a task-specific exception and the user explicitly authorizes that execution. Existing review, clean-diff, secret, destructive-action, evidence, and task-status gates still apply.
 
+## Model Selection Guidance
+
+- Architecture assesses delivery risk before approval, records `Delivery risk` and `Execution profile` in each new task, and provides the advisory model recommendation defined in `docs/tasks/README.md` before implementation and review handoffs.
+- Implementation and review read the declared profile and briefly report any known mismatch. A mismatch alone does not block otherwise authorized work.
+- If implementation or review discovers a materially higher-risk boundary, report it and recommend escalation instead of silently continuing under the lower profile.
+- Model selection is advisory. It does not replace or weaken task approval, scope, validation, authorization, independent review, or finalization gates, and agents must not claim to have inspected or changed Codex UI settings they cannot verify.
+
 ## Definition of Done
 
 A task is complete only when:

@@ -15,6 +15,8 @@ Only tasks with `Status: Approved` may enter implementation. The unchanged appro
 
 Each implementation task should contain:
 
+- Delivery risk.
+- Execution profile.
 - Goal.
 - Context.
 - In scope.
@@ -28,6 +30,44 @@ Each implementation task should contain:
 - Referenced decisions and documents.
 - Risks.
 - Open questions.
+
+## Delivery Risk and Execution Profiles
+
+Architecture assesses delivery risk before requesting approval, records the applicable triggers, and chooses the highest risk class present:
+
+- **Low:** documentation or narrow mechanical changes with no runtime contract.
+- **Standard:** bounded application behavior with ordinary failure impact.
+- **High:** migrations, evidence integrity, authentication, tenant isolation, secrets, concurrency, leases, retries, crash windows, public contracts, external protocols, or broad cross-package behavior.
+- **Critical:** credible data-loss, security, irreversible, destructive, or governance impact where a defect can escape ordinary recovery boundaries.
+
+Every new task specification must declare `Delivery risk` and `Execution profile`. The execution profile normally matches the delivery risk, but architecture may select a stronger profile and record why. Do not retroactively edit completed or already approved task specifications merely to add these fields.
+
+The following model mapping is current advisory guidance, not a permanent product contract. The durable task fields are the risk class and execution profile; exact model names may change without rewriting historical tasks.
+
+| Execution profile | Architect            | Implementation              | Review               |
+| ----------------- | -------------------- | --------------------------- | -------------------- |
+| Low               | GPT-5.6 Sol / Medium | GPT-5.6 Sol / Low or Medium | GPT-5.6 Sol / Medium |
+| Standard          | GPT-5.6 Sol / Medium | GPT-5.6 Sol / Medium        | GPT-5.6 Sol / High   |
+| High              | GPT-5.6 Sol / High   | GPT-5.6 Sol / High          | GPT-5.6 Sol / XHigh  |
+| Critical          | GPT-5.6 Sol / XHigh  | GPT-5.6 Sol / XHigh         | GPT-5.6 Sol / XHigh  |
+
+`Max` is never a default. Recommend it only as a targeted escalation for an exceptionally ambiguous boundary or after at least two unresolved review/fix cycles on the same root problem.
+
+Before implementation and review handoffs, architecture emits this compact recommendation and repeats it if discovered risk changes materially:
+
+```text
+Model recommendation
+Complexity: <Low | Standard | High | Critical>
+Risk triggers: <concise reasons>
+Architect: <model / reasoning>
+Implementation: <model / reasoning>
+Review: <model / reasoning>
+Escalation: <none or condition>
+```
+
+Architecture must not claim it changed the model for an existing task. The user changes Codex UI settings manually unless task creation was explicitly delegated with model settings. Implementation and review read the declared profile, briefly report a known mismatch, and continue within the approved scope because a mismatch alone is not a blocking gate. If either role discovers a materially higher-risk boundary, it reports the change and recommends escalation rather than silently continuing under the lower profile. Review uses the assurance level in the matrix and remains independent.
+
+No risk class or execution profile weakens task approval, validation, evidence, authorization, independent-review, secret-protection, destructive-action, or finalization requirements.
 
 ## Task Size
 

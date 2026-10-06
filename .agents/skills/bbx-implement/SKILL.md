@@ -13,6 +13,7 @@ Implement only an approved specification or an explicitly user-approved fix pass
 2. Read `AGENTS.md`, the approved task, and only the architecture documents referenced by that task before editing.
 3. Establish the declared branch or commit baseline and inspect the complete worktree. Preserve unrelated user changes.
 4. Treat the repository sources identified by `AGENTS.md` and the approved task as authoritative. If this guidance conflicts with a higher-priority source, stop and report the conflict.
+5. Read the task's declared delivery risk and execution profile. Briefly report a known model/reasoning mismatch, but do not treat that mismatch alone as blocking otherwise authorized implementation.
 
 ## Implement and validate
 
@@ -21,6 +22,7 @@ Implement only an approved specification or an explicitly user-approved fix pass
 - Run checks affected by the files or behavior being changed while implementing. Before handoff, run the task-required final local suite once against the final implementation state.
 - A result is passing evidence only for the exact state on which it completed successfully. If that state changes, rerun only the checks affected by the change; do not repeat successful checks on an unchanged relevant state.
 - Broaden validation when a check fails, a warning is unexplained, the relevant diff changes, or the scope includes a high-risk boundary identified by repository policy.
+- If implementation discovers a materially higher-risk boundary than the declared profile, report the changed risk and recommend escalation rather than silently continuing under the lower profile. Model selection remains advisory and does not weaken any scope, validation, authorization, review, or finalization gate.
 - Do not make redundant network requests; reuse existing evidence instead of repeating a network request merely to obtain additional metadata or confirmation. Permit task-required network access only when the network action is within the approved task scope and the user has explicitly authorized it. Do not start unrelated services or tools, including Docker, unless the approved task requires them and the user explicitly authorizes the action.
 - Do not commit, push, mark the task `Done`, inspect hosted CI, or begin finalization during the implementation phase.
 

@@ -17,11 +17,15 @@ Define one coherent, reviewable task without implementing it.
 ## Define the task
 
 - Write the minimally sufficient specification for one reviewable change. State the goal, boundaries, required behavior, acceptance criteria, dependencies, validation, deliverables, risks, and open questions without copying background that does not affect delivery.
+- Before requesting approval, assess delivery risk using the canonical classes in `docs/tasks/README.md`, record the applicable triggers, choose the highest class present, and add `Delivery risk` and `Execution profile` to every new task specification. A stronger execution profile may be selected when justified.
+- Emit the compact model recommendation from `docs/tasks/README.md` before implementation and review handoffs, and repeat it if discovered risk changes materially. Treat exact model names as advisory and `Max` as the restricted escalation described there.
+- Do not claim to have inspected or changed the model for an existing task. The user changes Codex UI settings manually unless task creation was explicitly delegated with model settings.
 - Reference authoritative product, architecture, contract, and workflow documents by path instead of restating their guidance. Include task-specific constraints where the implementation or review needs them.
 - Decide explicitly whether the work meets the architecture-decision criteria in `docs/architecture/overview.md`. Require a new ADR when it does; otherwise record why no ADR is needed.
 - Use the status flow and task shape in `docs/tasks/README.md`.
 - Keep a new or materially changed specification at `Draft` or `Proposed` until the user explicitly approves it. Never approve your own proposal.
 - Do not silently alter an accepted ADR. Stop and request an architecture decision when sources conflict or the proposal would change an accepted decision.
+- Model selection never replaces or weakens approval, scope, validation, authorization, independent-review, or finalization gates.
 
 ## Produce the handoff
 
