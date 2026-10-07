@@ -6,6 +6,9 @@ export default defineConfig({
   root: fileURLToPath(new URL('.', import.meta.url)),
   resolve: {
     alias: {
+      '@blackbox/analyzers': fileURLToPath(
+        new URL('../../packages/analyzers/src/index.ts', import.meta.url),
+      ),
       '@blackbox/artifact-storage': fileURLToPath(
         new URL(
           '../../packages/artifact-storage/src/index.ts',
