@@ -1,4 +1,4 @@
-# Processing relay, core projections, and verified file projections
+# Processing relay, core/files projections, and deterministic findings
 
 BBX-009A uses the standard-PostgreSQL `processing_intents` outbox and one private basic `pgmq` queue named `bbx_processing_v1`. Ingestion still commits evidence and exactly one pending intent without calling the queue.
 
@@ -33,6 +33,16 @@ Core projector v1 rebuilds from all immutable events in canonical sequence. A sn
 Files projector v1 rebuilds the complete current file snapshot from every canonical `git.diff.captured` file-list declaration. It independently verifies exact length and SHA-256 before strict UTF-8/JSON parsing, then re-locks and revalidates the complete source fingerprint before atomic publication. A missing, unverified, conflicting, changed, invalid, or unavailable source never publishes a partial snapshot. Exact receipt replay performs no storage read; a different intent reaching the same fingerprint creates its receipt without rewriting rows.
 
 File query state is independent of core state. Effective file counts are unknown while files are processing, stale, incomplete, or failed. Projected paths are already-redacted display evidence, may be ambiguous, and must never be treated as identity. `observed-during-run` is temporal evidence, not a causal claim.
+
+Findings projector v1 runs after a successful or already-applied core/files result and before that exact queue message is archived. Findings configuration is mandatory for the supported worker composition; missing configuration fails closed and cannot archive successful dependency work. It uses the unchanged opaque queue payload. Its dependency fingerprint covers analyzer/catalog identity and exact core/files versions, fingerprints, and completeness markers under the shared run lock. Stale core is retryable and cannot publish; missing, stale, or incomplete files publish a complete nine-rule catalog with explicit `unknown` results, and a later files intent replaces it atomically. A receipt is honored only after the current dependency fingerprint and analyzer/catalog identity match the published projection. Exact replay creates no duplicate results or references; a changed dependency or analyzer version rebuilds atomically even when that intent already has a receipt. Ordinary delivery keeps the same exhausted intent and fingerprint stopped, while a distinct later valid intent may take ownership even when the dependency fingerprint is unchanged. The injected `replayFindingsIntent` operation explicitly authorizes one bounded retry of an exhausted intent; live leases, stale-owner checks, deadlines, and poison handling still apply. Raw evidence and core/files rows are never rewritten.
+
+File-backed finding references retain two distinct RFC 6901 pointers: the
+immutable event-to-artifact declaration pointer and the validated entry pointer
+inside the verified file-list representation. Database constraints bind the
+event, artifact, and declaration pointer exactly; the entry pointer, ordinal,
+and opaque entry identity remain available for evidence navigation.
+
+The current catalog has one result for every V1 rule. `pass` requires all nine results to be clear with complete coverage, `review` requires at least one triggered result, and every triggered result has an immutable same-run event or event-plus-artifact reference. Processing failure, evidence incompleteness, observed run outcome, and deterministic outcome remain separate query fields. After correcting an underlying safe failure, use the bounded injected `replayFindingsIntent`; do not edit evidence or upstream projections.
 
 ## Verified-artifact intent backfill
 

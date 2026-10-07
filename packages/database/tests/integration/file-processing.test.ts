@@ -13,10 +13,12 @@ import {
   finalizeArtifactVerification,
   getCoreRunDetail,
   ingestEvidenceBatch,
+  listFindings,
   listCoreRuns,
   listFileChanges,
   processCoreIntent,
   processFilesIntent,
+  processFindingsIntent,
   replayFilesIntent,
 } from '../../src/index.js';
 import { inspectFileSourceSnapshot } from '../../src/file-processing.js';
@@ -61,6 +63,14 @@ const coreOptions = {
   eventPageSize: 100,
   maxEvents: 100,
   maxProjectedChildren: 1_000,
+};
+const findingsOptions = {
+  leaseSeconds: 10,
+  attemptTimeoutMs: 2_000,
+  transitionMarginMs: 100,
+  maxAttempts: 2,
+  retryBaseSeconds: 1,
+  retryMaxSeconds: 1,
 };
 
 async function repository() {
@@ -1467,5 +1477,227 @@ describe('files projector PostgreSQL lifecycle', () => {
       filesCompletenessReason: 'files_incomplete',
     });
     await handle.dispose();
+  });
+
+  it('atomically replaces missing-file findings after late verified file projection', async () => {
+    const scope = await repository();
+    const writer = createDatabaseClient({ connectionString });
+    const reader = createDatabaseClient({ connectionString });
+    const source = await addVerifiedFileSource(
+      writer,
+      scope,
+      0,
+      'src/auth/session.ts',
+    );
+    const coreIntent = await writer.client.processingIntent.findFirstOrThrow({
+      where: {
+        organizationId: scope.organizationId,
+        kind: 'EVIDENCE_BATCH_ACCEPTED',
+      },
+      select: { id: true },
+    });
+    await processCoreIntent(writer.client, coreIntent.id, coreOptions);
+    await expect(
+      processFindingsIntent(writer.client, coreIntent.id, findingsOptions),
+    ).resolves.toBe('applied');
+    const run = await writer.client.run.findUniqueOrThrow({
+      where: {
+        organizationId_canonicalRunId: {
+          organizationId: scope.organizationId,
+          canonicalRunId: scope.runId,
+        },
+      },
+      select: { id: true },
+    });
+    const before = await writer.client.findingsRunProjection.findUniqueOrThrow({
+      where: { runId: run.id },
+      select: { deterministicOutcome: true, sourceFingerprint: true },
+    });
+    expect(before.deterministicOutcome).toBe('unknown');
+    const oldResultIds = (
+      await writer.client.findingRuleResult.findMany({
+        where: { runId: run.id },
+        orderBy: { catalogOrder: 'asc' },
+        select: { id: true },
+      })
+    ).map(({ id }) => id);
+    expect(oldResultIds).toHaveLength(9);
+
+    await processFilesIntent(
+      writer.client,
+      source.intentId,
+      readerFor([source]),
+      fileOptions,
+    );
+    const upstreamBefore = await Promise.all([
+      writer.client.evidenceEvent.count({ where: { runId: run.id } }),
+      writer.client.coreRunProjection.count({ where: { runId: run.id } }),
+      writer.client.fileChangeProjection.count({ where: { runId: run.id } }),
+    ]);
+    let reached!: () => void;
+    let release!: () => void;
+    const replaced = new Promise<void>((resolve) => (reached = resolve));
+    const continueCommit = new Promise<void>((resolve) => (release = resolve));
+    const processing = processFindingsIntent(
+      writer.client,
+      source.intentId,
+      findingsOptions,
+      {
+        hooks: {
+          afterResultsReplaced: async () => {
+            reached();
+            await continueCommit;
+          },
+        },
+      },
+    );
+    await replaced;
+    const during = await Promise.all([
+      reader.client.findingsRunProjection.findUniqueOrThrow({
+        where: { runId: run.id },
+        select: { deterministicOutcome: true, sourceFingerprint: true },
+      }),
+      reader.client.findingRuleResult.findMany({
+        where: { runId: run.id },
+        orderBy: { catalogOrder: 'asc' },
+        select: { id: true },
+      }),
+    ]);
+    expect(during[0]).toEqual(before);
+    expect(during[1].map(({ id }) => id)).toEqual(oldResultIds);
+    release();
+    await expect(processing).resolves.toBe('applied');
+
+    const page = await listFindings(writer.client, {
+      organizationId: scope.organizationId,
+      repositoryId: scope.repositoryId,
+      canonicalRunId: scope.runId,
+      limit: 9,
+    });
+    expect(page).toMatchObject({
+      processingState: 'ready',
+      deterministicOutcome: 'review',
+      items: expect.arrayContaining([
+        expect.objectContaining({
+          ruleId: 'bbx.sensitive-area-change',
+          outcome: 'triggered',
+          references: [
+            expect.objectContaining({
+              eventArtifactPointer: '/payload/fileListArtifact',
+              jsonPointer: '/files/0',
+              fileOrdinal: 0,
+            }),
+          ],
+        }),
+      ]),
+    });
+    const storedReference =
+      await writer.client.findingEvidenceReference.findFirstOrThrow({
+        where: {
+          runId: run.id,
+          result: { ruleId: 'bbx.sensitive-area-change' },
+        },
+        select: {
+          resultId: true,
+          eventId: true,
+          artifactDeclarationId: true,
+          eventArtifactPointer: true,
+          jsonPointer: true,
+          fileOrdinal: true,
+          entryId: true,
+        },
+      });
+    const unrelatedArtifact =
+      await writer.client.artifactDeclaration.findFirstOrThrow({
+        where: {
+          runId: run.id,
+          id: { not: storedReference.artifactDeclarationId! },
+        },
+        select: { id: true },
+      });
+    const insertReference = (
+      organizationId: string,
+      runId: string,
+      artifactId: string,
+      eventArtifactPointer: string,
+      ordinal: number,
+      entryId: string,
+    ) =>
+      pool.query(
+        `INSERT INTO finding_evidence_references
+          (organization_id, run_id, result_id, ordinal, event_id,
+           artifact_declaration_id, event_artifact_pointer, json_pointer,
+           file_ordinal, entry_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [
+          organizationId,
+          runId,
+          storedReference.resultId,
+          ordinal,
+          storedReference.eventId,
+          artifactId,
+          eventArtifactPointer,
+          storedReference.jsonPointer,
+          storedReference.fileOrdinal,
+          entryId,
+        ],
+      );
+    await expect(
+      insertReference(
+        scope.organizationId,
+        run.id,
+        unrelatedArtifact.id,
+        storedReference.eventArtifactPointer!,
+        96,
+        storedReference.entryId!,
+      ),
+    ).rejects.toMatchObject({ code: '23503' });
+    await expect(
+      insertReference(
+        scope.organizationId,
+        run.id,
+        storedReference.artifactDeclarationId!,
+        '/payload/diffArtifact',
+        97,
+        storedReference.entryId!,
+      ),
+    ).rejects.toMatchObject({ code: '23503' });
+    await expect(
+      insertReference(
+        randomUUID(),
+        run.id,
+        storedReference.artifactDeclarationId!,
+        storedReference.eventArtifactPointer!,
+        98,
+        `${storedReference.entryId!}-cross-tenant`,
+      ),
+    ).rejects.toMatchObject({ code: '23503' });
+    await expect(
+      insertReference(
+        scope.organizationId,
+        randomUUID(),
+        storedReference.artifactDeclarationId!,
+        storedReference.eventArtifactPointer!,
+        99,
+        `${storedReference.entryId!}-cross-run`,
+      ),
+    ).rejects.toMatchObject({ code: '23503' });
+    const newResultIds = (
+      await writer.client.findingRuleResult.findMany({
+        where: { runId: run.id },
+        orderBy: { catalogOrder: 'asc' },
+        select: { id: true },
+      })
+    ).map(({ id }) => id);
+    expect(newResultIds).toHaveLength(9);
+    expect(newResultIds.some((id) => oldResultIds.includes(id))).toBe(false);
+    expect(
+      await Promise.all([
+        writer.client.evidenceEvent.count({ where: { runId: run.id } }),
+        writer.client.coreRunProjection.count({ where: { runId: run.id } }),
+        writer.client.fileChangeProjection.count({ where: { runId: run.id } }),
+      ]),
+    ).toEqual(upstreamBefore);
+    await Promise.all([writer.dispose(), reader.dispose()]);
   });
 });

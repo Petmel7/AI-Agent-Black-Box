@@ -60,10 +60,24 @@ export {
   type FileProcessingResult,
 } from './file-processing.js';
 export {
+  FINDINGS_PROJECTOR_NAME,
+  FINDINGS_PROJECTOR_VERSION,
+  FindingsProcessingError,
+  inspectFindingsSourceSnapshot,
+  processFindingsIntent,
+  replayFindingsIntent,
+  type FindingsProcessingContext,
+  type FindingsProcessingOptions,
+  type FindingsProcessingResult,
+  type FindingsSourceSnapshot,
+} from './findings-processing.js';
+export {
   getCoreRunDetail,
+  listFindings,
   listFileChanges,
   listCoreRuns,
   type FileChangeListInput,
+  type FindingListInput,
   type QueryProcessingState,
   type QueryConsistencyHooks,
   type RunDetailInput,

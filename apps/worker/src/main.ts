@@ -56,6 +56,17 @@ const worker = createProductionWorker({
     retryBaseSeconds: integer('WORKER_RETRY_BASE_SECONDS', 5),
     retryMaxSeconds: integer('WORKER_RETRY_MAX_SECONDS', 300),
   },
+  findingsProcessing: {
+    leaseSeconds: integer('WORKER_PROJECTION_LEASE_SECONDS', 300),
+    attemptTimeoutMs: integer('WORKER_PROJECTION_ATTEMPT_TIMEOUT_MS', 240_000),
+    transitionMarginMs: integer(
+      'WORKER_PROJECTION_TRANSITION_MARGIN_MS',
+      5_000,
+    ),
+    maxAttempts: integer('WORKER_PROJECTION_MAX_ATTEMPTS', 5),
+    retryBaseSeconds: integer('WORKER_RETRY_BASE_SECONDS', 5),
+    retryMaxSeconds: integer('WORKER_RETRY_MAX_SECONDS', 300),
+  },
   storage: {
     url: process.env.SUPABASE_URL ?? '',
     serviceRoleKey: process.env.SUPABASE_SERVICE_ROLE_KEY ?? '',

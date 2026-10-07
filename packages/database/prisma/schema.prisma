@@ -25,19 +25,23 @@ model Organization {
   fileRunProjections     FileRunProjection[]
   fileChangeProjections  FileChangeProjection[]
   artifactUploadAttempts ArtifactUploadAttempt[]
+  findingsRunProjections FindingsRunProjection[]
+  findingRuleResults     FindingRuleResult[]
+  findingReferences      FindingEvidenceReference[]
 
   @@map("organizations")
 }
 
 model Repository {
-  id                    String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  organizationId        String                 @map("organization_id") @db.Uuid
-  createdAt             DateTime               @default(now()) @map("created_at") @db.Timestamptz(3)
-  organization          Organization           @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "repositories_organization_id_fkey")
-  runs                  Run[]
-  coreRunProjections    CoreRunProjection[]
-  fileRunProjections    FileRunProjection[]
-  fileChangeProjections FileChangeProjection[]
+  id                     String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId         String                  @map("organization_id") @db.Uuid
+  createdAt              DateTime                @default(now()) @map("created_at") @db.Timestamptz(3)
+  organization           Organization            @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "repositories_organization_id_fkey")
+  runs                   Run[]
+  coreRunProjections     CoreRunProjection[]
+  fileRunProjections     FileRunProjection[]
+  fileChangeProjections  FileChangeProjection[]
+  findingsRunProjections FindingsRunProjection[]
 
   @@unique([organizationId, id], map: "repositories_org_id_key")
   @@map("repositories")
@@ -64,6 +68,9 @@ model Run {
   coreRunProjection      CoreRunProjection?
   fileRunProjection      FileRunProjection?
   fileChangeProjections  FileChangeProjection[]
+  findingsRunProjection  FindingsRunProjection?
+  findingRuleResults     FindingRuleResult[]
+  findingReferences      FindingEvidenceReference[]
 
   @@unique([organizationId, canonicalRunId], map: "runs_org_canonical_run_id_key")
   @@unique([organizationId, id], map: "runs_org_id_key")
@@ -91,21 +98,22 @@ model EvidenceBatch {
 }
 
 model EvidenceEvent {
-  id               String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  organizationId   String                  @map("organization_id") @db.Uuid
-  runId            String                  @map("run_id") @db.Uuid
-  canonicalEventId String                  @map("canonical_event_id") @db.Uuid
-  schemaVersion    Int                     @map("schema_version")
-  sequence         BigInt
-  kind             String
-  observedAt       DateTime                @map("observed_at") @db.Timestamptz(3)
-  occurredAt       DateTime?               @map("occurred_at") @db.Timestamptz(3)
-  receivedAt       DateTime                @default(now()) @map("received_at") @db.Timestamptz(3)
-  rawEvent         Json                    @map("raw_event") @db.JsonB
-  organization     Organization            @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "events_organization_id_fkey")
-  run              Run                     @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "events_org_run_fkey")
-  memberships      EvidenceBatchEvent[]
-  artifactLinks    EvidenceEventArtifact[]
+  id                String                     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId    String                     @map("organization_id") @db.Uuid
+  runId             String                     @map("run_id") @db.Uuid
+  canonicalEventId  String                     @map("canonical_event_id") @db.Uuid
+  schemaVersion     Int                        @map("schema_version")
+  sequence          BigInt
+  kind              String
+  observedAt        DateTime                   @map("observed_at") @db.Timestamptz(3)
+  occurredAt        DateTime?                  @map("occurred_at") @db.Timestamptz(3)
+  receivedAt        DateTime                   @default(now()) @map("received_at") @db.Timestamptz(3)
+  rawEvent          Json                       @map("raw_event") @db.JsonB
+  organization      Organization               @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "events_organization_id_fkey")
+  run               Run                        @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "events_org_run_fkey")
+  memberships       EvidenceBatchEvent[]
+  artifactLinks     EvidenceEventArtifact[]
+  findingReferences FindingEvidenceReference[]
 
   @@unique([organizationId, canonicalEventId], map: "events_org_canonical_event_id_key")
   @@unique([runId, sequence], map: "events_run_sequence_key")
@@ -132,26 +140,27 @@ model EvidenceBatchEvent {
 }
 
 model ArtifactDeclaration {
-  id                    String                  @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  organizationId        String                  @map("organization_id") @db.Uuid
-  runId                 String                  @map("run_id") @db.Uuid
-  canonicalArtifactId   String                  @map("canonical_artifact_id") @db.Uuid
+  id                    String                     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId        String                     @map("organization_id") @db.Uuid
+  runId                 String                     @map("run_id") @db.Uuid
+  canonicalArtifactId   String                     @map("canonical_artifact_id") @db.Uuid
   kind                  String
-  mediaType             String                  @map("media_type")
-  byteLength            BigInt                  @map("byte_length")
+  mediaType             String                     @map("media_type")
+  byteLength            BigInt                     @map("byte_length")
   sha256                String
-  redactionApplied      Boolean                 @map("redaction_applied")
-  redactionRuleset      String?                 @map("redaction_ruleset_version")
+  redactionApplied      Boolean                    @map("redaction_applied")
+  redactionRuleset      String?                    @map("redaction_ruleset_version")
   compression           String?
-  characterEncoding     String?                 @map("character_encoding")
-  receivedAt            DateTime                @default(now()) @map("received_at") @db.Timestamptz(3)
-  rawReference          Json                    @map("raw_reference") @db.JsonB
-  organization          Organization            @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "artifacts_organization_id_fkey")
-  run                   Run                     @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "artifacts_org_run_fkey")
+  characterEncoding     String?                    @map("character_encoding")
+  receivedAt            DateTime                   @default(now()) @map("received_at") @db.Timestamptz(3)
+  rawReference          Json                       @map("raw_reference") @db.JsonB
+  organization          Organization               @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "artifacts_organization_id_fkey")
+  run                   Run                        @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "artifacts_org_run_fkey")
   eventLinks            EvidenceEventArtifact[]
   uploadAttempts        ArtifactUploadAttempt[]
   processingIntents     ProcessingIntent[]
   fileChangeProjections FileChangeProjection[]
+  findingReferences     FindingEvidenceReference[]
 
   @@unique([organizationId, canonicalArtifactId], map: "artifacts_org_canonical_artifact_id_key")
   @@unique([organizationId, runId, id], map: "artifacts_org_run_id_key")
@@ -196,18 +205,20 @@ model ArtifactUploadAttempt {
 }
 
 model EvidenceEventArtifact {
-  id             String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  organizationId String              @map("organization_id") @db.Uuid
-  runId          String              @map("run_id") @db.Uuid
-  eventId        String              @map("event_id") @db.Uuid
-  artifactId     String              @map("artifact_id") @db.Uuid
-  jsonPointer    String              @map("json_pointer")
-  organization   Organization        @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "event_artifacts_organization_id_fkey")
-  run            Run                 @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "event_artifacts_org_run_fkey")
-  event          EvidenceEvent       @relation(fields: [organizationId, runId, eventId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "event_artifacts_org_run_event_fkey")
-  artifact       ArtifactDeclaration @relation(fields: [organizationId, runId, artifactId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "event_artifacts_org_run_artifact_fkey")
+  id                String                     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId    String                     @map("organization_id") @db.Uuid
+  runId             String                     @map("run_id") @db.Uuid
+  eventId           String                     @map("event_id") @db.Uuid
+  artifactId        String                     @map("artifact_id") @db.Uuid
+  jsonPointer       String                     @map("json_pointer")
+  organization      Organization               @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "event_artifacts_organization_id_fkey")
+  run               Run                        @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "event_artifacts_org_run_fkey")
+  event             EvidenceEvent              @relation(fields: [organizationId, runId, eventId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "event_artifacts_org_run_event_fkey")
+  artifact          ArtifactDeclaration        @relation(fields: [organizationId, runId, artifactId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "event_artifacts_org_run_artifact_fkey")
+  findingReferences FindingEvidenceReference[] @relation("FindingReferenceEventArtifact")
 
   @@unique([eventId, jsonPointer], map: "event_artifacts_event_pointer_key")
+  @@unique([organizationId, runId, eventId, artifactId, jsonPointer], map: "event_artifacts_org_run_event_artifact_pointer_key")
   @@map("evidence_event_artifacts")
 }
 
@@ -565,4 +576,92 @@ model FileChangeProjection {
   @@unique([runId, sourceEventId, entryId], map: "file_changes_run_event_entry_key")
   @@index([organizationId, runId, sourceSequence, ordinal], map: "file_changes_org_run_cursor_idx")
   @@map("file_change_projections")
+}
+
+model FindingsRunProjection {
+  id                   String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId       String              @map("organization_id") @db.Uuid
+  repositoryId         String              @map("repository_id") @db.Uuid
+  runId                String              @unique(map: "findings_run_projections_run_id_key") @map("run_id") @db.Uuid
+  projectorName        String              @map("projector_name")
+  projectorVersion     Int                 @map("projector_version")
+  analyzerName         String              @map("analyzer_name")
+  analyzerVersion      Int                 @map("analyzer_version")
+  catalogVersion       Int                 @map("catalog_version")
+  sourceFingerprint    String              @map("source_fingerprint")
+  coreVersion          Int                 @map("core_version")
+  coreFingerprint      String              @map("core_fingerprint")
+  coreCompleteness     String              @map("core_completeness")
+  filesVersion         Int?                @map("files_version")
+  filesFingerprint     String?             @map("files_fingerprint")
+  filesCompleteness    String              @map("files_completeness")
+  deterministicOutcome String              @map("deterministic_outcome")
+  coverage             String
+  triggeredCount       Int                 @map("triggered_count")
+  unknownCount         Int                 @map("unknown_count")
+  highCount            Int                 @map("high_count")
+  mediumCount          Int                 @map("medium_count")
+  updatedAt            DateTime            @default(now()) @map("updated_at") @db.Timestamptz(3)
+  organization         Organization        @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "findings_runs_organization_id_fkey")
+  repository           Repository          @relation(fields: [organizationId, repositoryId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "findings_runs_org_repository_fkey")
+  run                  Run                 @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "findings_runs_org_run_fkey")
+  results              FindingRuleResult[]
+
+  @@unique([organizationId, runId], map: "findings_runs_org_run_key")
+  @@index([organizationId, repositoryId, updatedAt, runId], map: "findings_runs_org_repository_cursor_idx")
+  @@map("findings_run_projections")
+}
+
+model FindingRuleResult {
+  id                  String                     @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId      String                     @map("organization_id") @db.Uuid
+  runId               String                     @map("run_id") @db.Uuid
+  resultKey           String                     @map("result_key")
+  catalogOrder        Int                        @map("catalog_order")
+  ruleId              String                     @map("rule_id")
+  ruleVersion         Int                        @map("rule_version")
+  severity            String
+  outcome             String
+  coverage            String
+  reasonCodes         Json                       @map("reason_codes") @db.JsonB
+  explanation         String
+  matchCount          Int                        @map("match_count")
+  matches             Json                       @db.JsonB
+  matchesTruncated    Boolean                    @map("matches_truncated")
+  referencesTruncated Boolean                    @map("references_truncated")
+  runProjection       FindingsRunProjection      @relation(fields: [organizationId, runId], references: [organizationId, runId], onDelete: Cascade, onUpdate: Restrict, map: "finding_results_org_run_projection_fkey")
+  organization        Organization               @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "finding_results_organization_id_fkey")
+  run                 Run                        @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "finding_results_org_run_fkey")
+  references          FindingEvidenceReference[]
+
+  @@unique([runId, ruleId, ruleVersion], map: "finding_results_run_rule_key")
+  @@unique([runId, catalogOrder], map: "finding_results_run_order_key")
+  @@unique([organizationId, resultKey], map: "finding_results_org_result_key")
+  @@unique([organizationId, runId, id], map: "finding_results_org_run_id_key")
+  @@index([organizationId, runId, catalogOrder], map: "finding_results_org_run_cursor_idx")
+  @@map("finding_rule_results")
+}
+
+model FindingEvidenceReference {
+  id                    String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId        String                 @map("organization_id") @db.Uuid
+  runId                 String                 @map("run_id") @db.Uuid
+  resultId              String                 @map("result_id") @db.Uuid
+  ordinal               Int
+  eventId               String                 @map("event_id") @db.Uuid
+  artifactDeclarationId String?                @map("artifact_declaration_id") @db.Uuid
+  eventArtifactPointer  String?                @map("event_artifact_pointer")
+  jsonPointer           String?                @map("json_pointer")
+  fileOrdinal           Int?                   @map("file_ordinal")
+  entryId               String?                @map("entry_id")
+  result                FindingRuleResult      @relation(fields: [organizationId, runId, resultId], references: [organizationId, runId, id], onDelete: Cascade, onUpdate: Restrict, map: "finding_refs_org_run_result_fkey")
+  organization          Organization           @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "finding_refs_organization_id_fkey")
+  run                   Run                    @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "finding_refs_org_run_fkey")
+  event                 EvidenceEvent          @relation(fields: [organizationId, runId, eventId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "finding_refs_org_run_event_fkey")
+  artifactDeclaration   ArtifactDeclaration?   @relation(fields: [organizationId, runId, artifactDeclarationId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "finding_refs_org_run_artifact_fkey")
+  eventArtifact         EvidenceEventArtifact? @relation("FindingReferenceEventArtifact", fields: [organizationId, runId, eventId, artifactDeclarationId, eventArtifactPointer], references: [organizationId, runId, eventId, artifactId, jsonPointer], onDelete: Restrict, onUpdate: Restrict, map: "finding_refs_event_artifact_pointer_fkey")
+
+  @@unique([resultId, ordinal], map: "finding_refs_result_ordinal_key")
+  @@unique([resultId, eventId, artifactDeclarationId, eventArtifactPointer, jsonPointer, fileOrdinal, entryId], map: "finding_refs_identity_key")
+  @@map("finding_evidence_references")
 }

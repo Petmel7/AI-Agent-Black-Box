@@ -7,9 +7,11 @@ import {
   createPgmqProcessingQueue,
   processCoreIntent,
   processFilesIntent,
+  processFindingsIntent,
   relayProcessingCycle,
   type CoreProcessingOptions,
   type FileProcessingOptions,
+  type FindingsProcessingOptions,
   type DatabaseClient,
   type ProcessingQueue,
   type RelayOptions,
@@ -27,6 +29,7 @@ export interface ProductionWorkerConfig {
   relay: RelayOptions;
   processing: CoreProcessingOptions;
   filesProcessing: FileProcessingOptions;
+  findingsProcessing: FindingsProcessingOptions;
   storage: {
     url: string;
     serviceRoleKey: string;
@@ -45,6 +48,7 @@ export interface ProcessingConsumerConfig {
   visibilityTimeoutSeconds: number;
   poisonReadLimit: number;
   filesProcessing?: FileProcessingOptions;
+  findingsProcessing: FindingsProcessingOptions;
   artifactReader?: Parameters<typeof processFilesIntent>[2];
 }
 
@@ -52,6 +56,7 @@ export interface ProcessingConsumerHooks {
   afterProcessBeforeArchive?: () => void | Promise<void>;
   processIntent?: typeof processCoreIntent;
   processFilesIntent?: typeof processFilesIntent;
+  processFindingsIntent?: typeof processFindingsIntent;
 }
 
 async function dispatchProcessingIntent(
@@ -60,42 +65,62 @@ async function dispatchProcessingIntent(
   config: ProcessingConsumerConfig,
   signal?: AbortSignal,
   hooks: ProcessingConsumerHooks = {},
-) {
+): Promise<'applied' | 'already_applied' | 'busy' | 'failed'> {
+  if (!config.findingsProcessing) {
+    const error = new Error(
+      'findings_processing_configuration_required',
+    ) as Error & {
+      retryable: boolean;
+    };
+    error.retryable = false;
+    throw error;
+  }
   const intent = await client.processingIntent.findUnique({
     where: { id: intentId },
     select: { kind: true },
   });
+  let result: 'applied' | 'already_applied' | 'busy' | 'failed';
   if (!intent)
-    return processCoreIntent(
+    result = await (hooks.processIntent ?? processCoreIntent)(
       client,
       intentId,
       config.processing,
       signal ? { signal } : {},
     );
-  if (intent.kind === 'EVIDENCE_BATCH_ACCEPTED')
-    return (hooks.processIntent ?? processCoreIntent)(
+  else if (intent.kind === 'EVIDENCE_BATCH_ACCEPTED')
+    result = await (hooks.processIntent ?? processCoreIntent)(
       client,
       intentId,
       config.processing,
       signal ? { signal } : {},
     );
-  if (
+  else if (
     intent.kind === 'ARTIFACT_VERIFIED' &&
     config.filesProcessing &&
     config.artifactReader
   )
-    return (hooks.processFilesIntent ?? processFilesIntent)(
+    result = await (hooks.processFilesIntent ?? processFilesIntent)(
       client,
       intentId,
       config.artifactReader,
       config.filesProcessing,
       signal ? { signal } : {},
     );
-  const error = new Error('unsupported_intent_kind') as Error & {
-    retryable: boolean;
-  };
-  error.retryable = false;
-  throw error;
+  else {
+    const error = new Error('unsupported_intent_kind') as Error & {
+      retryable: boolean;
+    };
+    error.retryable = false;
+    throw error;
+  }
+  if (result === 'applied' || result === 'already_applied')
+    return (hooks.processFindingsIntent ?? processFindingsIntent)(
+      client,
+      intentId,
+      config.findingsProcessing,
+      signal ? { signal } : {},
+    );
+  return result;
 }
 
 export async function consumeProcessingCycle(
@@ -124,20 +149,13 @@ export async function consumeProcessingCycle(
   await Promise.all(
     messages.map(async (message) => {
       try {
-        const result = hooks.processIntent
-          ? await hooks.processIntent(
-              client,
-              message.payload.intentId,
-              config.processing,
-              signal ? { signal } : {},
-            )
-          : await dispatchProcessingIntent(
-              client,
-              message.payload.intentId,
-              config,
-              signal,
-              hooks,
-            );
+        const result = await dispatchProcessingIntent(
+          client,
+          message.payload.intentId,
+          config,
+          signal,
+          hooks,
+        );
         if (result === 'applied' || result === 'already_applied') {
           await hooks.afterProcessBeforeArchive?.();
           await queue.archive(message.messageId);
@@ -195,7 +213,8 @@ export function createProductionWorker(
     );
   if (
     config.visibilityTimeoutSeconds <= config.processing.leaseSeconds ||
-    config.visibilityTimeoutSeconds <= config.filesProcessing.leaseSeconds
+    config.visibilityTimeoutSeconds <= config.filesProcessing.leaseSeconds ||
+    config.visibilityTimeoutSeconds <= config.findingsProcessing.leaseSeconds
   )
     throw new TypeError(
       'Queue visibility timeout must exceed the projection lease.',
@@ -223,6 +242,7 @@ export function createProductionWorker(
     const consumerConfig: ProcessingConsumerConfig = {
       processing: config.processing,
       filesProcessing: config.filesProcessing,
+      findingsProcessing: config.findingsProcessing,
       artifactReader,
       queueBatchSize: config.queueBatchSize,
       visibilityTimeoutSeconds: config.visibilityTimeoutSeconds,

@@ -1,12 +1,17 @@
 import { randomUUID } from 'node:crypto';
+import { setTimeout as delay } from 'node:timers/promises';
+import { EvidenceBatchSchema } from '@blackbox/contracts';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
   createDatabaseClient,
   createPgmqProcessingQueue,
+  ingestEvidenceBatch,
   MalformedQueueMessageError,
   PROCESSING_QUEUE_NAME,
   provisionProcessingQueue,
+  processCoreIntent,
+  processFindingsIntent,
   relayProcessingCycle,
 } from '../../src/index.js';
 
@@ -14,6 +19,25 @@ const connectionString = process.env.TEST_DATABASE_URL!;
 const handle = createDatabaseClient({ connectionString });
 const pool = new Pool({ connectionString, max: 2 });
 const queue = createPgmqProcessingQueue(handle.client);
+const coreOptions = {
+  leaseSeconds: 10,
+  attemptTimeoutMs: 2_000,
+  transitionMarginMs: 100,
+  maxAttempts: 2,
+  retryBaseSeconds: 1,
+  retryMaxSeconds: 1,
+  eventPageSize: 100,
+  maxEvents: 100,
+  maxProjectedChildren: 1_000,
+};
+const findingsOptions = {
+  leaseSeconds: 10,
+  attemptTimeoutMs: 2_000,
+  transitionMarginMs: 100,
+  maxAttempts: 2,
+  retryBaseSeconds: 1,
+  retryMaxSeconds: 1,
+};
 
 beforeAll(async () => {
   await provisionProcessingQueue(handle.client);
@@ -24,6 +48,92 @@ afterAll(async () => {
 });
 
 describe('private pgmq processing queue', () => {
+  it('redelivers an applied findings intent and converges on one receipt before archive', async () => {
+    const organization = await handle.client.organization.create({ data: {} });
+    const repository = await handle.client.repository.create({
+      data: { organizationId: organization.id },
+    });
+    const canonicalRunId = randomUUID();
+    const accepted = EvidenceBatchSchema.parse({
+      schemaVersion: 1,
+      batchId: randomUUID(),
+      runId: canonicalRunId,
+      sentAt: '2026-10-07T00:00:00.000Z',
+      events: [
+        {
+          schemaVersion: 1,
+          eventId: randomUUID(),
+          runId: canonicalRunId,
+          sequence: 0,
+          kind: 'run.started',
+          observedAt: '2026-10-07T00:00:00.000Z',
+          source: { component: 'collector' },
+          payload: { adapter: 'codex-jsonl', provider: 'codex' },
+        },
+        {
+          schemaVersion: 1,
+          eventId: randomUUID(),
+          runId: canonicalRunId,
+          sequence: 1,
+          kind: 'run.finished',
+          observedAt: '2026-10-07T00:00:01.000Z',
+          source: { component: 'collector' },
+          payload: { outcome: 'succeeded', durationMs: 1 },
+        },
+      ],
+    });
+    await ingestEvidenceBatch(handle.client, {
+      organizationId: organization.id,
+      repositoryId: repository.id,
+      batch: accepted,
+    });
+    const intent = await handle.client.processingIntent.findFirstOrThrow({
+      where: { organizationId: organization.id },
+      select: { id: true, runId: true },
+    });
+    const messageId = await queue.send({
+      schemaVersion: 1,
+      intentId: intent.id,
+    });
+    const first = await queue.read(1, 1);
+    expect(first).toEqual([
+      {
+        messageId,
+        readCount: 1,
+        payload: { schemaVersion: 1, intentId: intent.id },
+      },
+    ]);
+    await expect(
+      processCoreIntent(handle.client, intent.id, coreOptions),
+    ).resolves.toBe('applied');
+    await expect(
+      processFindingsIntent(handle.client, intent.id, findingsOptions),
+    ).resolves.toBe('applied');
+    await delay(1_100);
+    const repeated = await queue.read(2, 1);
+    expect(repeated).toEqual([
+      {
+        messageId,
+        readCount: 2,
+        payload: { schemaVersion: 1, intentId: intent.id },
+      },
+    ]);
+    await expect(
+      processFindingsIntent(handle.client, intent.id, findingsOptions),
+    ).resolves.toBe('already_applied');
+    expect(await queue.archive(messageId)).toBe(true);
+    expect(
+      await handle.client.processingApplicationReceipt.count({
+        where: { intentId: intent.id, projectorName: 'findings' },
+      }),
+    ).toBe(1);
+    expect(
+      await handle.client.findingRuleResult.count({
+        where: { runId: intent.runId },
+      }),
+    ).toBe(9);
+  });
+
   it('relays a real artifact intent through the unchanged opaque payload', async () => {
     const organization = await handle.client.organization.create({ data: {} });
     const repository = await handle.client.repository.create({

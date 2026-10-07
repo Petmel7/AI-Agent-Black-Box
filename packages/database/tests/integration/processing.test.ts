@@ -9,9 +9,12 @@ import {
   getCoreRunDetail,
   ingestEvidenceBatch,
   listCoreRuns,
+  listFindings,
   processCoreIntent,
+  processFindingsIntent,
   relayProcessingCycle,
   replayCoreIntent,
+  replayFindingsIntent,
   type ProcessingQueue,
 } from '../../src/index.js';
 
@@ -117,8 +120,493 @@ const relayOptions = {
   retryBaseSeconds: 1,
   retryMaxSeconds: 2,
 };
+const findingsOptions = {
+  leaseSeconds: 10,
+  attemptTimeoutMs: 2_000,
+  transitionMarginMs: 100,
+  maxAttempts: 2,
+  retryBaseSeconds: 1,
+  retryMaxSeconds: 1,
+};
+
+async function failedFindingsFixture() {
+  const scope = await seed();
+  const handle = createDatabaseClient({ connectionString });
+  const accepted = batch();
+  await ingestEvidenceBatch(handle.client, { ...scope, batch: accepted });
+  const run = await handle.client.run.findUniqueOrThrow({
+    where: {
+      organizationId_canonicalRunId: {
+        organizationId: scope.organizationId,
+        canonicalRunId: accepted.runId,
+      },
+    },
+    select: { id: true },
+  });
+  const first = await handle.client.processingIntent.findFirstOrThrow({
+    where: {
+      organizationId: scope.organizationId,
+      runId: run.id,
+      batch: { canonicalBatchId: accepted.batchId },
+    },
+    select: { id: true },
+  });
+  await processCoreIntent(handle.client, first.id, options);
+  const singleAttempt = { ...findingsOptions, maxAttempts: 1 };
+  const result = await processFindingsIntent(
+    handle.client,
+    first.id,
+    singleAttempt,
+    {
+      hooks: {
+        afterDependenciesRead: () => {
+          throw new Error('forced findings failure');
+        },
+      },
+    },
+  );
+  if (result !== 'failed')
+    throw new Error('Expected exhausted findings state.');
+  const failedState = await handle.client.runProcessingState.findUniqueOrThrow({
+    where: {
+      organizationId_runId_projectorName: {
+        organizationId: scope.organizationId,
+        runId: run.id,
+        projectorName: 'findings',
+      },
+    },
+    select: { attemptFingerprint: true },
+  });
+  if (!failedState.attemptFingerprint)
+    throw new Error('Expected failed findings fingerprint.');
+  return {
+    scope,
+    handle,
+    accepted,
+    runId: run.id,
+    firstIntentId: first.id,
+    singleAttempt,
+    failedFingerprint: failedState.attemptFingerprint,
+  };
+}
+
+async function createSameSourceIntent(
+  fixture: Awaited<ReturnType<typeof failedFindingsFixture>>,
+) {
+  const duplicate = EvidenceBatchSchema.parse({
+    ...fixture.accepted,
+    batchId: randomUUID(),
+    sentAt: '2026-10-01T00:00:03.000Z',
+  });
+  await ingestEvidenceBatch(fixture.handle.client, {
+    ...fixture.scope,
+    batch: duplicate,
+  });
+  return fixture.handle.client.processingIntent.findFirstOrThrow({
+    where: {
+      organizationId: fixture.scope.organizationId,
+      runId: fixture.runId,
+      batch: { canonicalBatchId: duplicate.batchId },
+    },
+    select: { id: true },
+  });
+}
 
 describe('processing migration and core persistence', () => {
+  it('publishes and exactly replays a complete conservative findings catalog without mutating evidence', async () => {
+    const migration = await pool.query(
+      `SELECT 1 FROM _prisma_migrations WHERE migration_name = '20261006120000_deterministic_findings' AND finished_at IS NOT NULL`,
+    );
+    expect(migration.rows).toHaveLength(1);
+    const scope = await seed();
+    const handle = createDatabaseClient({ connectionString });
+    const accepted = batch();
+    await ingestEvidenceBatch(handle.client, {
+      ...scope,
+      batch: accepted,
+    });
+    const run = await handle.client.run.findUniqueOrThrow({
+      where: {
+        organizationId_canonicalRunId: {
+          organizationId: scope.organizationId,
+          canonicalRunId: accepted.runId,
+        },
+      },
+      select: { id: true },
+    });
+    const intent = await handle.client.processingIntent.findFirstOrThrow({
+      where: {
+        organizationId: scope.organizationId,
+        runId: run.id,
+        batch: { canonicalBatchId: accepted.batchId },
+      },
+    });
+    expect(await processCoreIntent(handle.client, intent.id, options)).toBe(
+      'applied',
+    );
+    const before = await handle.client.evidenceEvent.count({
+      where: { runId: run.id },
+    });
+    expect(
+      await processFindingsIntent(handle.client, intent.id, findingsOptions),
+    ).toBe('applied');
+    expect(
+      await processFindingsIntent(handle.client, intent.id, findingsOptions),
+    ).toBe('already_applied');
+    expect(
+      await handle.client.evidenceEvent.count({
+        where: { runId: run.id },
+      }),
+    ).toBe(before);
+    const page = await listFindings(handle.client, {
+      ...scope,
+      canonicalRunId: accepted.runId,
+      limit: 5,
+    });
+    expect(page).toMatchObject({
+      processingState: 'ready',
+      deterministicOutcome: 'unknown',
+      coverage: 'partial',
+    });
+    expect(page?.items).toHaveLength(5);
+    expect(page?.nextCursor).not.toBeNull();
+    const second = await listFindings(handle.client, {
+      ...scope,
+      canonicalRunId: accepted.runId,
+      limit: 5,
+      cursor: page!.nextCursor!,
+    });
+    expect(second?.items).toHaveLength(4);
+    expect(
+      await listFindings(handle.client, {
+        organizationId: randomUUID(),
+        repositoryId: scope.repositoryId,
+        canonicalRunId: accepted.runId,
+        limit: 9,
+      }),
+    ).toBeNull();
+    await handle.dispose();
+  });
+
+  it('rebuilds findings after persisted analyzer identity or dependency fingerprint changes', async () => {
+    const scope = await seed();
+    const handle = createDatabaseClient({ connectionString });
+    const initialBatch = batch();
+    const accepted = EvidenceBatchSchema.parse({
+      ...initialBatch,
+      events: [
+        ...initialBatch.events,
+        errorEvent(initialBatch.runId, 10, 'initial-high-sequence'),
+      ],
+    });
+    await ingestEvidenceBatch(handle.client, { ...scope, batch: accepted });
+    const run = await handle.client.run.findUniqueOrThrow({
+      where: {
+        organizationId_canonicalRunId: {
+          organizationId: scope.organizationId,
+          canonicalRunId: accepted.runId,
+        },
+      },
+      select: { id: true },
+    });
+    const first = await handle.client.processingIntent.findFirstOrThrow({
+      where: { organizationId: scope.organizationId, runId: run.id },
+      select: { id: true },
+    });
+    await processCoreIntent(handle.client, first.id, options);
+    await processFindingsIntent(handle.client, first.id, findingsOptions);
+    const initial = await handle.client.findingsRunProjection.findUniqueOrThrow(
+      {
+        where: { runId: run.id },
+        select: { sourceFingerprint: true },
+      },
+    );
+
+    await pool.query(
+      'UPDATE findings_run_projections SET analyzer_version = 999 WHERE run_id = $1',
+      [run.id],
+    );
+    await expect(
+      replayFindingsIntent(handle.client, first.id, findingsOptions),
+    ).resolves.toBe('applied');
+    expect(
+      await handle.client.findingsRunProjection.findUniqueOrThrow({
+        where: { runId: run.id },
+        select: { analyzerVersion: true },
+      }),
+    ).toEqual({ analyzerVersion: 1 });
+
+    await ingestEvidenceBatch(handle.client, {
+      ...scope,
+      batch: incrementalBatch(accepted.runId, [
+        errorEvent(accepted.runId, 5, 'late-lower-findings-source'),
+      ]),
+    });
+    const second = await handle.client.processingIntent.findFirstOrThrow({
+      where: {
+        organizationId: scope.organizationId,
+        runId: run.id,
+        id: { not: first.id },
+      },
+      select: { id: true },
+    });
+    await processCoreIntent(handle.client, second.id, options);
+    await expect(
+      replayFindingsIntent(handle.client, first.id, findingsOptions),
+    ).resolves.toBe('applied');
+    const rebuilt = await handle.client.findingsRunProjection.findUniqueOrThrow(
+      {
+        where: { runId: run.id },
+        select: { sourceFingerprint: true },
+      },
+    );
+    expect(rebuilt.sourceFingerprint).not.toBe(initial.sourceFingerprint);
+    await expect(
+      replayFindingsIntent(handle.client, first.id, findingsOptions),
+    ).resolves.toBe('already_applied');
+    await handle.dispose();
+  });
+
+  it('lets a later non-exhausted intent recover failed findings on the same fingerprint', async () => {
+    const fixture = await failedFindingsFixture();
+    const evidenceCount = await fixture.handle.client.evidenceEvent.count({
+      where: { runId: fixture.runId },
+    });
+
+    await expect(
+      processFindingsIntent(
+        fixture.handle.client,
+        fixture.firstIntentId,
+        fixture.singleAttempt,
+      ),
+    ).resolves.toBe('failed');
+
+    const later = await createSameSourceIntent(fixture);
+    await expect(
+      processCoreIntent(fixture.handle.client, later.id, options),
+    ).resolves.toBe('already_applied');
+    await expect(
+      processFindingsIntent(
+        fixture.handle.client,
+        later.id,
+        fixture.singleAttempt,
+      ),
+    ).resolves.toBe('applied');
+
+    expect(
+      await fixture.handle.client.findingsRunProjection.findUniqueOrThrow({
+        where: { runId: fixture.runId },
+        select: { sourceFingerprint: true },
+      }),
+    ).toEqual({ sourceFingerprint: fixture.failedFingerprint });
+    expect(
+      await fixture.handle.client.evidenceEvent.count({
+        where: { runId: fixture.runId },
+      }),
+    ).toBe(evidenceCount);
+    expect(
+      await fixture.handle.client.runProcessingState.findUniqueOrThrow({
+        where: {
+          organizationId_runId_projectorName: {
+            organizationId: fixture.scope.organizationId,
+            runId: fixture.runId,
+            projectorName: 'findings',
+          },
+        },
+        select: { state: true, activeIntentId: true, attemptCount: true },
+      }),
+    ).toEqual({ state: 'READY', activeIntentId: null, attemptCount: 0 });
+    await expect(
+      processFindingsIntent(
+        fixture.handle.client,
+        fixture.firstIntentId,
+        fixture.singleAttempt,
+      ),
+    ).resolves.toBe('failed');
+    expect(
+      await fixture.handle.client.processingAttemptFailure.count({
+        where: { intentId: fixture.firstIntentId, projectorName: 'findings' },
+      }),
+    ).toBe(1);
+    await fixture.handle.dispose();
+  });
+
+  it('allows explicit replay of an exhausted intent on the same fingerprint', async () => {
+    const fixture = await failedFindingsFixture();
+
+    await expect(
+      processFindingsIntent(
+        fixture.handle.client,
+        fixture.firstIntentId,
+        fixture.singleAttempt,
+      ),
+    ).resolves.toBe('failed');
+    await expect(
+      replayFindingsIntent(
+        fixture.handle.client,
+        fixture.firstIntentId,
+        fixture.singleAttempt,
+      ),
+    ).resolves.toBe('applied');
+    expect(
+      await fixture.handle.client.processingAttemptFailure.count({
+        where: { intentId: fixture.firstIntentId, projectorName: 'findings' },
+      }),
+    ).toBe(0);
+    expect(
+      await fixture.handle.client.processingApplicationReceipt.count({
+        where: { intentId: fixture.firstIntentId, projectorName: 'findings' },
+      }),
+    ).toBe(1);
+    expect(
+      await fixture.handle.client.runProcessingState.findUniqueOrThrow({
+        where: {
+          organizationId_runId_projectorName: {
+            organizationId: fixture.scope.organizationId,
+            runId: fixture.runId,
+            projectorName: 'findings',
+          },
+        },
+        select: { state: true, activeIntentId: true, attemptCount: true },
+      }),
+    ).toEqual({ state: 'READY', activeIntentId: null, attemptCount: 0 });
+    await fixture.handle.dispose();
+  });
+
+  it('allows only one live owner during concurrent same-fingerprint recovery', async () => {
+    const fixture = await failedFindingsFixture();
+    const firstLater = await createSameSourceIntent(fixture);
+    const secondLater = await createSameSourceIntent(fixture);
+    await processCoreIntent(fixture.handle.client, firstLater.id, options);
+    await processCoreIntent(fixture.handle.client, secondLater.id, options);
+
+    let enterOwner!: () => void;
+    const ownerEntered = new Promise<void>((resolve) => {
+      enterOwner = resolve;
+    });
+    let releaseOwner!: () => void;
+    const ownerRelease = new Promise<void>((resolve) => {
+      releaseOwner = resolve;
+    });
+    const owner = processFindingsIntent(
+      fixture.handle.client,
+      firstLater.id,
+      fixture.singleAttempt,
+      {
+        hooks: {
+          afterDependenciesRead: async () => {
+            enterOwner();
+            await ownerRelease;
+          },
+        },
+      },
+    );
+    await ownerEntered;
+    try {
+      await expect(
+        processFindingsIntent(
+          fixture.handle.client,
+          secondLater.id,
+          fixture.singleAttempt,
+        ),
+      ).resolves.toBe('busy');
+      expect(
+        await fixture.handle.client.runProcessingState.findUniqueOrThrow({
+          where: {
+            organizationId_runId_projectorName: {
+              organizationId: fixture.scope.organizationId,
+              runId: fixture.runId,
+              projectorName: 'findings',
+            },
+          },
+          select: { state: true, activeIntentId: true },
+        }),
+      ).toEqual({ state: 'PROCESSING', activeIntentId: firstLater.id });
+    } finally {
+      releaseOwner();
+    }
+    await expect(owner).resolves.toBe('applied');
+    expect(
+      await fixture.handle.client.findingRuleResult.count({
+        where: { runId: fixture.runId },
+      }),
+    ).toBe(9);
+    await fixture.handle.dispose();
+  });
+
+  it('keeps result identity tenant-scoped for identical canonical run IDs', async () => {
+    const firstScope = await seed();
+    const secondScope = await seed();
+    const canonicalRunId = randomUUID();
+    const handle = createDatabaseClient({ connectionString });
+    for (const scope of [firstScope, secondScope]) {
+      await ingestEvidenceBatch(handle.client, {
+        ...scope,
+        batch: batch(canonicalRunId),
+      });
+      const intent = await handle.client.processingIntent.findFirstOrThrow({
+        where: { organizationId: scope.organizationId },
+        select: { id: true },
+      });
+      await processCoreIntent(handle.client, intent.id, options);
+      await processFindingsIntent(handle.client, intent.id, findingsOptions);
+    }
+    const firstKeys = await handle.client.findingRuleResult.findMany({
+      where: { organizationId: firstScope.organizationId },
+      orderBy: { catalogOrder: 'asc' },
+      select: { resultKey: true },
+    });
+    const secondKeys = await handle.client.findingRuleResult.findMany({
+      where: { organizationId: secondScope.organizationId },
+      orderBy: { catalogOrder: 'asc' },
+      select: { resultKey: true },
+    });
+    expect(firstKeys).toHaveLength(9);
+    expect(secondKeys).toHaveLength(9);
+    expect(firstKeys).not.toEqual(secondKeys);
+    await handle.dispose();
+  });
+
+  it('rejects stale findings ownership before publication', async () => {
+    const scope = await seed();
+    const handle = createDatabaseClient({ connectionString });
+    const accepted = batch();
+    await ingestEvidenceBatch(handle.client, { ...scope, batch: accepted });
+    const run = await handle.client.run.findUniqueOrThrow({
+      where: {
+        organizationId_canonicalRunId: {
+          organizationId: scope.organizationId,
+          canonicalRunId: accepted.runId,
+        },
+      },
+      select: { id: true },
+    });
+    const intent = await handle.client.processingIntent.findFirstOrThrow({
+      where: { runId: run.id },
+      select: { id: true },
+    });
+    await processCoreIntent(handle.client, intent.id, options);
+    await expect(
+      processFindingsIntent(handle.client, intent.id, findingsOptions, {
+        hooks: {
+          afterDependenciesRead: async () => {
+            await pool.query(
+              `UPDATE run_processing_states SET lease_id = $1
+               WHERE organization_id = $2 AND run_id = $3 AND projector_name = 'findings'`,
+              [randomUUID(), scope.organizationId, run.id],
+            );
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'processing_lease_lost' });
+    expect(
+      await handle.client.findingsRunProjection.count({
+        where: { runId: run.id },
+      }),
+    ).toBe(0);
+    await handle.dispose();
+  });
+
   it('deploys without pgmq and enforces intent lease/state coherence', async () => {
     const migration = await pool.query(
       `SELECT 1 FROM _prisma_migrations WHERE migration_name = '20261001120000_processing_relay_core_projections' AND finished_at IS NOT NULL`,

@@ -40,6 +40,14 @@ const config = {
     retryBaseSeconds: 1,
     retryMaxSeconds: 2,
   },
+  findingsProcessing: {
+    leaseSeconds: 20,
+    attemptTimeoutMs: 10_000,
+    transitionMarginMs: 1_000,
+    maxAttempts: 2,
+    retryBaseSeconds: 1,
+    retryMaxSeconds: 2,
+  },
   storage: {
     url: 'https://example.supabase.co',
     serviceRoleKey: 'service-role-sentinel',
@@ -101,12 +109,15 @@ describe('production worker composition', () => {
       ],
       archive,
     };
+    const client = {
+      processingIntent: { findUnique: vi.fn(async () => null) },
+    } as never;
     const processIntent = vi.fn(async () => 'failed' as const);
-    await consumeProcessingCycle({} as never, queue, config, undefined, {
+    await consumeProcessingCycle(client, queue, config, undefined, {
       processIntent,
     });
     expect(archive).not.toHaveBeenCalled();
-    await consumeProcessingCycle({} as never, queue, config, undefined, {
+    await consumeProcessingCycle(client, queue, config, undefined, {
       processIntent,
     });
     expect(archive).toHaveBeenCalledWith(7);
@@ -129,21 +140,63 @@ describe('production worker composition', () => {
       ],
       archive,
     };
+    const client = {
+      processingIntent: { findUnique: vi.fn(async () => null) },
+    } as never;
     const processIntent = vi
       .fn()
       .mockResolvedValueOnce('applied')
       .mockResolvedValueOnce('already_applied');
-    await consumeProcessingCycle({} as never, queue, config, undefined, {
+    const processFindings = vi
+      .fn()
+      .mockResolvedValueOnce('applied')
+      .mockResolvedValueOnce('already_applied');
+    await consumeProcessingCycle(client, queue, config, undefined, {
       processIntent,
+      processFindingsIntent: processFindings,
       afterProcessBeforeArchive: () => {
         throw new Error('crash');
       },
     });
     expect(archive).not.toHaveBeenCalled();
-    await consumeProcessingCycle({} as never, queue, config, undefined, {
+    await consumeProcessingCycle(client, queue, config, undefined, {
       processIntent,
+      processFindingsIntent: processFindings,
     });
     expect(archive).toHaveBeenCalledWith(8);
+    expect(processFindings).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not archive successful dependency work when findings configuration is absent', async () => {
+    const archive = vi.fn(async () => true);
+    const queue: ProcessingQueue = {
+      verify: async () => undefined,
+      send: async () => 1,
+      read: async () => [
+        {
+          messageId: 81,
+          readCount: 1,
+          payload: {
+            schemaVersion: 1,
+            intentId: '00000000-0000-4000-8000-000000000081',
+          },
+        },
+      ],
+      archive,
+    };
+    const client = {
+      processingIntent: { findUnique: vi.fn(async () => null) },
+    } as never;
+    const processIntent = vi.fn(async () => 'applied' as const);
+    const withoutFindings = {
+      ...config,
+      findingsProcessing: undefined,
+    } as unknown as typeof config;
+    await consumeProcessingCycle(client, queue, withoutFindings, undefined, {
+      processIntent,
+    });
+    expect(processIntent).not.toHaveBeenCalled();
+    expect(archive).not.toHaveBeenCalled();
   });
 
   it('dispatches artifact intents to the files projector and archives successful application', async () => {
@@ -163,16 +216,24 @@ describe('production worker composition', () => {
       },
     } as never;
     const processFiles = vi.fn(async () => 'applied' as const);
+    const processFindings = vi.fn(async () => 'applied' as const);
     const artifactReader = vi.fn();
     const consumerConfig = { ...config, artifactReader };
     await consumeProcessingCycle(client, queue, consumerConfig, undefined, {
       processFilesIntent: processFiles,
+      processFindingsIntent: processFindings,
     });
     expect(processFiles).toHaveBeenCalledWith(
       client,
       intentId,
       artifactReader,
       config.filesProcessing,
+      {},
+    );
+    expect(processFindings).toHaveBeenCalledWith(
+      client,
+      intentId,
+      config.findingsProcessing,
       {},
     );
     expect(archive).toHaveBeenCalledWith(9);
@@ -202,6 +263,7 @@ describe('production worker composition', () => {
     } as never;
     const withoutFiles = {
       processing: config.processing,
+      findingsProcessing: config.findingsProcessing,
       queueBatchSize: config.queueBatchSize,
       visibilityTimeoutSeconds: config.visibilityTimeoutSeconds,
       poisonReadLimit: config.poisonReadLimit,

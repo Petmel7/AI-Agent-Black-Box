@@ -7,6 +7,11 @@ import {
   FILES_PROJECTOR_VERSION,
   inspectFileSourceSnapshot,
 } from './file-processing.js';
+import {
+  FINDINGS_PROJECTOR_NAME,
+  FINDINGS_PROJECTOR_VERSION,
+  inspectFindingsSourceSnapshot,
+} from './findings-processing.js';
 import { Prisma } from './generated/client/client.js';
 import type { DatabaseClient } from './client.js';
 
@@ -161,6 +166,40 @@ function fileState(
   return projection.completeness === 'complete' ? 'ready' : 'incomplete';
 }
 
+async function findingsState(
+  client: DatabaseClient | Prisma.TransactionClient,
+  organizationId: string,
+  runId: string,
+  projection: {
+    projectorName: string;
+    projectorVersion: number;
+    sourceFingerprint: string;
+  } | null,
+  processing: {
+    state: string;
+    projectorVersion: number;
+    sourceFingerprint: string | null;
+  } | null,
+): Promise<QueryProcessingState> {
+  if (processing?.state === 'FAILED') return 'failed';
+  const current = await inspectFindingsSourceSnapshot(
+    client,
+    organizationId,
+    runId,
+  );
+  if (!current.coreCurrent) return projection ? 'stale' : 'processing';
+  if (!projection) return 'processing';
+  if (
+    projection.projectorName !== FINDINGS_PROJECTOR_NAME ||
+    projection.projectorVersion !== FINDINGS_PROJECTOR_VERSION ||
+    processing?.projectorVersion !== FINDINGS_PROJECTOR_VERSION ||
+    projection.sourceFingerprint !== current.fingerprint ||
+    processing.sourceFingerprint !== current.fingerprint
+  )
+    return 'stale';
+  return processing.state === 'READY' ? 'ready' : 'processing';
+}
+
 async function listCoreRunsInSnapshot(
   client: Prisma.TransactionClient,
   input: RunListInput,
@@ -215,9 +254,16 @@ async function listCoreRunsInSnapshot(
           fileCount: true,
         },
       },
+      findingsRunProjection: true,
       processingStates: {
         where: {
-          projectorName: { in: [CORE_PROJECTOR_NAME, FILES_PROJECTOR_NAME] },
+          projectorName: {
+            in: [
+              CORE_PROJECTOR_NAME,
+              FILES_PROJECTOR_NAME,
+              FINDINGS_PROJECTOR_NAME,
+            ],
+          },
         },
         select: {
           projectorName: true,
@@ -255,6 +301,17 @@ async function listCoreRunsInSnapshot(
         filesProcessing,
         currentFiles,
       );
+      const findingsProcessing =
+        run.processingStates.find(
+          (value) => value.projectorName === FINDINGS_PROJECTOR_NAME,
+        ) ?? null;
+      const currentFindingsState = await findingsState(
+        client,
+        input.organizationId,
+        run.id,
+        run.findingsRunProjection,
+        findingsProcessing,
+      );
       return {
         runId: run.canonicalRunId,
         createdAt: run.createdAt.toISOString(),
@@ -266,6 +323,32 @@ async function listCoreRunsInSnapshot(
         filesCompletenessReason:
           run.fileRunProjection?.completenessReason ??
           (filesState === 'ready' ? null : `files_${filesState}`),
+        findingsProcessingState: currentFindingsState,
+        findingsProcessingErrorCode: findingsProcessing?.lastErrorCode ?? null,
+        deterministicOutcome:
+          currentFindingsState === 'ready'
+            ? (run.findingsRunProjection?.deterministicOutcome ?? null)
+            : null,
+        findingsCoverage:
+          currentFindingsState === 'ready'
+            ? (run.findingsRunProjection?.coverage ?? null)
+            : null,
+        triggeredFindingCount:
+          currentFindingsState === 'ready'
+            ? (run.findingsRunProjection?.triggeredCount ?? null)
+            : null,
+        unknownFindingCount:
+          currentFindingsState === 'ready'
+            ? (run.findingsRunProjection?.unknownCount ?? null)
+            : null,
+        highFindingCount:
+          currentFindingsState === 'ready'
+            ? (run.findingsRunProjection?.highCount ?? null)
+            : null,
+        mediumFindingCount:
+          currentFindingsState === 'ready'
+            ? (run.findingsRunProjection?.mediumCount ?? null)
+            : null,
         evidenceCompleteness:
           run.coreRunProjection?.evidenceCompleteness ?? null,
         observedOutcome: run.coreRunProjection?.observedOutcome ?? null,
@@ -593,9 +676,16 @@ async function getCoreRunDetailInSnapshot(
         },
       },
       fileRunProjection: true,
+      findingsRunProjection: true,
       processingStates: {
         where: {
-          projectorName: { in: [CORE_PROJECTOR_NAME, FILES_PROJECTOR_NAME] },
+          projectorName: {
+            in: [
+              CORE_PROJECTOR_NAME,
+              FILES_PROJECTOR_NAME,
+              FINDINGS_PROJECTOR_NAME,
+            ],
+          },
         },
       },
     },
@@ -622,6 +712,45 @@ async function getCoreRunDetailInSnapshot(
     filesProcessing,
     currentFiles,
   );
+  const findingsProcessing =
+    run.processingStates.find(
+      (value) => value.projectorName === FINDINGS_PROJECTOR_NAME,
+    ) ?? null;
+  const currentFindingsState = await findingsState(
+    client,
+    input.organizationId,
+    run.id,
+    run.findingsRunProjection,
+    findingsProcessing,
+  );
+  const findingsSummary = {
+    findingsProcessingState: currentFindingsState,
+    findingsProcessingErrorCode: findingsProcessing?.lastErrorCode ?? null,
+    deterministicOutcome:
+      currentFindingsState === 'ready'
+        ? (run.findingsRunProjection?.deterministicOutcome ?? null)
+        : null,
+    findingsCoverage:
+      currentFindingsState === 'ready'
+        ? (run.findingsRunProjection?.coverage ?? null)
+        : null,
+    triggeredFindingCount:
+      currentFindingsState === 'ready'
+        ? (run.findingsRunProjection?.triggeredCount ?? null)
+        : null,
+    unknownFindingCount:
+      currentFindingsState === 'ready'
+        ? (run.findingsRunProjection?.unknownCount ?? null)
+        : null,
+    highFindingCount:
+      currentFindingsState === 'ready'
+        ? (run.findingsRunProjection?.highCount ?? null)
+        : null,
+    mediumFindingCount:
+      currentFindingsState === 'ready'
+        ? (run.findingsRunProjection?.mediumCount ?? null)
+        : null,
+  };
   if (!projection)
     return {
       runId: run.canonicalRunId,
@@ -636,6 +765,7 @@ async function getCoreRunDetailInSnapshot(
         (filesState === 'ready' ? null : `files_${filesState}`),
       filesChanged:
         filesState === 'ready' ? (run.fileRunProjection?.fileCount ?? 0) : null,
+      ...findingsSummary,
       projection: null,
     };
   const page = <T, R>(
@@ -663,6 +793,7 @@ async function getCoreRunDetailInSnapshot(
     filesCompletenessReason:
       run.fileRunProjection?.completenessReason ??
       (filesState === 'ready' ? null : `files_${filesState}`),
+    ...findingsSummary,
     projection: {
       projectorName: projection.projectorName,
       projectorVersion: projection.projectorVersion,
@@ -812,6 +943,135 @@ export async function getCoreRunDetail(
 ) {
   return client.$transaction(
     (transaction) => getCoreRunDetailInSnapshot(transaction, input, hooks),
+    { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead },
+  );
+}
+
+export interface FindingListInput {
+  organizationId: string;
+  repositoryId: string;
+  canonicalRunId: string;
+  limit: number;
+  cursor?: string;
+}
+
+function findingCursor(value: string | undefined): number | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(
+      Buffer.from(value, 'base64url').toString('utf8'),
+    ) as Record<string, unknown>;
+    if (
+      typeof parsed.catalogOrder !== 'number' ||
+      !Number.isSafeInteger(parsed.catalogOrder) ||
+      parsed.catalogOrder < 0
+    )
+      throw new Error();
+    return parsed.catalogOrder;
+  } catch {
+    throw new TypeError('Invalid finding pagination cursor.');
+  }
+}
+
+/** Tenant-safe current catalog pagination. Wrong-tenant and missing runs both return null. */
+export async function listFindings(
+  client: DatabaseClient,
+  input: FindingListInput,
+  hooks: QueryConsistencyHooks = {},
+) {
+  bounded(input.limit, 100);
+  const cursor = findingCursor(input.cursor);
+  return client.$transaction(
+    async (transaction) => {
+      const run = await transaction.run.findFirst({
+        where: {
+          organizationId: input.organizationId,
+          repositoryId: input.repositoryId,
+          canonicalRunId: input.canonicalRunId,
+        },
+        select: {
+          id: true,
+          findingsRunProjection: true,
+          processingStates: {
+            where: { projectorName: FINDINGS_PROJECTOR_NAME },
+            take: 1,
+          },
+        },
+      });
+      if (!run) return null;
+      await hooks.afterBaseRead?.();
+      const processing = run.processingStates[0] ?? null;
+      const processingState = await findingsState(
+        transaction,
+        input.organizationId,
+        run.id,
+        run.findingsRunProjection,
+        processing,
+      );
+      if (processingState !== 'ready' || !run.findingsRunProjection)
+        return {
+          processingState,
+          processingErrorCode: processing?.lastErrorCode ?? null,
+          deterministicOutcome: null,
+          coverage: null,
+          items: [],
+          nextCursor: null,
+        };
+      const rows = await transaction.findingRuleResult.findMany({
+        where: {
+          organizationId: input.organizationId,
+          runId: run.id,
+          ...(cursor === null ? {} : { catalogOrder: { gt: cursor } }),
+        },
+        orderBy: { catalogOrder: 'asc' },
+        take: input.limit + 1,
+        include: {
+          references: {
+            orderBy: { ordinal: 'asc' },
+            include: {
+              event: { select: { canonicalEventId: true } },
+              artifactDeclaration: { select: { canonicalArtifactId: true } },
+            },
+          },
+        },
+      });
+      const visible = rows.slice(0, input.limit);
+      return {
+        processingState,
+        processingErrorCode: null,
+        deterministicOutcome: run.findingsRunProjection.deterministicOutcome,
+        coverage: run.findingsRunProjection.coverage,
+        items: visible.map((row) => ({
+          resultKey: row.resultKey,
+          catalogOrder: row.catalogOrder,
+          ruleId: row.ruleId,
+          ruleVersion: row.ruleVersion,
+          severity: row.severity,
+          outcome: row.outcome,
+          coverage: row.coverage,
+          reasonCodes: row.reasonCodes,
+          explanation: row.explanation,
+          matchCount: row.matchCount,
+          matches: row.matches,
+          matchesTruncated: row.matchesTruncated,
+          referencesTruncated: row.referencesTruncated,
+          references: row.references.map((reference) => ({
+            ordinal: reference.ordinal,
+            eventId: reference.event.canonicalEventId,
+            artifactId:
+              reference.artifactDeclaration?.canonicalArtifactId ?? null,
+            eventArtifactPointer: reference.eventArtifactPointer,
+            jsonPointer: reference.jsonPointer,
+            fileOrdinal: reference.fileOrdinal,
+            entryId: reference.entryId,
+          })),
+        })),
+        nextCursor:
+          rows.length > input.limit && visible.at(-1)
+            ? encode({ catalogOrder: visible.at(-1)!.catalogOrder })
+            : null,
+      };
+    },
     { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead },
   );
 }

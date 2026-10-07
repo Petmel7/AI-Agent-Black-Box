@@ -4,8 +4,12 @@ import { setTimeout as delay } from 'node:timers/promises';
 import {
   createDatabaseClient,
   createPgmqProcessingQueue,
+  ingestEvidenceBatch,
+  processCoreIntent,
+  processFindingsIntent,
   PROCESSING_QUEUE_NAME,
   provisionProcessingQueue,
+  type IngestEvidenceBatchInput,
   type ProcessingQueue,
   type ProcessingQueueMessage,
 } from '@blackbox/database';
@@ -40,6 +44,14 @@ const config: ProcessingConsumerConfig = {
     eventPageSize: 100,
     maxEvents: 100,
     maxProjectedChildren: 1_000,
+  },
+  findingsProcessing: {
+    leaseSeconds: 10,
+    attemptTimeoutMs: 2_000,
+    transitionMarginMs: 100,
+    maxAttempts: 2,
+    retryBaseSeconds: 1,
+    retryMaxSeconds: 1,
   },
   queueBatchSize: 1,
   visibilityTimeoutSeconds: 1,
@@ -105,14 +117,163 @@ async function artifactIntent(): Promise<{
   return { intentId: intent.id, runId: run.id };
 }
 
+async function evidenceIntent(): Promise<{
+  intentId: string;
+  organizationId: string;
+  runId: string;
+}> {
+  const organization = await handle.client.organization.create({ data: {} });
+  const repository = await handle.client.repository.create({
+    data: { organizationId: organization.id },
+  });
+  const canonicalRunId = randomUUID();
+  await ingestEvidenceBatch(handle.client, {
+    organizationId: organization.id,
+    repositoryId: repository.id,
+    batch: {
+      schemaVersion: 1,
+      batchId: randomUUID(),
+      runId: canonicalRunId,
+      sentAt: '2026-10-07T00:00:00.000Z',
+      events: [
+        {
+          schemaVersion: 1,
+          eventId: randomUUID(),
+          runId: canonicalRunId,
+          sequence: 0,
+          kind: 'run.started',
+          observedAt: '2026-10-07T00:00:00.000Z',
+          source: { component: 'collector' },
+          payload: { adapter: 'codex-jsonl', provider: 'codex' },
+        },
+        {
+          schemaVersion: 1,
+          eventId: randomUUID(),
+          runId: canonicalRunId,
+          sequence: 1,
+          kind: 'run.finished',
+          observedAt: '2026-10-07T00:00:01.000Z',
+          source: { component: 'collector' },
+          payload: { outcome: 'succeeded', durationMs: 1 },
+        },
+      ],
+    } satisfies IngestEvidenceBatchInput['batch'],
+  });
+  return handle.client.processingIntent
+    .findFirstOrThrow({
+      where: { organizationId: organization.id },
+      select: { id: true, runId: true },
+    })
+    .then(({ id, runId }) => ({
+      intentId: id,
+      organizationId: organization.id,
+      runId,
+    }));
+}
+
 describe('real PGMQ processing consumer', () => {
+  it('creates one findings receipt and archives only after post-findings crash redelivery', async () => {
+    const { intentId, runId } = await evidenceIntent();
+    const messageId = await queue.send({ schemaVersion: 1, intentId });
+    const archive = vi.fn((id: number) => queue.archive(id));
+    const observedQueue = { ...queue, archive } satisfies ProcessingQueue;
+    await expect(
+      consumeProcessingCycle(handle.client, observedQueue, config, undefined, {
+        afterProcessBeforeArchive: () => {
+          throw new Error('post-findings pre-archive crash');
+        },
+      }),
+    ).resolves.toBe(1);
+    expect(archive).not.toHaveBeenCalled();
+    expect(
+      await handle.client.processingApplicationReceipt.count({
+        where: { intentId, projectorName: 'findings' },
+      }),
+    ).toBe(1);
+    expect(
+      await handle.client.findingRuleResult.count({ where: { runId } }),
+    ).toBe(9);
+    await delay(1_100);
+    await expect(
+      consumeProcessingCycle(handle.client, observedQueue, config),
+    ).resolves.toBe(1);
+    expect(archive).toHaveBeenCalledWith(messageId);
+    expect(
+      await handle.client.processingApplicationReceipt.count({
+        where: { intentId, projectorName: 'findings' },
+      }),
+    ).toBe(1);
+    await expect(queue.read(1, 1)).resolves.toEqual([]);
+  });
+
+  it('keeps a failed findings gate visible until poison convergence', async () => {
+    const { intentId, organizationId, runId } = await evidenceIntent();
+    await expect(
+      processCoreIntent(handle.client, intentId, config.processing),
+    ).resolves.toBe('applied');
+    await expect(
+      processFindingsIntent(
+        handle.client,
+        intentId,
+        { ...config.findingsProcessing, maxAttempts: 1 },
+        {
+          hooks: {
+            afterDependenciesRead: () => {
+              throw new Error('force exhausted findings intent');
+            },
+          },
+        },
+      ),
+    ).resolves.toBe('failed');
+    const messageId = await queue.send({ schemaVersion: 1, intentId });
+    const archive = vi.fn((id: number) => queue.archive(id));
+    const observedQueue = { ...queue, archive } satisfies ProcessingQueue;
+    await expect(
+      consumeProcessingCycle(handle.client, observedQueue, config),
+    ).resolves.toBe(1);
+    expect(archive).not.toHaveBeenCalled();
+    await delay(1_100);
+    await expect(
+      consumeProcessingCycle(handle.client, observedQueue, config),
+    ).resolves.toBe(1);
+    expect(archive).toHaveBeenCalledWith(messageId);
+    expect(
+      await handle.client.processingApplicationReceipt.count({
+        where: { intentId, projectorName: 'findings' },
+      }),
+    ).toBe(0);
+    await expect(
+      handle.client.runProcessingState.findUniqueOrThrow({
+        where: {
+          organizationId_runId_projectorName: {
+            organizationId,
+            runId,
+            projectorName: 'findings',
+          },
+        },
+        select: { state: true, activeIntentId: true },
+      }),
+    ).resolves.toEqual({ state: 'FAILED', activeIntentId: intentId });
+    expect(
+      await handle.client.processingAttemptFailure.count({
+        where: { intentId, projectorName: 'findings' },
+      }),
+    ).toBe(1);
+    await expect(queue.read(1, 1)).resolves.toEqual([]);
+  });
+
   it('recovers the process/archive window through visibility redelivery', async () => {
     const intentId = randomUUID();
     await queue.send({ schemaVersion: 1, intentId });
     const processIntent = vi.fn(async () => 'applied' as const);
+    const processFindings = vi
+      .fn()
+      .mockResolvedValueOnce('applied')
+      .mockResolvedValueOnce('already_applied');
     await expect(
       consumeProcessingCycle(handle.client, queue, config, undefined, {
         processIntent,
+        processFindingsIntent: processFindings,
         afterProcessBeforeArchive: () => {
           throw new Error('simulated crash window');
         },
@@ -123,9 +284,11 @@ describe('real PGMQ processing consumer', () => {
     await expect(
       consumeProcessingCycle(handle.client, queue, config, undefined, {
         processIntent,
+        processFindingsIntent: processFindings,
       }),
     ).resolves.toBe(1);
     expect(processIntent).toHaveBeenCalledTimes(2);
+    expect(processFindings).toHaveBeenCalledTimes(2);
     await expect(queue.read(1, 1)).resolves.toEqual([]);
   });
 
