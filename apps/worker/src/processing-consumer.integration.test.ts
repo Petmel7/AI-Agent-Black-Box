@@ -7,6 +7,7 @@ import {
   ingestEvidenceBatch,
   processCoreIntent,
   processFindingsIntent,
+  processSummaryIntent,
   PROCESSING_QUEUE_NAME,
   provisionProcessingQueue,
   type IngestEvidenceBatchInput,
@@ -46,6 +47,14 @@ const config: ProcessingConsumerConfig = {
     maxProjectedChildren: 1_000,
   },
   findingsProcessing: {
+    leaseSeconds: 10,
+    attemptTimeoutMs: 2_000,
+    transitionMarginMs: 100,
+    maxAttempts: 2,
+    retryBaseSeconds: 1,
+    retryMaxSeconds: 1,
+  },
+  summaryProcessing: {
     leaseSeconds: 10,
     attemptTimeoutMs: 2_000,
     transitionMarginMs: 100,
@@ -172,7 +181,7 @@ async function evidenceIntent(): Promise<{
 }
 
 describe('real PGMQ processing consumer', () => {
-  it('creates one findings receipt and archives only after post-findings crash redelivery', async () => {
+  it('creates one summary receipt and archives only after post-summary crash redelivery', async () => {
     const { intentId, runId } = await evidenceIntent();
     const messageId = await queue.send({ schemaVersion: 1, intentId });
     const archive = vi.fn((id: number) => queue.archive(id));
@@ -180,7 +189,7 @@ describe('real PGMQ processing consumer', () => {
     await expect(
       consumeProcessingCycle(handle.client, observedQueue, config, undefined, {
         afterProcessBeforeArchive: () => {
-          throw new Error('post-findings pre-archive crash');
+          throw new Error('post-summary pre-archive crash');
         },
       }),
     ).resolves.toBe(1);
@@ -188,6 +197,11 @@ describe('real PGMQ processing consumer', () => {
     expect(
       await handle.client.processingApplicationReceipt.count({
         where: { intentId, projectorName: 'findings' },
+      }),
+    ).toBe(1);
+    expect(
+      await handle.client.processingApplicationReceipt.count({
+        where: { intentId, projectorName: 'summary' },
       }),
     ).toBe(1);
     expect(
@@ -201,6 +215,88 @@ describe('real PGMQ processing consumer', () => {
     expect(
       await handle.client.processingApplicationReceipt.count({
         where: { intentId, projectorName: 'findings' },
+      }),
+    ).toBe(1);
+    expect(
+      await handle.client.processingApplicationReceipt.count({
+        where: { intentId, projectorName: 'summary' },
+      }),
+    ).toBe(1);
+    await expect(queue.read(1, 1)).resolves.toEqual([]);
+  });
+
+  it('retries a summary failure by visibility and archives only at poison convergence', async () => {
+    const { intentId, organizationId, runId } = await evidenceIntent();
+    await expect(
+      processCoreIntent(handle.client, intentId, config.processing),
+    ).resolves.toBe('applied');
+    await expect(
+      processFindingsIntent(handle.client, intentId, config.findingsProcessing),
+    ).resolves.toBe('applied');
+    await expect(
+      processSummaryIntent(
+        handle.client,
+        intentId,
+        { ...config.summaryProcessing, maxAttempts: 1 },
+        {
+          hooks: {
+            afterDependenciesRead: () => {
+              throw new Error('force exhausted summary intent');
+            },
+          },
+        },
+      ),
+    ).resolves.toBe('failed');
+
+    const payload = { schemaVersion: 1 as const, intentId };
+    const messageId = await queue.send(payload);
+    const deliveries: ProcessingQueueMessage[] = [];
+    const archive = vi.fn((id: number) => queue.archive(id));
+    const observedQueue = {
+      ...queue,
+      read: async (visibilityTimeoutSeconds: number, quantity: number) => {
+        const messages = await queue.read(visibilityTimeoutSeconds, quantity);
+        deliveries.push(...messages);
+        return messages;
+      },
+      archive,
+    } satisfies ProcessingQueue;
+
+    await expect(
+      consumeProcessingCycle(handle.client, observedQueue, config),
+    ).resolves.toBe(1);
+    expect(deliveries).toEqual([{ messageId, readCount: 1, payload }]);
+    expect(archive).not.toHaveBeenCalled();
+    await delay(1_100);
+    await expect(
+      consumeProcessingCycle(handle.client, observedQueue, config),
+    ).resolves.toBe(1);
+    expect(deliveries).toEqual([
+      { messageId, readCount: 1, payload },
+      { messageId, readCount: 2, payload },
+    ]);
+    expect(archive).toHaveBeenCalledOnce();
+    expect(archive).toHaveBeenCalledWith(messageId);
+    expect(
+      await handle.client.processingApplicationReceipt.count({
+        where: { intentId, projectorName: 'summary' },
+      }),
+    ).toBe(0);
+    await expect(
+      handle.client.runProcessingState.findUniqueOrThrow({
+        where: {
+          organizationId_runId_projectorName: {
+            organizationId,
+            runId,
+            projectorName: 'summary',
+          },
+        },
+        select: { state: true, activeIntentId: true },
+      }),
+    ).resolves.toEqual({ state: 'FAILED', activeIntentId: intentId });
+    expect(
+      await handle.client.processingAttemptFailure.count({
+        where: { intentId, projectorName: 'summary' },
       }),
     ).toBe(1);
     await expect(queue.read(1, 1)).resolves.toEqual([]);
@@ -270,10 +366,15 @@ describe('real PGMQ processing consumer', () => {
       .fn()
       .mockResolvedValueOnce('applied')
       .mockResolvedValueOnce('already_applied');
+    const processSummary = vi
+      .fn()
+      .mockResolvedValueOnce('applied')
+      .mockResolvedValueOnce('already_applied');
     await expect(
       consumeProcessingCycle(handle.client, queue, config, undefined, {
         processIntent,
         processFindingsIntent: processFindings,
+        processSummaryIntent: processSummary,
         afterProcessBeforeArchive: () => {
           throw new Error('simulated crash window');
         },
@@ -285,10 +386,12 @@ describe('real PGMQ processing consumer', () => {
       consumeProcessingCycle(handle.client, queue, config, undefined, {
         processIntent,
         processFindingsIntent: processFindings,
+        processSummaryIntent: processSummary,
       }),
     ).resolves.toBe(1);
     expect(processIntent).toHaveBeenCalledTimes(2);
     expect(processFindings).toHaveBeenCalledTimes(2);
+    expect(processSummary).toHaveBeenCalledTimes(2);
     await expect(queue.read(1, 1)).resolves.toEqual([]);
   });
 

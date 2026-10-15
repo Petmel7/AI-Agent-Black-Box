@@ -21,6 +21,9 @@ export default defineConfig({
       '@blackbox/database': fileURLToPath(
         new URL('../../packages/database/src/index.ts', import.meta.url),
       ),
+      '@blackbox/summaries': fileURLToPath(
+        new URL('../../packages/summaries/src/index.ts', import.meta.url),
+      ),
     },
   },
   test: {

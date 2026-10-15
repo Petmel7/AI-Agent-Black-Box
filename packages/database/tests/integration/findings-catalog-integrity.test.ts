@@ -9,6 +9,7 @@ import {
   ingestEvidenceBatch,
   processCoreIntent,
   processFindingsIntent,
+  processSummaryIntent,
 } from '../../src/index.js';
 
 const connectionString = (() => {
@@ -45,6 +46,14 @@ const coreOptions = {
 };
 
 const findingsOptions = {
+  leaseSeconds: 10,
+  attemptTimeoutMs: 2_000,
+  transitionMarginMs: 100,
+  maxAttempts: 2,
+  retryBaseSeconds: 1,
+  retryMaxSeconds: 1,
+};
+const summaryOptions = {
   leaseSeconds: 10,
   attemptTimeoutMs: 2_000,
   transitionMarginMs: 100,
@@ -237,6 +246,27 @@ async function createCatalog(scope: Scope): Promise<Catalog> {
   }
 }
 
+async function createSummary(scope: Scope): Promise<Catalog> {
+  const catalog = await createCatalog(scope);
+  await publishSummary(catalog);
+  return catalog;
+}
+
+async function publishSummary(catalog: Catalog): Promise<void> {
+  const handle = createDatabaseClient({ connectionString });
+  try {
+    const intent = await handle.client.processingIntent.findFirstOrThrow({
+      where: { organizationId: catalog.organizationId, runId: catalog.runId },
+      select: { id: true },
+    });
+    expect(
+      await processSummaryIntent(handle.client, intent.id, summaryOptions),
+    ).toBe('applied');
+  } finally {
+    await handle.dispose();
+  }
+}
+
 async function resultId(runId: string, ruleId: string): Promise<string> {
   return (
     await pool.query<{ id: string }>(
@@ -303,6 +333,20 @@ function insertReference(input: ReferenceInsert) {
 
 async function rollback(client: PoolClient): Promise<void> {
   await client.query('ROLLBACK').catch(() => undefined);
+}
+
+async function expectTransactionFailure(
+  action: (client: PoolClient) => Promise<unknown>,
+  expected: Record<string, unknown>,
+): Promise<void> {
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await expect(action(client)).rejects.toMatchObject(expected);
+  } finally {
+    await rollback(client);
+    client.release();
+  }
 }
 
 describe('findings catalog ownership integrity', () => {
@@ -664,8 +708,8 @@ describe('findings catalog ownership integrity', () => {
     ).toBe('9');
   });
 
-  it('allows a complete atomic delete-and-reinsert replacement with references preserved', async () => {
-    const catalog = await createCatalog(await seedScope());
+  it('allows a complete atomic delete-and-reinsert replacement, preserves references, and invalidates the summary', async () => {
+    const catalog = await createSummary(await seedScope());
     const oldResultIds = (
       await pool.query<{ id: string }>(
         'SELECT id FROM finding_rule_results WHERE run_id = $1 ORDER BY catalog_order',
@@ -747,5 +791,653 @@ describe('findings catalog ownership integrity', () => {
     expect((await pool.query(referenceQuery, [catalog.runId])).rows).toEqual(
       beforeReferences,
     );
+    expect(
+      (
+        await pool.query<{ count: string }>(
+          'SELECT count(*)::text AS count FROM summary_run_projections WHERE run_id = $1',
+          [catalog.runId],
+        )
+      ).rows[0]!.count,
+    ).toBe('0');
+  });
+
+  it('invalidates a summary for an aggregate-preserving triggered/clear result swap', async () => {
+    const catalog = await createCatalog(await seedScope());
+    const clearCandidate = (
+      await pool.query<{ id: string }>(
+        `SELECT id FROM finding_rule_results
+          WHERE run_id = $1 AND outcome = 'unknown' AND severity = 'medium'
+          ORDER BY catalog_order LIMIT 1`,
+        [catalog.runId],
+      )
+    ).rows[0]!;
+    const prepare = await pool.connect();
+    try {
+      await prepare.query('BEGIN');
+      await prepare.query(
+        `UPDATE finding_rule_results
+            SET outcome = 'clear', coverage = 'complete'
+          WHERE id = $1`,
+        [clearCandidate.id],
+      );
+      await prepare.query(
+        `UPDATE findings_run_projections
+            SET unknown_count = unknown_count - 1
+          WHERE run_id = $1`,
+        [catalog.runId],
+      );
+      await prepare.query('COMMIT');
+    } finally {
+      await rollback(prepare);
+      prepare.release();
+    }
+    const triggered = (
+      await pool.query<{
+        id: string;
+        rule_id: string;
+      }>(
+        `SELECT id, rule_id FROM finding_rule_results
+          WHERE run_id = $1 AND outcome = 'triggered'
+          ORDER BY catalog_order LIMIT 1`,
+        [catalog.runId],
+      )
+    ).rows[0]!;
+    const clear = (
+      await pool.query<{
+        id: string;
+        rule_id: string;
+      }>(
+        `SELECT id, rule_id FROM finding_rule_results
+          WHERE run_id = $1 AND outcome = 'clear'
+          ORDER BY catalog_order LIMIT 1`,
+        [catalog.runId],
+      )
+    ).rows[0]!;
+    const reference = (
+      await pool.query<{
+        event_id: string;
+      }>(
+        `SELECT event_id FROM finding_evidence_references
+          WHERE result_id = $1 ORDER BY ordinal LIMIT 1`,
+        [triggered.id],
+      )
+    ).rows[0]!;
+    await pool.query(
+      `INSERT INTO finding_evidence_references
+        (organization_id, run_id, result_id, ordinal, event_id)
+       VALUES ($1, $2, $3, 0, $4)`,
+      [catalog.organizationId, catalog.runId, clear.id, reference.event_id],
+    );
+    await publishSummary(catalog);
+
+    await pool.query(
+      `UPDATE finding_rule_results
+          SET outcome = CASE
+            WHEN rule_id = $2 THEN 'clear'
+            WHEN rule_id = $3 THEN 'triggered'
+            ELSE outcome
+          END
+        WHERE run_id = $1 AND rule_id IN ($2, $3)`,
+      [catalog.runId, triggered.rule_id, clear.rule_id],
+    );
+
+    expect(
+      (
+        await pool.query<{ count: string }>(
+          'SELECT count(*)::text AS count FROM summary_run_projections WHERE run_id = $1',
+          [catalog.runId],
+        )
+      ).rows[0]!.count,
+    ).toBe('0');
+    const projection = await pool.query<{
+      triggered_count: number;
+      deterministic_outcome: string;
+    }>(
+      'SELECT triggered_count, deterministic_outcome FROM findings_run_projections WHERE run_id = $1',
+      [catalog.runId],
+    );
+    expect(projection.rows[0]).toEqual({
+      triggered_count: 1,
+      deterministic_outcome: 'review',
+    });
+  });
+
+  it('invalidates material projection changes and rolls invalidation back with the mutation', async () => {
+    const catalog = await createSummary(await seedScope());
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        'UPDATE findings_run_projections SET analyzer_version = analyzer_version + 1 WHERE run_id = $1',
+        [catalog.runId],
+      );
+      expect(
+        (
+          await client.query<{ count: string }>(
+            'SELECT count(*)::text AS count FROM summary_run_projections WHERE run_id = $1',
+            [catalog.runId],
+          )
+        ).rows[0]!.count,
+      ).toBe('0');
+      await client.query('ROLLBACK');
+      expect(
+        (
+          await pool.query<{ count: string }>(
+            'SELECT count(*)::text AS count FROM summary_run_projections WHERE run_id = $1',
+            [catalog.runId],
+          )
+        ).rows[0]!.count,
+      ).toBe('1');
+    } finally {
+      await rollback(client);
+      client.release();
+    }
+
+    await pool.query(
+      'UPDATE findings_run_projections SET analyzer_version = analyzer_version + 1 WHERE run_id = $1',
+      [catalog.runId],
+    );
+    expect(
+      (
+        await pool.query<{ count: string }>(
+          'SELECT count(*)::text AS count FROM summary_run_projections WHERE run_id = $1',
+          [catalog.runId],
+        )
+      ).rows[0]!.count,
+    ).toBe('0');
+  });
+
+  it('requires every summary claim to have the support kind allowed by its class', async () => {
+    const summary = await createSummary(await seedScope());
+    const rows = await pool.query<{
+      claim_class: string;
+      support_kind: string;
+      count: string;
+    }>(
+      `SELECT claim.claim_class, support.support_kind, count(*)::text AS count
+         FROM summary_claims claim
+         JOIN summary_claim_supports support ON support.claim_id = claim.id
+        WHERE claim.run_id = $1
+        GROUP BY claim.claim_class, support.support_kind`,
+      [summary.runId],
+    );
+    expect(rows.rows.length).toBeGreaterThan(0);
+    expect(
+      rows.rows.every(
+        (row) =>
+          (row.claim_class === 'observation' &&
+            row.support_kind === 'evidence') ||
+          (row.claim_class !== 'observation' && row.support_kind === 'finding'),
+      ),
+    ).toBe(true);
+    const unsupported = await pool.query<{ count: string }>(
+      `SELECT count(*)::text AS count
+         FROM summary_claims claim
+        WHERE claim.run_id = $1
+          AND NOT EXISTS (SELECT 1 FROM summary_claim_supports support WHERE support.claim_id = claim.id)`,
+      [summary.runId],
+    );
+    expect(unsupported.rows[0]!.count).toBe('0');
+  });
+
+  it('permits only complete summary evidence locator shapes', async () => {
+    const summary = await createSummary(await seedScope());
+    const claim = (
+      await pool.query<{
+        id: string;
+        claim_class: string;
+        support_count: number;
+      }>(
+        `SELECT id, claim_class, support_count FROM summary_claims
+          WHERE run_id = $1 AND claim_class = 'observation'
+          ORDER BY section_order, claim_order LIMIT 1`,
+        [summary.runId],
+      )
+    ).rows[0]!;
+    const evidence = (await linkedArtifacts(summary.runId))[0]!;
+    const validPresence = new Set(['00000', '11100', '11111']);
+    const initialSupportCount = claim.support_count;
+    let nextSupportOrdinal = initialSupportCount;
+
+    for (let value = 0; value < 32; value += 1) {
+      const presence = value.toString(2).padStart(5, '0');
+      const parameters = [
+        summary.organizationId,
+        summary.runId,
+        claim.id,
+        claim.claim_class,
+        nextSupportOrdinal,
+        evidence.eventId,
+        presence[0] === '1' ? evidence.artifactId : null,
+        presence[1] === '1' ? evidence.eventArtifactPointer : null,
+        presence[2] === '1' ? '/tests/0' : null,
+        presence[3] === '1' ? 0 : null,
+        presence[4] === '1' ? `entry-${presence}` : null,
+      ];
+      const statement = `INSERT INTO summary_claim_supports
+        (organization_id, run_id, claim_id, claim_class, ordinal,
+         support_kind, event_id, artifact_declaration_id,
+         event_artifact_pointer, json_pointer, file_ordinal, entry_id)
+       VALUES ($1, $2, $3, $4, $5, 'evidence', $6, $7, $8, $9, $10, $11)`;
+      if (!validPresence.has(presence)) {
+        await expect(pool.query(statement, parameters)).rejects.toMatchObject({
+          code: '23514',
+          constraint: 'summary_supports_kind_check',
+        });
+        continue;
+      }
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(statement, parameters);
+        await client.query(
+          'UPDATE summary_claims SET support_count = support_count + 1 WHERE id = $1',
+          [claim.id],
+        );
+        await client.query('COMMIT');
+        nextSupportOrdinal += 1;
+      } finally {
+        await rollback(client);
+        client.release();
+      }
+    }
+
+    const stored = await pool.query<{ presence: string }>(
+      `SELECT
+         (CASE WHEN artifact_declaration_id IS NULL THEN '0' ELSE '1' END ||
+          CASE WHEN event_artifact_pointer IS NULL THEN '0' ELSE '1' END ||
+          CASE WHEN json_pointer IS NULL THEN '0' ELSE '1' END ||
+          CASE WHEN file_ordinal IS NULL THEN '0' ELSE '1' END ||
+         CASE WHEN entry_id IS NULL THEN '0' ELSE '1' END) AS presence
+         FROM summary_claim_supports
+        WHERE claim_id = $1 AND ordinal >= $2
+        ORDER BY ordinal`,
+      [claim.id, initialSupportCount],
+    );
+    expect(stored.rows.map((row) => row.presence)).toEqual([
+      '00000',
+      '11100',
+      '11111',
+    ]);
+  });
+
+  it('permits only a complete summary finding identity shape', async () => {
+    const summary = await createSummary(await seedScope());
+    const claim = (
+      await pool.query<{
+        id: string;
+        claim_class: string;
+        support_count: number;
+      }>(
+        `SELECT id, claim_class, support_count FROM summary_claims
+          WHERE run_id = $1 AND claim_class = 'limitation'
+          ORDER BY section_order, claim_order LIMIT 1`,
+        [summary.runId],
+      )
+    ).rows[0]!;
+    const finding = (
+      await pool.query<{
+        id: string;
+        result_key: string;
+        rule_id: string;
+        rule_version: number;
+        source_fingerprint: string;
+      }>(
+        `SELECT result.id, result.result_key, result.rule_id, result.rule_version,
+                projection.source_fingerprint
+           FROM finding_rule_results result
+           JOIN findings_run_projections projection ON projection.run_id = result.run_id
+          WHERE result.run_id = $1
+            AND NOT EXISTS (
+              SELECT 1 FROM summary_claim_supports support
+               WHERE support.claim_id = $2 AND support.finding_result_id = result.id
+            )
+          ORDER BY result.catalog_order LIMIT 1`,
+        [summary.runId, claim.id],
+      )
+    ).rows[0]!;
+    const initialSupportCount = claim.support_count;
+    const statement = `INSERT INTO summary_claim_supports
+      (organization_id, run_id, claim_id, claim_class, ordinal,
+       support_kind, finding_result_id, finding_result_key,
+       finding_rule_id, finding_rule_version, findings_source_fingerprint)
+     VALUES ($1, $2, $3, $4, $5, 'finding', $6, $7, $8, $9, $10)`;
+
+    for (let value = 0; value < 32; value += 1) {
+      const presence = value.toString(2).padStart(5, '0');
+      const parameters = [
+        summary.organizationId,
+        summary.runId,
+        claim.id,
+        claim.claim_class,
+        initialSupportCount,
+        presence[0] === '1' ? finding.id : null,
+        presence[1] === '1' ? finding.result_key : null,
+        presence[2] === '1' ? finding.rule_id : null,
+        presence[3] === '1' ? finding.rule_version : null,
+        presence[4] === '1' ? finding.source_fingerprint : null,
+      ];
+      if (presence !== '11111') {
+        await expectTransactionFailure(
+          (client) => client.query(statement, parameters),
+          { code: '23514', constraint: 'summary_supports_kind_check' },
+        );
+        continue;
+      }
+      const client = await pool.connect();
+      try {
+        await client.query('BEGIN');
+        await client.query(statement, parameters);
+        await client.query(
+          'UPDATE summary_claims SET support_count = support_count + 1 WHERE id = $1',
+          [claim.id],
+        );
+        await client.query('COMMIT');
+      } finally {
+        await rollback(client);
+        client.release();
+      }
+    }
+
+    const stored = await pool.query<{ presence: string }>(
+      `SELECT
+         (CASE WHEN finding_result_id IS NULL THEN '0' ELSE '1' END ||
+          CASE WHEN finding_result_key IS NULL THEN '0' ELSE '1' END ||
+          CASE WHEN finding_rule_id IS NULL THEN '0' ELSE '1' END ||
+          CASE WHEN finding_rule_version IS NULL THEN '0' ELSE '1' END ||
+          CASE WHEN findings_source_fingerprint IS NULL THEN '0' ELSE '1' END) AS presence
+         FROM summary_claim_supports
+        WHERE claim_id = $1 AND ordinal = $2`,
+      [claim.id, initialSupportCount],
+    );
+    expect(stored.rows).toEqual([{ presence: '11111' }]);
+  });
+
+  it('rejects dangling, cross-run, cross-tenant, and partial summary support shapes', async () => {
+    const scope = await seedScope();
+    const source = await createSummary(scope);
+    const sameTenant = await createSummary(scope);
+    const crossTenant = await createSummary(await seedScope());
+    const sourceClaim = (
+      await pool.query<{
+        id: string;
+        claim_class: string;
+        support_count: number;
+      }>(
+        `SELECT id, claim_class, support_count FROM summary_claims
+          WHERE run_id = $1 AND claim_class = 'limitation'
+          ORDER BY section_order, claim_order LIMIT 1`,
+        [source.runId],
+      )
+    ).rows[0]!;
+    const targetFinding = async (runId: string) =>
+      (
+        await pool.query<{
+          id: string;
+          result_key: string;
+          rule_id: string;
+          rule_version: number;
+          source_fingerprint: string;
+        }>(
+          `SELECT result.id, result.result_key, result.rule_id, result.rule_version,
+                  projection.source_fingerprint
+             FROM finding_rule_results result
+             JOIN findings_run_projections projection ON projection.run_id = result.run_id
+            WHERE result.run_id = $1 ORDER BY result.catalog_order LIMIT 1`,
+          [runId],
+        )
+      ).rows[0]!;
+
+    const ownFinding = await targetFinding(source.runId);
+    const sameTenantFinding = await targetFinding(sameTenant.runId);
+    const crossTenantFinding = await targetFinding(crossTenant.runId);
+    const insertFindingSupport = (
+      client: PoolClient,
+      target: typeof ownFinding,
+      resultId = target.id,
+      sourceFingerprint = ownFinding.source_fingerprint,
+    ) =>
+      client.query(
+        `INSERT INTO summary_claim_supports
+          (organization_id, run_id, claim_id, claim_class, ordinal,
+           support_kind, finding_result_id, finding_result_key,
+           finding_rule_id, finding_rule_version, findings_source_fingerprint)
+         VALUES ($1, $2, $3, $4, $5, 'finding', $6, $7, $8, $9, $10)`,
+        [
+          source.organizationId,
+          source.runId,
+          sourceClaim.id,
+          sourceClaim.claim_class,
+          sourceClaim.support_count,
+          resultId,
+          target.result_key,
+          target.rule_id,
+          target.rule_version,
+          sourceFingerprint,
+        ],
+      );
+
+    await expectTransactionFailure(
+      (client) =>
+        client.query(
+          `INSERT INTO summary_claim_supports
+          (organization_id, run_id, claim_id, claim_class, ordinal,
+           support_kind, finding_result_id)
+         VALUES ($1, $2, $3, $4, $5, 'finding', $6)`,
+          [
+            source.organizationId,
+            source.runId,
+            sourceClaim.id,
+            sourceClaim.claim_class,
+            sourceClaim.support_count,
+            ownFinding.id,
+          ],
+        ),
+      { code: '23514', constraint: 'summary_supports_kind_check' },
+    );
+    await expectTransactionFailure(
+      (client) => insertFindingSupport(client, ownFinding, randomUUID()),
+      { code: '23503', constraint: 'summary_supports_finding_result_fkey' },
+    );
+    await expectTransactionFailure(
+      (client) => insertFindingSupport(client, sameTenantFinding),
+      { code: '23503', constraint: 'summary_supports_finding_result_fkey' },
+    );
+    await expectTransactionFailure(
+      (client) => insertFindingSupport(client, crossTenantFinding),
+      { code: '23503', constraint: 'summary_supports_finding_result_fkey' },
+    );
+    await expectTransactionFailure(
+      (client) =>
+        insertFindingSupport(
+          client,
+          ownFinding,
+          ownFinding.id,
+          sameTenantFinding.source_fingerprint,
+        ),
+      {
+        code: '23503',
+        constraint: 'summary_supports_findings_snapshot_fkey',
+      },
+    );
+
+    const observation = (
+      await pool.query<{
+        id: string;
+        claim_class: string;
+        support_count: number;
+      }>(
+        `SELECT id, claim_class, support_count FROM summary_claims
+          WHERE run_id = $1 AND claim_class = 'observation'
+          ORDER BY section_order, claim_order LIMIT 1`,
+        [source.runId],
+      )
+    ).rows[0]!;
+    const eventId = async (runId: string) =>
+      (
+        await pool.query<{ id: string }>(
+          'SELECT id FROM evidence_events WHERE run_id = $1 ORDER BY sequence LIMIT 1',
+          [runId],
+        )
+      ).rows[0]!.id;
+    const sameTenantEventId = await eventId(sameTenant.runId);
+    const crossTenantEventId = await eventId(crossTenant.runId);
+    const evidence = (await linkedArtifacts(source.runId))[0]!;
+
+    await expectTransactionFailure(
+      (client) =>
+        client.query(
+          `INSERT INTO summary_claim_supports
+          (organization_id, run_id, claim_id, claim_class, ordinal,
+           support_kind, finding_result_id, finding_result_key,
+           finding_rule_id, finding_rule_version, findings_source_fingerprint)
+         VALUES ($1, $2, $3, $4, $5, 'finding', $6, $7, $8, $9, $10)`,
+          [
+            source.organizationId,
+            source.runId,
+            observation.id,
+            observation.claim_class,
+            observation.support_count,
+            ownFinding.id,
+            ownFinding.result_key,
+            ownFinding.rule_id,
+            ownFinding.rule_version,
+            ownFinding.source_fingerprint,
+          ],
+        ),
+      { code: '23514', constraint: 'summary_supports_kind_check' },
+    );
+    await expectTransactionFailure(
+      (client) =>
+        client.query(
+          `INSERT INTO summary_claim_supports
+          (organization_id, run_id, claim_id, claim_class, ordinal,
+           support_kind, event_id, artifact_declaration_id)
+         VALUES ($1, $2, $3, $4, $5, 'evidence', $6, $7)`,
+          [
+            source.organizationId,
+            source.runId,
+            observation.id,
+            observation.claim_class,
+            observation.support_count,
+            evidence.eventId,
+            evidence.artifactId,
+          ],
+        ),
+      { code: '23514', constraint: 'summary_supports_kind_check' },
+    );
+    for (const invalidEventId of [
+      randomUUID(),
+      sameTenantEventId,
+      crossTenantEventId,
+    ])
+      await expectTransactionFailure(
+        (client) =>
+          client.query(
+            `INSERT INTO summary_claim_supports
+              (organization_id, run_id, claim_id, claim_class, ordinal,
+               support_kind, event_id)
+             VALUES ($1, $2, $3, $4, $5, 'evidence', $6)`,
+            [
+              source.organizationId,
+              source.runId,
+              observation.id,
+              observation.claim_class,
+              observation.support_count,
+              invalidEventId,
+            ],
+          ),
+        { code: '23503', constraint: 'summary_supports_org_run_event_fkey' },
+      );
+    await expectTransactionFailure(
+      (client) =>
+        client.query(
+          `INSERT INTO summary_claim_supports
+            (organization_id, run_id, claim_id, claim_class, ordinal,
+             support_kind, event_id, artifact_declaration_id,
+             event_artifact_pointer, json_pointer)
+           VALUES ($1, $2, $3, $4, $5, 'evidence', $6, $7, $8, $9)`,
+          [
+            source.organizationId,
+            source.runId,
+            observation.id,
+            observation.claim_class,
+            observation.support_count,
+            evidence.eventId,
+            evidence.artifactId,
+            `${evidence.eventArtifactPointer}/missing`,
+            '/tests/0',
+          ],
+        ),
+      {
+        code: '23503',
+        constraint: 'summary_supports_event_artifact_pointer_fkey',
+      },
+    );
+    await expectTransactionFailure(
+      async (client) => {
+        await client.query(
+          `INSERT INTO summary_claim_supports
+            (organization_id, run_id, claim_id, claim_class, ordinal,
+             support_kind, event_id, artifact_declaration_id,
+             event_artifact_pointer, json_pointer)
+           VALUES ($1, $2, $3, $4, $5, 'evidence', $6, $7, $8, $9)`,
+          [
+            source.organizationId,
+            source.runId,
+            observation.id,
+            observation.claim_class,
+            observation.support_count,
+            evidence.eventId,
+            evidence.artifactId,
+            evidence.eventArtifactPointer,
+            '/fixture-completeness',
+          ],
+        );
+        await client.query('SET CONSTRAINTS ALL IMMEDIATE');
+      },
+      { code: '23514', message: 'summary_claim_support_incomplete' },
+    );
+  });
+
+  it('defers incomplete support deletion and rolls back an incomplete finding replacement', async () => {
+    const summary = await createSummary(await seedScope());
+    const claim = (
+      await pool.query<{ id: string }>(
+        'SELECT id FROM summary_claims WHERE run_id = $1 ORDER BY section_order, claim_order LIMIT 1',
+        [summary.runId],
+      )
+    ).rows[0]!;
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        'DELETE FROM summary_claim_supports WHERE claim_id = $1',
+        [claim.id],
+      );
+      await expect(client.query('COMMIT')).rejects.toMatchObject({
+        code: '23514',
+        message: 'summary_claim_support_incomplete',
+      });
+    } finally {
+      await rollback(client);
+      client.release();
+    }
+    await expect(
+      pool.query('DELETE FROM finding_rule_results WHERE run_id = $1', [
+        summary.runId,
+      ]),
+    ).rejects.toMatchObject({
+      code: '23514',
+      message: 'findings_catalog_incomplete',
+    });
+    expect(
+      (
+        await pool.query<{ count: string }>(
+          'SELECT count(*)::text AS count FROM summary_run_projections WHERE run_id = $1',
+          [summary.runId],
+        )
+      ).rows[0]!.count,
+    ).toBe('1');
   });
 });

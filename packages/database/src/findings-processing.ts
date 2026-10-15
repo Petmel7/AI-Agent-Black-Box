@@ -38,6 +38,7 @@ export interface FindingsProcessingContext {
   signal?: AbortSignal;
   hooks?: {
     afterDependenciesRead?: () => void | Promise<void>;
+    afterSummaryInvalidated?: () => void | Promise<void>;
     afterResultsReplaced?: () => void | Promise<void>;
   };
 }
@@ -543,6 +544,13 @@ async function publish(
         existing.catalogVersion === CATALOG_VERSION,
       );
       if (!projectionCurrent) {
+        // Finding supports bind summaries to this exact snapshot. Invalidate the
+        // complete summary graph in the same transaction before any referenced
+        // finding identity or fingerprint can change.
+        await transaction.summaryRunProjection.deleteMany({
+          where: { runId: intent.runId },
+        });
+        await context.hooks?.afterSummaryInvalidated?.();
         await transaction.findingsRunProjection.upsert({
           where: { runId: intent.runId },
           create: {

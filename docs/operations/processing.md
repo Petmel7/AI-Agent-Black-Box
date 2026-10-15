@@ -1,4 +1,4 @@
-# Processing relay, core/files projections, and deterministic findings
+# Processing relay, core/files projections, findings, and summaries
 
 BBX-009A uses the standard-PostgreSQL `processing_intents` outbox and one private basic `pgmq` queue named `bbx_processing_v1`. Ingestion still commits evidence and exactly one pending intent without calling the queue.
 
@@ -43,6 +43,36 @@ event, artifact, and declaration pointer exactly; the entry pointer, ordinal,
 and opaque entry identity remain available for evidence navigation.
 
 The current catalog has one result for every V1 rule. `pass` requires all nine results to be clear with complete coverage, `review` requires at least one triggered result, and every triggered result has an immutable same-run event or event-plus-artifact reference. Processing failure, evidence incompleteness, observed run outcome, and deterministic outcome remain separate query fields. After correcting an underlying safe failure, use the bounded injected `replayFindingsIntent`; do not edit evidence or upstream projections.
+
+Summary projector v1 is the mandatory final production gate after findings and
+before exact-message archive. It uses the unchanged queue payload and publishes
+one structured current snapshot with ordered claims and typed supports. An
+observation terminates at immutable canonical evidence; an assessment or
+limitation binds to the exact same-tenant, same-run current finding result and
+findings source fingerprint. Finding replacement first invalidates the complete
+summary graph in the same transaction, so readers see a compatible complete
+summary or no current summary, never dangling or partially replaced support.
+Database mutation guards apply the same invalidation before any material
+findings projection, result, or evidence-reference write, including direct SQL.
+
+Exact summary replay returns `already_applied` and preserves summary and claim
+keys. A changed core, files, findings, generator, format, or template identity
+rebuilds the complete snapshot under the shared run-source lock. Stale core or
+findings cannot publish. Current incomplete evidence may publish `unknown` with
+visible supported limitations. A summary `pass` means only that the exact
+current deterministic findings catalog is fully clear with complete coverage;
+it is not correctness, merge safety, task completion, or policy approval.
+Claim and support pagination cursors are bound to the exact summary key (and,
+for supports, the exact claim key). A cursor from a replaced snapshot is
+rejected and must be restarted from the current first page.
+
+Summary processing uses the existing bounded projection lease, deadline,
+attempt, poison, cancellation, and shutdown settings. Recovery is the injected
+single-intent `replaySummaryIntent` after the underlying safe failure is fixed.
+Do not edit immutable evidence, upstream projections, findings, receipts, or
+summary rows directly. A crash after summary commit and before archive is safe:
+visibility redelivery observes the exact projector receipts and archives only
+after `core/files → findings → summary` succeeds again.
 
 ## Verified-artifact intent backfill
 

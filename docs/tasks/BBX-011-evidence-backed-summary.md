@@ -1,6 +1,6 @@
 # BBX-011: Evidence-Backed Summary
 
-- **Status:** Approved
+- **Status:** Done
 - **Owner:** Implementation Chat
 - **Review:** Review Chat
 - **Depends on:** BBX-010 completed at `c7fff7abac306b94c11407859be4affd0bbca42c`

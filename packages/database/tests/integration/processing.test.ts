@@ -10,11 +10,15 @@ import {
   ingestEvidenceBatch,
   listCoreRuns,
   listFindings,
+  listSummaryClaims,
+  listSummarySupports,
   processCoreIntent,
   processFindingsIntent,
+  processSummaryIntent,
   relayProcessingCycle,
   replayCoreIntent,
   replayFindingsIntent,
+  replaySummaryIntent,
   type ProcessingQueue,
 } from '../../src/index.js';
 
@@ -128,6 +132,40 @@ const findingsOptions = {
   retryBaseSeconds: 1,
   retryMaxSeconds: 1,
 };
+const summaryOptions = {
+  leaseSeconds: 10,
+  attemptTimeoutMs: 2_000,
+  transitionMarginMs: 100,
+  maxAttempts: 2,
+  retryBaseSeconds: 1,
+  retryMaxSeconds: 1,
+};
+
+async function readySummaryFixture(
+  requestedScope?: Awaited<ReturnType<typeof seed>>,
+) {
+  const scope = requestedScope ?? (await seed());
+  const handle = createDatabaseClient({ connectionString });
+  const accepted = batch();
+  await ingestEvidenceBatch(handle.client, { ...scope, batch: accepted });
+  const run = await handle.client.run.findUniqueOrThrow({
+    where: {
+      organizationId_canonicalRunId: {
+        organizationId: scope.organizationId,
+        canonicalRunId: accepted.runId,
+      },
+    },
+    select: { id: true },
+  });
+  const intent = await handle.client.processingIntent.findFirstOrThrow({
+    where: { organizationId: scope.organizationId, runId: run.id },
+    select: { id: true },
+  });
+  await processCoreIntent(handle.client, intent.id, options);
+  await processFindingsIntent(handle.client, intent.id, findingsOptions);
+  await processSummaryIntent(handle.client, intent.id, summaryOptions);
+  return { scope, handle, accepted, runId: run.id, intentId: intent.id };
+}
 
 async function failedFindingsFixture() {
   const scope = await seed();
@@ -335,6 +373,14 @@ describe('processing migration and core persistence', () => {
         select: { analyzerVersion: true },
       }),
     ).toEqual({ analyzerVersion: 1 });
+    await expect(
+      processSummaryIntent(handle.client, first.id, summaryOptions),
+    ).resolves.toBe('applied');
+    const initialSummary =
+      await handle.client.summaryRunProjection.findUniqueOrThrow({
+        where: { runId: run.id },
+        select: { summaryKey: true },
+      });
 
     await ingestEvidenceBatch(handle.client, {
       ...scope,
@@ -361,6 +407,20 @@ describe('processing migration and core persistence', () => {
       },
     );
     expect(rebuilt.sourceFingerprint).not.toBe(initial.sourceFingerprint);
+    expect(
+      await handle.client.summaryRunProjection.count({
+        where: { runId: run.id },
+      }),
+    ).toBe(0);
+    await expect(
+      processSummaryIntent(handle.client, first.id, summaryOptions),
+    ).resolves.toBe('applied');
+    const rebuiltSummary =
+      await handle.client.summaryRunProjection.findUniqueOrThrow({
+        where: { runId: run.id },
+        select: { summaryKey: true },
+      });
+    expect(rebuiltSummary.summaryKey).not.toBe(initialSummary.summaryKey);
     await expect(
       replayFindingsIntent(handle.client, first.id, findingsOptions),
     ).resolves.toBe('already_applied');
@@ -1343,5 +1403,1381 @@ describe('processing migration and core persistence', () => {
       }),
     ).toBe(0);
     await handle.dispose();
+  });
+
+  it('publishes, exactly replays, and tenant-safely pages a conservative summary', async () => {
+    const migration = await pool.query(
+      `SELECT 1 FROM _prisma_migrations WHERE migration_name = '20261013120000_evidence_backed_summaries' AND finished_at IS NOT NULL`,
+    );
+    expect(migration.rows).toHaveLength(1);
+    const own = await seed();
+    const other = await seed();
+    const handle = createDatabaseClient({ connectionString });
+    const accepted = batch();
+    await ingestEvidenceBatch(handle.client, { ...own, batch: accepted });
+    const run = await handle.client.run.findUniqueOrThrow({
+      where: {
+        organizationId_canonicalRunId: {
+          organizationId: own.organizationId,
+          canonicalRunId: accepted.runId,
+        },
+      },
+      select: { id: true },
+    });
+    const intent = await handle.client.processingIntent.findFirstOrThrow({
+      where: { organizationId: own.organizationId, runId: run.id },
+      select: { id: true },
+    });
+    await expect(
+      processCoreIntent(handle.client, intent.id, options),
+    ).resolves.toBe('applied');
+    await expect(
+      processFindingsIntent(handle.client, intent.id, findingsOptions),
+    ).resolves.toBe('applied');
+    await expect(
+      processSummaryIntent(handle.client, intent.id, summaryOptions),
+    ).resolves.toBe('applied');
+    const first = await handle.client.summaryRunProjection.findUniqueOrThrow({
+      where: { runId: run.id },
+      include: {
+        claims: { orderBy: [{ sectionOrder: 'asc' }, { claimOrder: 'asc' }] },
+      },
+    });
+    await expect(
+      processSummaryIntent(handle.client, intent.id, summaryOptions),
+    ).resolves.toBe('already_applied');
+    const replayed = await handle.client.summaryRunProjection.findUniqueOrThrow(
+      {
+        where: { runId: run.id },
+        include: {
+          claims: { orderBy: [{ sectionOrder: 'asc' }, { claimOrder: 'asc' }] },
+        },
+      },
+    );
+    expect(replayed.summaryKey).toBe(first.summaryKey);
+    expect(replayed.claims.map((claim) => claim.claimKey)).toEqual(
+      first.claims.map((claim) => claim.claimKey),
+    );
+    expect(replayed.summaryOutcome).toBe('unknown');
+    expect(
+      replayed.claims.some((claim) => claim.claimClass === 'limitation'),
+    ).toBe(true);
+
+    const page = await listSummaryClaims(handle.client, {
+      ...own,
+      canonicalRunId: accepted.runId,
+      limit: 2,
+    });
+    expect(page?.processingState).toBe('ready');
+    expect(page?.items).toHaveLength(2);
+    expect(page?.nextCursor).not.toBeNull();
+    const next = await listSummaryClaims(handle.client, {
+      ...own,
+      canonicalRunId: accepted.runId,
+      limit: 100,
+      cursor: page!.nextCursor!,
+    });
+    expect(next?.items.length).toBe(first.claimCount - 2);
+    const supported = first.claims.find((claim) => claim.supportCount > 0)!;
+    const supportPage = await listSummarySupports(handle.client, {
+      ...own,
+      canonicalRunId: accepted.runId,
+      claimKey: supported.claimKey,
+      limit: 1,
+    });
+    expect(supportPage?.items).toHaveLength(1);
+    await expect(
+      listSummaryClaims(handle.client, {
+        ...other,
+        canonicalRunId: accepted.runId,
+        limit: 10,
+      }),
+    ).resolves.toBeNull();
+    await handle.dispose();
+  });
+
+  it('keeps a current summary available after an exact-source replay attempt fails', async () => {
+    const fixture = await readySummaryFixture();
+    const foreign = await seed();
+    try {
+      const before =
+        await fixture.handle.client.summaryRunProjection.findUniqueOrThrow({
+          where: { runId: fixture.runId },
+          include: {
+            claims: {
+              orderBy: [{ sectionOrder: 'asc' }, { claimOrder: 'asc' }],
+              include: { supports: { orderBy: { ordinal: 'asc' } } },
+            },
+          },
+        });
+      await expect(
+        replaySummaryIntent(
+          fixture.handle.client,
+          fixture.intentId,
+          { ...summaryOptions, maxAttempts: 1 },
+          {
+            hooks: {
+              afterDependenciesRead: () => {
+                throw new Error('forced exact-source replay failure');
+              },
+            },
+          },
+        ),
+      ).resolves.toBe('failed');
+
+      const after =
+        await fixture.handle.client.summaryRunProjection.findUniqueOrThrow({
+          where: { runId: fixture.runId },
+          include: {
+            claims: {
+              orderBy: [{ sectionOrder: 'asc' }, { claimOrder: 'asc' }],
+              include: { supports: { orderBy: { ordinal: 'asc' } } },
+            },
+          },
+        });
+      expect(after).toEqual(before);
+
+      const claims = await listSummaryClaims(fixture.handle.client, {
+        ...fixture.scope,
+        canonicalRunId: fixture.accepted.runId,
+        limit: 100,
+      });
+      expect(claims).toMatchObject({
+        processingState: 'failed',
+        summaryAvailability: 'current',
+        processingErrorCode: 'summary_projection_failed',
+        outcome: before.summaryOutcome,
+        claimCount: before.claimCount,
+      });
+      expect(claims?.items).toHaveLength(before.claimCount);
+      const supported = claims!.items.find((claim) => claim.supportCount > 0)!;
+      const supports = await listSummarySupports(fixture.handle.client, {
+        ...fixture.scope,
+        canonicalRunId: fixture.accepted.runId,
+        claimKey: supported.claimKey,
+        limit: 100,
+      });
+      expect(supports).toMatchObject({
+        processingState: 'failed',
+        summaryAvailability: 'current',
+        processingErrorCode: 'summary_projection_failed',
+        claimKey: supported.claimKey,
+      });
+      expect(supports?.items).toHaveLength(supported.supportCount);
+
+      const detail = await getCoreRunDetail(fixture.handle.client, {
+        ...fixture.scope,
+        canonicalRunId: fixture.accepted.runId,
+        childLimit: 10,
+      });
+      expect(detail).toMatchObject({
+        summaryProcessingState: 'failed',
+        summaryAvailability: 'current',
+        summaryProcessingErrorCode: 'summary_projection_failed',
+        summaryOutcome: before.summaryOutcome,
+      });
+      const list = await listCoreRuns(fixture.handle.client, {
+        ...fixture.scope,
+        limit: 10,
+      });
+      expect(list.items[0]).toMatchObject({
+        summaryProcessingState: 'failed',
+        summaryAvailability: 'current',
+        summaryProcessingErrorCode: 'summary_projection_failed',
+        summaryOutcome: before.summaryOutcome,
+      });
+
+      const changed = incrementalBatch(fixture.accepted.runId, [
+        errorEvent(fixture.accepted.runId, 2, 'summary-dependency-changed'),
+      ]);
+      await ingestEvidenceBatch(fixture.handle.client, {
+        ...fixture.scope,
+        batch: changed,
+      });
+      const intent =
+        await fixture.handle.client.processingIntent.findFirstOrThrow({
+          where: {
+            runId: fixture.runId,
+            batch: { canonicalBatchId: changed.batchId },
+          },
+          select: { id: true },
+        });
+      await processCoreIntent(fixture.handle.client, intent.id, options);
+      const stale = await listSummaryClaims(fixture.handle.client, {
+        ...fixture.scope,
+        canonicalRunId: fixture.accepted.runId,
+        limit: 100,
+      });
+      expect(stale).toMatchObject({
+        processingState: 'failed',
+        summaryAvailability: 'stale',
+        outcome: null,
+        items: [],
+      });
+      await expect(
+        listSummaryClaims(fixture.handle.client, {
+          organizationId: foreign.organizationId,
+          repositoryId: foreign.repositoryId,
+          canonicalRunId: fixture.accepted.runId,
+          limit: 10,
+        }),
+      ).resolves.toBeNull();
+    } finally {
+      await fixture.handle.dispose();
+    }
+  });
+
+  it('allows only one live summary owner and rejects stale ownership before publication', async () => {
+    const own = await seed();
+    const first = createDatabaseClient({ connectionString });
+    const second = createDatabaseClient({ connectionString });
+    const accepted = batch();
+    await ingestEvidenceBatch(first.client, { ...own, batch: accepted });
+    const run = await first.client.run.findUniqueOrThrow({
+      where: {
+        organizationId_canonicalRunId: {
+          organizationId: own.organizationId,
+          canonicalRunId: accepted.runId,
+        },
+      },
+      select: { id: true },
+    });
+    const intent = await first.client.processingIntent.findFirstOrThrow({
+      where: { runId: run.id },
+      select: { id: true },
+    });
+    await processCoreIntent(first.client, intent.id, options);
+    await processFindingsIntent(first.client, intent.id, findingsOptions);
+
+    let ownerEntered!: () => void;
+    const entered = new Promise<void>((resolve) => {
+      ownerEntered = resolve;
+    });
+    let releaseOwner!: () => void;
+    const release = new Promise<void>((resolve) => {
+      releaseOwner = resolve;
+    });
+    const owner = processSummaryIntent(
+      first.client,
+      intent.id,
+      summaryOptions,
+      {
+        hooks: {
+          afterDependenciesRead: async () => {
+            ownerEntered();
+            await release;
+          },
+        },
+      },
+    );
+    await entered;
+    try {
+      await expect(
+        processSummaryIntent(second.client, intent.id, summaryOptions),
+      ).resolves.toBe('busy');
+    } finally {
+      releaseOwner();
+    }
+    await expect(owner).resolves.toBe('applied');
+    await expect(
+      processSummaryIntent(second.client, intent.id, summaryOptions, {
+        hooks: {
+          afterDependenciesRead: async () => {
+            await pool.query(
+              `UPDATE run_processing_states SET lease_id = $1
+               WHERE organization_id = $2 AND run_id = $3 AND projector_name = 'summary'`,
+              [randomUUID(), own.organizationId, run.id],
+            );
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'processing_lease_lost' });
+    expect(
+      await first.client.summaryRunProjection.count({
+        where: { runId: run.id },
+      }),
+    ).toBe(1);
+    await Promise.all([first.dispose(), second.dispose()]);
+  });
+
+  it('atomically rolls back findings-to-summary invalidation and rebuilds after replacement', async () => {
+    const own = await seed();
+    const handle = createDatabaseClient({ connectionString });
+    const accepted = batch();
+    await ingestEvidenceBatch(handle.client, { ...own, batch: accepted });
+    const run = await handle.client.run.findUniqueOrThrow({
+      where: {
+        organizationId_canonicalRunId: {
+          organizationId: own.organizationId,
+          canonicalRunId: accepted.runId,
+        },
+      },
+      select: { id: true },
+    });
+    const first = await handle.client.processingIntent.findFirstOrThrow({
+      where: { runId: run.id },
+      select: { id: true },
+    });
+    await processCoreIntent(handle.client, first.id, options);
+    await processFindingsIntent(handle.client, first.id, findingsOptions);
+    await processSummaryIntent(handle.client, first.id, summaryOptions);
+    const old = await handle.client.summaryRunProjection.findUniqueOrThrow({
+      where: { runId: run.id },
+      select: { summaryKey: true },
+    });
+
+    const late = incrementalBatch(accepted.runId, [
+      errorEvent(accepted.runId, 2, 'late-summary-source'),
+    ]);
+    await ingestEvidenceBatch(handle.client, { ...own, batch: late });
+    const second = await handle.client.processingIntent.findFirstOrThrow({
+      where: { runId: run.id, batch: { canonicalBatchId: late.batchId } },
+      select: { id: true },
+    });
+    await processCoreIntent(handle.client, second.id, options);
+    await expect(
+      processFindingsIntent(
+        handle.client,
+        second.id,
+        { ...findingsOptions, maxAttempts: 1 },
+        {
+          hooks: {
+            afterSummaryInvalidated: () => {
+              throw new Error('crash after summary invalidation');
+            },
+          },
+        },
+      ),
+    ).resolves.toBe('failed');
+    await expect(
+      handle.client.summaryRunProjection.findUniqueOrThrow({
+        where: { runId: run.id },
+        select: { summaryKey: true },
+      }),
+    ).resolves.toEqual(old);
+
+    await expect(
+      replayFindingsIntent(handle.client, second.id, findingsOptions),
+    ).resolves.toBe('applied');
+    expect(
+      await handle.client.summaryRunProjection.count({
+        where: { runId: run.id },
+      }),
+    ).toBe(0);
+    await expect(
+      processSummaryIntent(handle.client, second.id, summaryOptions),
+    ).resolves.toBe('applied');
+    const current = await handle.client.summaryRunProjection.findUniqueOrThrow({
+      where: { runId: run.id },
+      select: { summaryKey: true },
+    });
+    expect(current.summaryKey).not.toBe(old.summaryKey);
+    await handle.dispose();
+  });
+
+  it('rolls back a crash after claim replacement and recovers by explicit replay', async () => {
+    const own = await seed();
+    const handle = createDatabaseClient({ connectionString });
+    const accepted = batch();
+    await ingestEvidenceBatch(handle.client, { ...own, batch: accepted });
+    const run = await handle.client.run.findUniqueOrThrow({
+      where: {
+        organizationId_canonicalRunId: {
+          organizationId: own.organizationId,
+          canonicalRunId: accepted.runId,
+        },
+      },
+      select: { id: true },
+    });
+    const intent = await handle.client.processingIntent.findFirstOrThrow({
+      where: { runId: run.id },
+      select: { id: true },
+    });
+    await processCoreIntent(handle.client, intent.id, options);
+    await processFindingsIntent(handle.client, intent.id, findingsOptions);
+    await expect(
+      processSummaryIntent(
+        handle.client,
+        intent.id,
+        { ...summaryOptions, maxAttempts: 1 },
+        {
+          hooks: {
+            afterClaimsReplaced: () => {
+              throw new Error('crash after claims');
+            },
+          },
+        },
+      ),
+    ).resolves.toBe('failed');
+    expect(
+      await handle.client.summaryRunProjection.count({
+        where: { runId: run.id },
+      }),
+    ).toBe(0);
+    expect(
+      await handle.client.processingApplicationReceipt.count({
+        where: { intentId: intent.id, projectorName: 'summary' },
+      }),
+    ).toBe(0);
+    await expect(
+      replaySummaryIntent(handle.client, intent.id, summaryOptions),
+    ).resolves.toBe('applied');
+    await handle.dispose();
+  });
+
+  it('changes summary identity when the material findings graph changes without changing its dependency fingerprint', async () => {
+    const fixture = await readySummaryFixture();
+    try {
+      const candidates = (
+        await pool.query<{
+          id: string;
+          rule_id: string;
+        }>(
+          `SELECT id, rule_id FROM finding_rule_results
+            WHERE run_id = $1 AND severity = 'high'
+            ORDER BY catalog_order LIMIT 2`,
+          [fixture.runId],
+        )
+      ).rows;
+      expect(candidates).toHaveLength(2);
+      const eventId = (
+        await pool.query<{ id: string }>(
+          'SELECT id FROM evidence_events WHERE run_id = $1 ORDER BY sequence LIMIT 1',
+          [fixture.runId],
+        )
+      ).rows[0]!.id;
+      const prepare = await pool.connect();
+      try {
+        await prepare.query('BEGIN');
+        await prepare.query(
+          'DELETE FROM finding_evidence_references WHERE result_id = ANY($1::uuid[])',
+          [candidates.map((candidate) => candidate.id)],
+        );
+        await prepare.query(
+          `UPDATE finding_rule_results SET
+             outcome = CASE WHEN id = $2 THEN 'triggered' ELSE 'clear' END,
+             coverage = 'complete'
+           WHERE run_id = $1 AND id IN ($2, $3)`,
+          [fixture.runId, candidates[0]!.id, candidates[1]!.id],
+        );
+        await prepare.query(
+          `INSERT INTO finding_evidence_references
+            (organization_id, run_id, result_id, ordinal, event_id)
+           VALUES ($1, $2, $3, 0, $4)`,
+          [
+            fixture.scope.organizationId,
+            fixture.runId,
+            candidates[0]!.id,
+            eventId,
+          ],
+        );
+        await prepare.query(
+          `UPDATE findings_run_projections projection SET
+             deterministic_outcome = 'review',
+             coverage = CASE WHEN EXISTS (
+               SELECT 1 FROM finding_rule_results result
+                WHERE result.run_id = projection.run_id
+                  AND result.coverage = 'partial'
+             ) THEN 'partial' ELSE 'complete' END,
+             triggered_count = (SELECT count(*) FROM finding_rule_results result WHERE result.run_id = projection.run_id AND result.outcome = 'triggered'),
+             unknown_count = (SELECT count(*) FROM finding_rule_results result WHERE result.run_id = projection.run_id AND result.outcome = 'unknown'),
+             high_count = (SELECT count(*) FROM finding_rule_results result WHERE result.run_id = projection.run_id AND result.outcome = 'triggered' AND result.severity = 'high'),
+             medium_count = (SELECT count(*) FROM finding_rule_results result WHERE result.run_id = projection.run_id AND result.outcome = 'triggered' AND result.severity = 'medium')
+           WHERE run_id = $1`,
+          [fixture.runId],
+        );
+        await prepare.query('COMMIT');
+      } finally {
+        await prepare.query('ROLLBACK').catch(() => undefined);
+        prepare.release();
+      }
+      await expect(
+        processSummaryIntent(
+          fixture.handle.client,
+          fixture.intentId,
+          summaryOptions,
+        ),
+      ).resolves.toBe('applied');
+      const before =
+        await fixture.handle.client.summaryRunProjection.findUniqueOrThrow({
+          where: { runId: fixture.runId },
+          select: { summaryKey: true, sourceFingerprint: true },
+        });
+      const findingsBefore =
+        await fixture.handle.client.findingsRunProjection.findUniqueOrThrow({
+          where: { runId: fixture.runId },
+          select: { sourceFingerprint: true },
+        });
+      const claimPage = await listSummaryClaims(fixture.handle.client, {
+        ...fixture.scope,
+        canonicalRunId: fixture.accepted.runId,
+        limit: 1,
+      });
+      expect(claimPage?.nextCursor).not.toBeNull();
+      const allClaims = await listSummaryClaims(fixture.handle.client, {
+        ...fixture.scope,
+        canonicalRunId: fixture.accepted.runId,
+        limit: 100,
+      });
+      const multiSupportClaim = allClaims!.items.find(
+        (claim) => claim.supportCount > 1,
+      )!;
+      expect(multiSupportClaim).toBeDefined();
+      const supportPage = await listSummarySupports(fixture.handle.client, {
+        ...fixture.scope,
+        canonicalRunId: fixture.accepted.runId,
+        claimKey: multiSupportClaim.claimKey,
+        limit: 1,
+      });
+      expect(supportPage?.nextCursor).not.toBeNull();
+
+      const swap = await pool.connect();
+      try {
+        await swap.query('BEGIN');
+        await swap.query(
+          `INSERT INTO finding_evidence_references
+            (organization_id, run_id, result_id, ordinal, event_id)
+           VALUES ($1, $2, $3, 0, $4)`,
+          [
+            fixture.scope.organizationId,
+            fixture.runId,
+            candidates[1]!.id,
+            eventId,
+          ],
+        );
+        await swap.query(
+          `UPDATE finding_rule_results SET outcome = CASE
+             WHEN id = $2 THEN 'clear'
+             WHEN id = $3 THEN 'triggered'
+             ELSE outcome END
+           WHERE run_id = $1 AND id IN ($2, $3)`,
+          [fixture.runId, candidates[0]!.id, candidates[1]!.id],
+        );
+        await swap.query('COMMIT');
+      } catch (error) {
+        await swap.query('ROLLBACK');
+        throw error;
+      } finally {
+        swap.release();
+      }
+      expect(
+        await fixture.handle.client.summaryRunProjection.count({
+          where: { runId: fixture.runId },
+        }),
+      ).toBe(0);
+      await expect(
+        processFindingsIntent(
+          fixture.handle.client,
+          fixture.intentId,
+          findingsOptions,
+        ),
+      ).resolves.toBe('already_applied');
+      expect(
+        await fixture.handle.client.findingsRunProjection.findUniqueOrThrow({
+          where: { runId: fixture.runId },
+          select: { sourceFingerprint: true },
+        }),
+      ).toEqual(findingsBefore);
+
+      await expect(
+        processSummaryIntent(
+          fixture.handle.client,
+          fixture.intentId,
+          summaryOptions,
+        ),
+      ).resolves.toBe('applied');
+      const after =
+        await fixture.handle.client.summaryRunProjection.findUniqueOrThrow({
+          where: { runId: fixture.runId },
+          select: { summaryKey: true, sourceFingerprint: true },
+        });
+      expect(after.summaryKey).not.toBe(before.summaryKey);
+      expect(after.sourceFingerprint).not.toBe(before.sourceFingerprint);
+      const incompatible = await pool.query<{ count: string }>(
+        `SELECT count(*)::text AS count
+           FROM summary_claim_supports support
+           JOIN finding_rule_results result ON result.id = support.finding_result_id
+           JOIN findings_run_projections projection ON projection.run_id = support.run_id
+          WHERE support.run_id = $1 AND support.support_kind = 'finding'
+            AND (support.finding_result_key IS DISTINCT FROM result.result_key
+              OR support.finding_rule_id IS DISTINCT FROM result.rule_id
+              OR support.finding_rule_version IS DISTINCT FROM result.rule_version
+              OR support.findings_source_fingerprint IS DISTINCT FROM projection.source_fingerprint)`,
+        [fixture.runId],
+      );
+      expect(incompatible.rows[0]!.count).toBe('0');
+      await expect(
+        listSummaryClaims(fixture.handle.client, {
+          ...fixture.scope,
+          canonicalRunId: fixture.accepted.runId,
+          limit: 1,
+          cursor: claimPage!.nextCursor!,
+        }),
+      ).rejects.toThrow('stale snapshot');
+      await expect(
+        listSummarySupports(fixture.handle.client, {
+          ...fixture.scope,
+          canonicalRunId: fixture.accepted.runId,
+          claimKey: multiSupportClaim.claimKey,
+          limit: 1,
+          cursor: supportPage!.nextCursor!,
+        }),
+      ).rejects.toThrow('stale snapshot');
+
+      const rebuilt =
+        await fixture.handle.client.summaryRunProjection.findUniqueOrThrow({
+          where: { runId: fixture.runId },
+          include: {
+            claims: {
+              orderBy: [{ sectionOrder: 'asc' }, { claimOrder: 'asc' }],
+              include: { supports: { orderBy: { ordinal: 'asc' } } },
+            },
+          },
+        });
+      await expect(
+        processSummaryIntent(
+          fixture.handle.client,
+          fixture.intentId,
+          summaryOptions,
+        ),
+      ).resolves.toBe('already_applied');
+      expect(
+        await fixture.handle.client.summaryRunProjection.findUniqueOrThrow({
+          where: { runId: fixture.runId },
+          include: {
+            claims: {
+              orderBy: [{ sectionOrder: 'asc' }, { claimOrder: 'asc' }],
+              include: { supports: { orderBy: { ordinal: 'asc' } } },
+            },
+          },
+        }),
+      ).toEqual(rebuilt);
+    } finally {
+      await fixture.handle.dispose();
+    }
+  });
+
+  it('binds claim pagination to one summary snapshot and keeps exact replay traversal stable', async () => {
+    const first = await readySummaryFixture();
+    const secondRun = await readySummaryFixture(first.scope);
+    const foreign = await readySummaryFixture();
+    try {
+      const firstPage = await listSummaryClaims(first.handle.client, {
+        ...first.scope,
+        canonicalRunId: first.accepted.runId,
+        limit: 1,
+      });
+      expect(firstPage?.nextCursor).not.toBeNull();
+      const cursor = firstPage!.nextCursor!;
+
+      await expect(
+        processSummaryIntent(
+          first.handle.client,
+          first.intentId,
+          summaryOptions,
+        ),
+      ).resolves.toBe('already_applied');
+      const replayPage = await listSummaryClaims(first.handle.client, {
+        ...first.scope,
+        canonicalRunId: first.accepted.runId,
+        limit: 100,
+        cursor,
+      });
+      expect(replayPage?.items.length).toBeGreaterThan(0);
+      expect(replayPage?.nextCursor).toBeNull();
+
+      for (const malformed of ['%%%', 'a'.repeat(1_025)])
+        await expect(
+          listSummaryClaims(first.handle.client, {
+            ...first.scope,
+            canonicalRunId: first.accepted.runId,
+            limit: 1,
+            cursor: malformed,
+          }),
+        ).rejects.toThrow('Invalid summary claim pagination cursor');
+
+      await expect(
+        listSummaryClaims(secondRun.handle.client, {
+          ...first.scope,
+          canonicalRunId: secondRun.accepted.runId,
+          limit: 1,
+          cursor,
+        }),
+      ).rejects.toThrow('stale snapshot');
+      await expect(
+        listSummaryClaims(foreign.handle.client, {
+          ...foreign.scope,
+          canonicalRunId: foreign.accepted.runId,
+          limit: 1,
+          cursor,
+        }),
+      ).rejects.toThrow('stale snapshot');
+      await expect(
+        listSummaryClaims(foreign.handle.client, {
+          ...foreign.scope,
+          canonicalRunId: first.accepted.runId,
+          limit: 1,
+          cursor,
+        }),
+      ).resolves.toBeNull();
+
+      const traverse = async () => {
+        const keys: string[] = [];
+        let nextCursor: string | undefined;
+        do {
+          const page = await listSummaryClaims(first.handle.client, {
+            ...first.scope,
+            canonicalRunId: first.accepted.runId,
+            limit: 2,
+            ...(nextCursor ? { cursor: nextCursor } : {}),
+          });
+          keys.push(...page!.items.map((item) => item.claimKey));
+          nextCursor = page!.nextCursor ?? undefined;
+        } while (nextCursor);
+        return keys;
+      };
+      expect(await traverse()).toEqual(await traverse());
+    } finally {
+      await Promise.all([
+        first.handle.dispose(),
+        secondRun.handle.dispose(),
+        foreign.handle.dispose(),
+      ]);
+    }
+  });
+
+  it('binds support pagination to the exact summary and claim with stable complete traversal', async () => {
+    const first = await readySummaryFixture();
+    const secondRun = await readySummaryFixture(first.scope);
+    const foreign = await readySummaryFixture();
+    try {
+      const claimsFor = async (
+        fixture: Awaited<ReturnType<typeof readySummaryFixture>>,
+      ) =>
+        listSummaryClaims(fixture.handle.client, {
+          ...fixture.scope,
+          canonicalRunId: fixture.accepted.runId,
+          limit: 100,
+        });
+      const firstClaims = await claimsFor(first);
+      const claim = firstClaims!.items.find((item) => item.supportCount > 1)!;
+      const otherClaim = firstClaims!.items.find(
+        (item) => item.claimKey !== claim.claimKey,
+      )!;
+      expect(claim).toBeDefined();
+      expect(otherClaim).toBeDefined();
+      const firstPage = await listSummarySupports(first.handle.client, {
+        ...first.scope,
+        canonicalRunId: first.accepted.runId,
+        claimKey: claim.claimKey,
+        limit: 1,
+      });
+      expect(firstPage).toMatchObject({
+        summaryAvailability: 'current',
+        claimKey: claim.claimKey,
+      });
+      expect(firstPage?.items).toHaveLength(1);
+      expect(firstPage?.nextCursor).not.toBeNull();
+      const cursor = firstPage!.nextCursor!;
+
+      await expect(
+        processSummaryIntent(
+          first.handle.client,
+          first.intentId,
+          summaryOptions,
+        ),
+      ).resolves.toBe('already_applied');
+      const continued = await listSummarySupports(first.handle.client, {
+        ...first.scope,
+        canonicalRunId: first.accepted.runId,
+        claimKey: claim.claimKey,
+        limit: 100,
+        cursor,
+      });
+      expect(continued?.items).toHaveLength(claim.supportCount - 1);
+      expect(continued?.nextCursor).toBeNull();
+
+      const traverse = async () => {
+        const ordinals: number[] = [];
+        let nextCursor: string | undefined;
+        do {
+          const page = await listSummarySupports(first.handle.client, {
+            ...first.scope,
+            canonicalRunId: first.accepted.runId,
+            claimKey: claim.claimKey,
+            limit: 1,
+            ...(nextCursor ? { cursor: nextCursor } : {}),
+          });
+          ordinals.push(...page!.items.map((item) => item.ordinal));
+          nextCursor = page!.nextCursor ?? undefined;
+        } while (nextCursor);
+        return ordinals;
+      };
+      const traversal = await traverse();
+      expect(traversal).toHaveLength(claim.supportCount);
+      expect(new Set(traversal).size).toBe(claim.supportCount);
+      expect(traversal).toEqual(
+        Array.from({ length: claim.supportCount }, (_, ordinal) => ordinal),
+      );
+      expect(await traverse()).toEqual(traversal);
+
+      for (const malformed of ['%%%', 'a'.repeat(1_025)])
+        await expect(
+          listSummarySupports(first.handle.client, {
+            ...first.scope,
+            canonicalRunId: first.accepted.runId,
+            claimKey: claim.claimKey,
+            limit: 1,
+            cursor: malformed,
+          }),
+        ).rejects.toThrow('Invalid summary support pagination cursor');
+      await expect(
+        listSummarySupports(first.handle.client, {
+          ...first.scope,
+          canonicalRunId: first.accepted.runId,
+          claimKey: otherClaim.claimKey,
+          limit: 1,
+          cursor,
+        }),
+      ).rejects.toThrow('stale snapshot');
+
+      const secondClaims = await claimsFor(secondRun);
+      const secondClaim = secondClaims!.items.find(
+        (item) => item.supportCount > 1,
+      )!;
+      await expect(
+        listSummarySupports(secondRun.handle.client, {
+          ...secondRun.scope,
+          canonicalRunId: secondRun.accepted.runId,
+          claimKey: secondClaim.claimKey,
+          limit: 1,
+          cursor,
+        }),
+      ).rejects.toThrow('stale snapshot');
+      const foreignClaims = await claimsFor(foreign);
+      const foreignClaim = foreignClaims!.items.find(
+        (item) => item.supportCount > 1,
+      )!;
+      await expect(
+        listSummarySupports(foreign.handle.client, {
+          ...foreign.scope,
+          canonicalRunId: foreign.accepted.runId,
+          claimKey: foreignClaim.claimKey,
+          limit: 1,
+          cursor,
+        }),
+      ).rejects.toThrow('stale snapshot');
+      await expect(
+        listSummarySupports(foreign.handle.client, {
+          ...foreign.scope,
+          canonicalRunId: first.accepted.runId,
+          claimKey: claim.claimKey,
+          limit: 1,
+          cursor,
+        }),
+      ).resolves.toBeNull();
+    } finally {
+      await Promise.all([
+        first.handle.dispose(),
+        secondRun.handle.dispose(),
+        foreign.handle.dispose(),
+      ]);
+    }
+  });
+
+  it('rejects a claim cursor after replacement between pages', async () => {
+    const fixture = await readySummaryFixture();
+    try {
+      const highSequence = incrementalBatch(fixture.accepted.runId, [
+        errorEvent(fixture.accepted.runId, 4, 'higher-sequence-first'),
+      ]);
+      await ingestEvidenceBatch(fixture.handle.client, {
+        ...fixture.scope,
+        batch: highSequence,
+      });
+      const highIntent =
+        await fixture.handle.client.processingIntent.findFirstOrThrow({
+          where: {
+            runId: fixture.runId,
+            batch: { canonicalBatchId: highSequence.batchId },
+          },
+          select: { id: true },
+        });
+      await processCoreIntent(fixture.handle.client, highIntent.id, options);
+      await processFindingsIntent(
+        fixture.handle.client,
+        highIntent.id,
+        findingsOptions,
+      );
+      await processSummaryIntent(
+        fixture.handle.client,
+        highIntent.id,
+        summaryOptions,
+      );
+      const page = await listSummaryClaims(fixture.handle.client, {
+        ...fixture.scope,
+        canonicalRunId: fixture.accepted.runId,
+        limit: 1,
+      });
+      const cursor = page!.nextCursor!;
+      const prior =
+        await fixture.handle.client.summaryRunProjection.findUniqueOrThrow({
+          where: { runId: fixture.runId },
+          select: { summaryKey: true },
+        });
+      const late = incrementalBatch(fixture.accepted.runId, [
+        errorEvent(fixture.accepted.runId, 2, 'late-lower-sequence'),
+      ]);
+      await ingestEvidenceBatch(fixture.handle.client, {
+        ...fixture.scope,
+        batch: late,
+      });
+      const intent =
+        await fixture.handle.client.processingIntent.findFirstOrThrow({
+          where: {
+            runId: fixture.runId,
+            batch: { canonicalBatchId: late.batchId },
+          },
+          select: { id: true },
+        });
+      await processCoreIntent(fixture.handle.client, intent.id, options);
+      await processFindingsIntent(
+        fixture.handle.client,
+        intent.id,
+        findingsOptions,
+      );
+      await processSummaryIntent(
+        fixture.handle.client,
+        intent.id,
+        summaryOptions,
+      );
+      const current =
+        await fixture.handle.client.summaryRunProjection.findUniqueOrThrow({
+          where: { runId: fixture.runId },
+          select: { summaryKey: true },
+        });
+      expect(current.summaryKey).not.toBe(prior.summaryKey);
+      await expect(
+        listSummaryClaims(fixture.handle.client, {
+          ...fixture.scope,
+          canonicalRunId: fixture.accepted.runId,
+          limit: 1,
+          cursor,
+        }),
+      ).rejects.toThrow('stale snapshot');
+    } finally {
+      await fixture.handle.dispose();
+    }
+  });
+
+  it('rejects a support cursor after summary replacement between pages', async () => {
+    const fixture = await readySummaryFixture();
+    try {
+      const claims = await listSummaryClaims(fixture.handle.client, {
+        ...fixture.scope,
+        canonicalRunId: fixture.accepted.runId,
+        limit: 100,
+      });
+      const claim = claims!.items.find((item) => item.supportCount > 1)!;
+      const page = await listSummarySupports(fixture.handle.client, {
+        ...fixture.scope,
+        canonicalRunId: fixture.accepted.runId,
+        claimKey: claim.claimKey,
+        limit: 1,
+      });
+      expect(page?.nextCursor).not.toBeNull();
+      const late = incrementalBatch(fixture.accepted.runId, [
+        errorEvent(fixture.accepted.runId, 2, 'support-page-replacement'),
+      ]);
+      await ingestEvidenceBatch(fixture.handle.client, {
+        ...fixture.scope,
+        batch: late,
+      });
+      const intent =
+        await fixture.handle.client.processingIntent.findFirstOrThrow({
+          where: {
+            runId: fixture.runId,
+            batch: { canonicalBatchId: late.batchId },
+          },
+          select: { id: true },
+        });
+      await processCoreIntent(fixture.handle.client, intent.id, options);
+      await processFindingsIntent(
+        fixture.handle.client,
+        intent.id,
+        findingsOptions,
+      );
+      await processSummaryIntent(
+        fixture.handle.client,
+        intent.id,
+        summaryOptions,
+      );
+      await expect(
+        listSummarySupports(fixture.handle.client, {
+          ...fixture.scope,
+          canonicalRunId: fixture.accepted.runId,
+          claimKey: claim.claimKey,
+          limit: 1,
+          cursor: page!.nextCursor!,
+        }),
+      ).rejects.toThrow('stale snapshot');
+    } finally {
+      await fixture.handle.dispose();
+    }
+  });
+
+  it('keeps one repeatable-read support page coherent while replacement commits', async () => {
+    const fixture = await readySummaryFixture();
+    const writer = createDatabaseClient({ connectionString });
+    try {
+      const claims = await listSummaryClaims(fixture.handle.client, {
+        ...fixture.scope,
+        canonicalRunId: fixture.accepted.runId,
+        limit: 100,
+      });
+      const claim = claims!.items.find((item) => item.supportCount > 1)!;
+      const prior =
+        await fixture.handle.client.summaryRunProjection.findUniqueOrThrow({
+          where: { runId: fixture.runId },
+          select: { summaryKey: true },
+        });
+      let replacementKey: string | null = null;
+      const page = await listSummarySupports(
+        fixture.handle.client,
+        {
+          ...fixture.scope,
+          canonicalRunId: fixture.accepted.runId,
+          claimKey: claim.claimKey,
+          limit: 1,
+        },
+        {
+          afterBaseRead: async () => {
+            const late = incrementalBatch(fixture.accepted.runId, [
+              errorEvent(
+                fixture.accepted.runId,
+                2,
+                'repeatable-read-support-late',
+              ),
+            ]);
+            await ingestEvidenceBatch(writer.client, {
+              ...fixture.scope,
+              batch: late,
+            });
+            const intent =
+              await writer.client.processingIntent.findFirstOrThrow({
+                where: {
+                  runId: fixture.runId,
+                  batch: { canonicalBatchId: late.batchId },
+                },
+                select: { id: true },
+              });
+            await processCoreIntent(writer.client, intent.id, options);
+            await processFindingsIntent(
+              writer.client,
+              intent.id,
+              findingsOptions,
+            );
+            await processSummaryIntent(
+              writer.client,
+              intent.id,
+              summaryOptions,
+            );
+            replacementKey = (
+              await writer.client.summaryRunProjection.findUniqueOrThrow({
+                where: { runId: fixture.runId },
+                select: { summaryKey: true },
+              })
+            ).summaryKey;
+          },
+        },
+      );
+      expect(page).toMatchObject({
+        summaryAvailability: 'current',
+        claimKey: claim.claimKey,
+      });
+      expect(page?.items).toHaveLength(1);
+      expect(page?.nextCursor).not.toBeNull();
+      expect(replacementKey).not.toBeNull();
+      expect(replacementKey).not.toBe(prior.summaryKey);
+      await expect(
+        listSummarySupports(fixture.handle.client, {
+          ...fixture.scope,
+          canonicalRunId: fixture.accepted.runId,
+          claimKey: claim.claimKey,
+          limit: 1,
+          cursor: page!.nextCursor!,
+        }),
+      ).rejects.toThrow('stale snapshot');
+    } finally {
+      await Promise.all([fixture.handle.dispose(), writer.dispose()]);
+    }
+  });
+
+  it('keeps one repeatable-read claim page coherent while replacement commits', async () => {
+    const fixture = await readySummaryFixture();
+    const writer = createDatabaseClient({ connectionString });
+    try {
+      let replacementKey: string | null = null;
+      const page = await listSummaryClaims(
+        fixture.handle.client,
+        {
+          ...fixture.scope,
+          canonicalRunId: fixture.accepted.runId,
+          limit: 1,
+        },
+        {
+          afterBaseRead: async () => {
+            const late = incrementalBatch(fixture.accepted.runId, [
+              errorEvent(fixture.accepted.runId, 2, 'repeatable-read-late'),
+            ]);
+            await ingestEvidenceBatch(writer.client, {
+              ...fixture.scope,
+              batch: late,
+            });
+            const intent =
+              await writer.client.processingIntent.findFirstOrThrow({
+                where: {
+                  runId: fixture.runId,
+                  batch: { canonicalBatchId: late.batchId },
+                },
+                select: { id: true },
+              });
+            await processCoreIntent(writer.client, intent.id, options);
+            await processFindingsIntent(
+              writer.client,
+              intent.id,
+              findingsOptions,
+            );
+            await processSummaryIntent(
+              writer.client,
+              intent.id,
+              summaryOptions,
+            );
+            replacementKey = (
+              await writer.client.summaryRunProjection.findUniqueOrThrow({
+                where: { runId: fixture.runId },
+                select: { summaryKey: true },
+              })
+            ).summaryKey;
+          },
+        },
+      );
+      expect(page?.processingState).toBe('ready');
+      expect(page?.items).toHaveLength(1);
+      expect(replacementKey).not.toBeNull();
+      await expect(
+        listSummaryClaims(fixture.handle.client, {
+          ...fixture.scope,
+          canonicalRunId: fixture.accepted.runId,
+          limit: 1,
+          cursor: page!.nextCursor!,
+        }),
+      ).rejects.toThrow('stale snapshot');
+    } finally {
+      await Promise.all([fixture.handle.dispose(), writer.dispose()]);
+    }
+  });
+
+  it('recovers a failed summary from a later valid intent with the current source', async () => {
+    const fixture = await readySummaryFixture();
+    try {
+      await fixture.handle.client.summaryRunProjection.delete({
+        where: { runId: fixture.runId },
+      });
+      await fixture.handle.client.processingApplicationReceipt.deleteMany({
+        where: {
+          intentId: fixture.intentId,
+          projectorName: 'summary',
+        },
+      });
+      await expect(
+        processSummaryIntent(
+          fixture.handle.client,
+          fixture.intentId,
+          { ...summaryOptions, maxAttempts: 1 },
+          {
+            hooks: {
+              afterDependenciesRead: () => {
+                throw new Error('exhaust first summary intent');
+              },
+            },
+          },
+        ),
+      ).resolves.toBe('failed');
+      const duplicate = EvidenceBatchSchema.parse({
+        ...fixture.accepted,
+        batchId: randomUUID(),
+        sentAt: '2026-10-01T00:00:04.000Z',
+      });
+      await ingestEvidenceBatch(fixture.handle.client, {
+        ...fixture.scope,
+        batch: duplicate,
+      });
+      const later =
+        await fixture.handle.client.processingIntent.findFirstOrThrow({
+          where: {
+            runId: fixture.runId,
+            batch: { canonicalBatchId: duplicate.batchId },
+          },
+          select: { id: true },
+        });
+      await processCoreIntent(fixture.handle.client, later.id, options);
+      await processFindingsIntent(
+        fixture.handle.client,
+        later.id,
+        findingsOptions,
+      );
+      await expect(
+        processSummaryIntent(fixture.handle.client, later.id, summaryOptions),
+      ).resolves.toBe('applied');
+    } finally {
+      await fixture.handle.dispose();
+    }
+  });
+
+  it.each([
+    ['deadline expiry', false],
+    ['cancellation', true],
+  ] as const)('rolls back summary publication on %s', async (_name, cancel) => {
+    const fixture = await readySummaryFixture();
+    const controller = new AbortController();
+    try {
+      await fixture.handle.client.summaryRunProjection.delete({
+        where: { runId: fixture.runId },
+      });
+      await fixture.handle.client.processingApplicationReceipt.deleteMany({
+        where: {
+          intentId: fixture.intentId,
+          projectorName: 'summary',
+        },
+      });
+      const result = await processSummaryIntent(
+        fixture.handle.client,
+        fixture.intentId,
+        {
+          ...summaryOptions,
+          leaseSeconds: 1,
+          attemptTimeoutMs: 50,
+          transitionMarginMs: 50,
+          maxAttempts: 1,
+        },
+        {
+          signal: controller.signal,
+          hooks: {
+            afterDependenciesRead: async () => {
+              if (cancel) controller.abort();
+              else await new Promise((resolve) => setTimeout(resolve, 75));
+            },
+          },
+        },
+      );
+      expect(result).toBe('failed');
+      expect(
+        await fixture.handle.client.summaryRunProjection.count({
+          where: { runId: fixture.runId },
+        }),
+      ).toBe(0);
+      expect(
+        await fixture.handle.client.processingApplicationReceipt.count({
+          where: {
+            intentId: fixture.intentId,
+            projectorName: 'summary',
+          },
+        }),
+      ).toBe(0);
+    } finally {
+      await fixture.handle.dispose();
+    }
+  });
+
+  it('serializes summary publication with a concurrent upstream findings replacement', async () => {
+    const fixture = await readySummaryFixture();
+    const second = createDatabaseClient({ connectionString });
+    try {
+      const previous =
+        await fixture.handle.client.summaryRunProjection.findUniqueOrThrow({
+          where: { runId: fixture.runId },
+          select: { summaryKey: true },
+        });
+      const late = incrementalBatch(fixture.accepted.runId, [
+        errorEvent(fixture.accepted.runId, 2, 'concurrent-findings-source'),
+      ]);
+      await ingestEvidenceBatch(fixture.handle.client, {
+        ...fixture.scope,
+        batch: late,
+      });
+      const intent =
+        await fixture.handle.client.processingIntent.findFirstOrThrow({
+          where: {
+            runId: fixture.runId,
+            batch: { canonicalBatchId: late.batchId },
+          },
+          select: { id: true },
+        });
+      await processCoreIntent(fixture.handle.client, intent.id, options);
+      let invalidated!: () => void;
+      const atInvalidation = new Promise<void>((resolve) => {
+        invalidated = resolve;
+      });
+      let release!: () => void;
+      const continueReplacement = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const replacement = processFindingsIntent(
+        fixture.handle.client,
+        intent.id,
+        findingsOptions,
+        {
+          hooks: {
+            afterSummaryInvalidated: async () => {
+              invalidated();
+              await continueReplacement;
+            },
+          },
+        },
+      );
+      await atInvalidation;
+      const summary = processSummaryIntent(
+        second.client,
+        intent.id,
+        summaryOptions,
+      );
+      let processing = false;
+      for (let attempt = 0; attempt < 50 && !processing; attempt += 1) {
+        processing =
+          (
+            await second.client.runProcessingState.findUnique({
+              where: {
+                organizationId_runId_projectorName: {
+                  organizationId: fixture.scope.organizationId,
+                  runId: fixture.runId,
+                  projectorName: 'summary',
+                },
+              },
+              select: { state: true },
+            })
+          )?.state === 'PROCESSING';
+        if (!processing)
+          await new Promise((resolve) => setTimeout(resolve, 10));
+      }
+      expect(processing).toBe(true);
+      release();
+      await expect(replacement).resolves.toBe('applied');
+      await expect(summary).resolves.toBe('applied');
+      const current =
+        await second.client.summaryRunProjection.findUniqueOrThrow({
+          where: { runId: fixture.runId },
+          select: { summaryKey: true, findingsFingerprint: true },
+        });
+      const findings =
+        await second.client.findingsRunProjection.findUniqueOrThrow({
+          where: { runId: fixture.runId },
+          select: { sourceFingerprint: true },
+        });
+      expect(current.summaryKey).not.toBe(previous.summaryKey);
+      expect(current.findingsFingerprint).toBe(findings.sourceFingerprint);
+    } finally {
+      await Promise.all([fixture.handle.dispose(), second.dispose()]);
+    }
   });
 });

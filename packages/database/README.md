@@ -27,6 +27,15 @@ state, and current core projections without weakening raw append-only guards.
 Queue access is explicit and injected; importing or constructing a client does
 not connect.
 
+BBX-011 adds the current summary projection, ordered material claims, and typed
+evidence/finding supports. `processSummaryIntent` and `replaySummaryIntent`
+publish only from current compatible core/files/findings dependencies.
+`listSummaryClaims` and `listSummarySupports` are tenant-scoped,
+repeatable-read query boundaries; they expose no HTTP or UI behavior. Finding
+replacement invalidates the complete summary graph atomically before referenced
+results change. Claim/support cursors carry the exact summary identity and are
+rejected after replacement instead of traversing across snapshots.
+
 The BBX-005 migration adds mutable artifact-upload attempts, bounded verification
 leases, terminal integrity observations, partial uniqueness for active and
 verified attempts, and migration-owned legal-transition guards. These rows are

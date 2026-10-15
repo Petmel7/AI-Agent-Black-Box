@@ -8,10 +8,12 @@ import {
   processCoreIntent,
   processFilesIntent,
   processFindingsIntent,
+  processSummaryIntent,
   relayProcessingCycle,
   type CoreProcessingOptions,
   type FileProcessingOptions,
   type FindingsProcessingOptions,
+  type SummaryProcessingOptions,
   type DatabaseClient,
   type ProcessingQueue,
   type RelayOptions,
@@ -30,6 +32,7 @@ export interface ProductionWorkerConfig {
   processing: CoreProcessingOptions;
   filesProcessing: FileProcessingOptions;
   findingsProcessing: FindingsProcessingOptions;
+  summaryProcessing: SummaryProcessingOptions;
   storage: {
     url: string;
     serviceRoleKey: string;
@@ -49,6 +52,7 @@ export interface ProcessingConsumerConfig {
   poisonReadLimit: number;
   filesProcessing?: FileProcessingOptions;
   findingsProcessing: FindingsProcessingOptions;
+  summaryProcessing: SummaryProcessingOptions;
   artifactReader?: Parameters<typeof processFilesIntent>[2];
 }
 
@@ -57,6 +61,7 @@ export interface ProcessingConsumerHooks {
   processIntent?: typeof processCoreIntent;
   processFilesIntent?: typeof processFilesIntent;
   processFindingsIntent?: typeof processFindingsIntent;
+  processSummaryIntent?: typeof processSummaryIntent;
 }
 
 async function dispatchProcessingIntent(
@@ -69,6 +74,15 @@ async function dispatchProcessingIntent(
   if (!config.findingsProcessing) {
     const error = new Error(
       'findings_processing_configuration_required',
+    ) as Error & {
+      retryable: boolean;
+    };
+    error.retryable = false;
+    throw error;
+  }
+  if (!config.summaryProcessing) {
+    const error = new Error(
+      'summary_processing_configuration_required',
     ) as Error & {
       retryable: boolean;
     };
@@ -113,13 +127,19 @@ async function dispatchProcessingIntent(
     error.retryable = false;
     throw error;
   }
-  if (result === 'applied' || result === 'already_applied')
-    return (hooks.processFindingsIntent ?? processFindingsIntent)(
-      client,
-      intentId,
-      config.findingsProcessing,
-      signal ? { signal } : {},
-    );
+  if (result === 'applied' || result === 'already_applied') {
+    const findingsResult = await (
+      hooks.processFindingsIntent ?? processFindingsIntent
+    )(client, intentId, config.findingsProcessing, signal ? { signal } : {});
+    if (findingsResult === 'applied' || findingsResult === 'already_applied')
+      return (hooks.processSummaryIntent ?? processSummaryIntent)(
+        client,
+        intentId,
+        config.summaryProcessing,
+        signal ? { signal } : {},
+      );
+    return findingsResult;
+  }
   return result;
 }
 
@@ -214,7 +234,8 @@ export function createProductionWorker(
   if (
     config.visibilityTimeoutSeconds <= config.processing.leaseSeconds ||
     config.visibilityTimeoutSeconds <= config.filesProcessing.leaseSeconds ||
-    config.visibilityTimeoutSeconds <= config.findingsProcessing.leaseSeconds
+    config.visibilityTimeoutSeconds <= config.findingsProcessing.leaseSeconds ||
+    config.visibilityTimeoutSeconds <= config.summaryProcessing.leaseSeconds
   )
     throw new TypeError(
       'Queue visibility timeout must exceed the projection lease.',
@@ -243,6 +264,7 @@ export function createProductionWorker(
       processing: config.processing,
       filesProcessing: config.filesProcessing,
       findingsProcessing: config.findingsProcessing,
+      summaryProcessing: config.summaryProcessing,
       artifactReader,
       queueBatchSize: config.queueBatchSize,
       visibilityTimeoutSeconds: config.visibilityTimeoutSeconds,

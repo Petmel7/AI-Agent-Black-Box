@@ -28,6 +28,9 @@ model Organization {
   findingsRunProjections FindingsRunProjection[]
   findingRuleResults     FindingRuleResult[]
   findingReferences      FindingEvidenceReference[]
+  summaryRunProjections  SummaryRunProjection[]
+  summaryClaims          SummaryClaim[]
+  summarySupports        SummaryClaimSupport[]
 
   @@map("organizations")
 }
@@ -42,6 +45,7 @@ model Repository {
   fileRunProjections     FileRunProjection[]
   fileChangeProjections  FileChangeProjection[]
   findingsRunProjections FindingsRunProjection[]
+  summaryRunProjections  SummaryRunProjection[]
 
   @@unique([organizationId, id], map: "repositories_org_id_key")
   @@map("repositories")
@@ -71,6 +75,9 @@ model Run {
   findingsRunProjection  FindingsRunProjection?
   findingRuleResults     FindingRuleResult[]
   findingReferences      FindingEvidenceReference[]
+  summaryRunProjection   SummaryRunProjection?
+  summaryClaims          SummaryClaim[]
+  summarySupports        SummaryClaimSupport[]
 
   @@unique([organizationId, canonicalRunId], map: "runs_org_canonical_run_id_key")
   @@unique([organizationId, id], map: "runs_org_id_key")
@@ -114,6 +121,7 @@ model EvidenceEvent {
   memberships       EvidenceBatchEvent[]
   artifactLinks     EvidenceEventArtifact[]
   findingReferences FindingEvidenceReference[]
+  summarySupports   SummaryClaimSupport[]
 
   @@unique([organizationId, canonicalEventId], map: "events_org_canonical_event_id_key")
   @@unique([runId, sequence], map: "events_run_sequence_key")
@@ -161,6 +169,7 @@ model ArtifactDeclaration {
   processingIntents     ProcessingIntent[]
   fileChangeProjections FileChangeProjection[]
   findingReferences     FindingEvidenceReference[]
+  summarySupports       SummaryClaimSupport[]
 
   @@unique([organizationId, canonicalArtifactId], map: "artifacts_org_canonical_artifact_id_key")
   @@unique([organizationId, runId, id], map: "artifacts_org_run_id_key")
@@ -216,6 +225,7 @@ model EvidenceEventArtifact {
   event             EvidenceEvent              @relation(fields: [organizationId, runId, eventId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "event_artifacts_org_run_event_fkey")
   artifact          ArtifactDeclaration        @relation(fields: [organizationId, runId, artifactId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "event_artifacts_org_run_artifact_fkey")
   findingReferences FindingEvidenceReference[] @relation("FindingReferenceEventArtifact")
+  summarySupports   SummaryClaimSupport[]      @relation("SummarySupportEventArtifact")
 
   @@unique([eventId, jsonPointer], map: "event_artifacts_event_pointer_key")
   @@unique([organizationId, runId, eventId, artifactId, jsonPointer], map: "event_artifacts_org_run_event_artifact_pointer_key")
@@ -579,35 +589,37 @@ model FileChangeProjection {
 }
 
 model FindingsRunProjection {
-  id                   String              @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
-  organizationId       String              @map("organization_id") @db.Uuid
-  repositoryId         String              @map("repository_id") @db.Uuid
-  runId                String              @unique(map: "findings_run_projections_run_id_key") @map("run_id") @db.Uuid
-  projectorName        String              @map("projector_name")
-  projectorVersion     Int                 @map("projector_version")
-  analyzerName         String              @map("analyzer_name")
-  analyzerVersion      Int                 @map("analyzer_version")
-  catalogVersion       Int                 @map("catalog_version")
-  sourceFingerprint    String              @map("source_fingerprint")
-  coreVersion          Int                 @map("core_version")
-  coreFingerprint      String              @map("core_fingerprint")
-  coreCompleteness     String              @map("core_completeness")
-  filesVersion         Int?                @map("files_version")
-  filesFingerprint     String?             @map("files_fingerprint")
-  filesCompleteness    String              @map("files_completeness")
-  deterministicOutcome String              @map("deterministic_outcome")
+  id                   String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId       String                @map("organization_id") @db.Uuid
+  repositoryId         String                @map("repository_id") @db.Uuid
+  runId                String                @unique(map: "findings_run_projections_run_id_key") @map("run_id") @db.Uuid
+  projectorName        String                @map("projector_name")
+  projectorVersion     Int                   @map("projector_version")
+  analyzerName         String                @map("analyzer_name")
+  analyzerVersion      Int                   @map("analyzer_version")
+  catalogVersion       Int                   @map("catalog_version")
+  sourceFingerprint    String                @map("source_fingerprint")
+  coreVersion          Int                   @map("core_version")
+  coreFingerprint      String                @map("core_fingerprint")
+  coreCompleteness     String                @map("core_completeness")
+  filesVersion         Int?                  @map("files_version")
+  filesFingerprint     String?               @map("files_fingerprint")
+  filesCompleteness    String                @map("files_completeness")
+  deterministicOutcome String                @map("deterministic_outcome")
   coverage             String
-  triggeredCount       Int                 @map("triggered_count")
-  unknownCount         Int                 @map("unknown_count")
-  highCount            Int                 @map("high_count")
-  mediumCount          Int                 @map("medium_count")
-  updatedAt            DateTime            @default(now()) @map("updated_at") @db.Timestamptz(3)
-  organization         Organization        @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "findings_runs_organization_id_fkey")
-  repository           Repository          @relation(fields: [organizationId, repositoryId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "findings_runs_org_repository_fkey")
-  run                  Run                 @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "findings_runs_org_run_fkey")
+  triggeredCount       Int                   @map("triggered_count")
+  unknownCount         Int                   @map("unknown_count")
+  highCount            Int                   @map("high_count")
+  mediumCount          Int                   @map("medium_count")
+  updatedAt            DateTime              @default(now()) @map("updated_at") @db.Timestamptz(3)
+  organization         Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "findings_runs_organization_id_fkey")
+  repository           Repository            @relation(fields: [organizationId, repositoryId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "findings_runs_org_repository_fkey")
+  run                  Run                   @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "findings_runs_org_run_fkey")
   results              FindingRuleResult[]
+  summaryRunProjection SummaryRunProjection? @relation("SummaryFindingsSnapshot")
 
   @@unique([organizationId, runId], map: "findings_runs_org_run_key")
+  @@unique([organizationId, runId, sourceFingerprint], map: "findings_runs_org_run_source_key")
   @@index([organizationId, repositoryId, updatedAt, runId], map: "findings_runs_org_repository_cursor_idx")
   @@map("findings_run_projections")
 }
@@ -633,11 +645,13 @@ model FindingRuleResult {
   organization        Organization               @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "finding_results_organization_id_fkey")
   run                 Run                        @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "finding_results_org_run_fkey")
   references          FindingEvidenceReference[]
+  summarySupports     SummaryClaimSupport[]
 
   @@unique([runId, ruleId, ruleVersion], map: "finding_results_run_rule_key")
   @@unique([runId, catalogOrder], map: "finding_results_run_order_key")
   @@unique([organizationId, resultKey], map: "finding_results_org_result_key")
   @@unique([organizationId, runId, id], map: "finding_results_org_run_id_key")
+  @@unique([organizationId, runId, id, resultKey, ruleId, ruleVersion], map: "finding_results_exact_support_key")
   @@index([organizationId, runId, catalogOrder], map: "finding_results_org_run_cursor_idx")
   @@map("finding_rule_results")
 }
@@ -664,4 +678,111 @@ model FindingEvidenceReference {
   @@unique([resultId, ordinal], map: "finding_refs_result_ordinal_key")
   @@unique([resultId, eventId, artifactDeclarationId, eventArtifactPointer, jsonPointer, fileOrdinal, entryId], map: "finding_refs_identity_key")
   @@map("finding_evidence_references")
+}
+
+model SummaryRunProjection {
+  id                       String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId           String                @map("organization_id") @db.Uuid
+  repositoryId             String                @map("repository_id") @db.Uuid
+  runId                    String                @unique(map: "summary_run_projections_run_id_key") @map("run_id") @db.Uuid
+  projectorName            String                @map("projector_name")
+  projectorVersion         Int                   @map("projector_version")
+  generatorName            String                @map("generator_name")
+  generatorVersion         Int                   @map("generator_version")
+  formatVersion            Int                   @map("format_version")
+  templateVersion          Int                   @map("template_version")
+  summaryKey               String                @map("summary_key")
+  sourceFingerprint        String                @map("source_fingerprint")
+  coreVersion              Int                   @map("core_version")
+  coreFingerprint          String                @map("core_fingerprint")
+  coreCompleteness         String                @map("core_completeness")
+  filesVersion             Int?                  @map("files_version")
+  filesFingerprint         String?               @map("files_fingerprint")
+  filesCompleteness        String                @map("files_completeness")
+  findingsProjectorVersion Int                   @map("findings_projector_version")
+  findingsFingerprint      String                @map("findings_fingerprint")
+  findingsAnalyzerName     String                @map("findings_analyzer_name")
+  findingsAnalyzerVersion  Int                   @map("findings_analyzer_version")
+  findingsCatalogVersion   Int                   @map("findings_catalog_version")
+  summaryOutcome           String                @map("summary_outcome")
+  sectionCount             Int                   @map("section_count")
+  claimCount               Int                   @map("claim_count")
+  claimsTruncated          Boolean               @map("claims_truncated")
+  updatedAt                DateTime              @default(now()) @map("updated_at") @db.Timestamptz(3)
+  organization             Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "summary_runs_organization_id_fkey")
+  repository               Repository            @relation(fields: [organizationId, repositoryId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "summary_runs_org_repository_fkey")
+  run                      Run                   @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "summary_runs_org_run_fkey")
+  findingsProjection       FindingsRunProjection @relation("SummaryFindingsSnapshot", fields: [organizationId, runId, findingsFingerprint], references: [organizationId, runId, sourceFingerprint], onDelete: Restrict, onUpdate: Restrict, map: "summary_runs_findings_snapshot_fkey")
+  claims                   SummaryClaim[]
+  supports                 SummaryClaimSupport[] @relation("SummarySupportRun")
+  findingSupports          SummaryClaimSupport[] @relation("SummarySupportFindingsSnapshot")
+
+  @@unique([organizationId, summaryKey], map: "summary_runs_org_summary_key")
+  @@unique([organizationId, runId], map: "summary_runs_org_run_key")
+  @@unique([organizationId, runId, findingsFingerprint], map: "summary_runs_org_run_findings_key")
+  @@index([organizationId, repositoryId, updatedAt, runId], map: "summary_runs_org_repository_cursor_idx")
+  @@map("summary_run_projections")
+}
+
+model SummaryClaim {
+  id                String                @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId    String                @map("organization_id") @db.Uuid
+  runId             String                @map("run_id") @db.Uuid
+  claimKey          String                @map("claim_key")
+  stableId          String                @map("stable_id")
+  sectionId         String                @map("section_id")
+  sectionOrder      Int                   @map("section_order")
+  claimOrder        Int                   @map("claim_order")
+  claimClass        String                @map("claim_class")
+  templateId        String                @map("template_id")
+  text              String
+  supportCount      Int                   @map("support_count")
+  supportsTruncated Boolean               @map("supports_truncated")
+  runProjection     SummaryRunProjection  @relation(fields: [organizationId, runId], references: [organizationId, runId], onDelete: Cascade, onUpdate: Restrict, map: "summary_claims_org_run_projection_fkey")
+  organization      Organization          @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "summary_claims_organization_id_fkey")
+  run               Run                   @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "summary_claims_org_run_fkey")
+  supports          SummaryClaimSupport[]
+
+  @@unique([organizationId, claimKey], map: "summary_claims_org_claim_key")
+  @@unique([runId, stableId], map: "summary_claims_run_stable_id_key")
+  @@unique([runId, sectionOrder, claimOrder], map: "summary_claims_run_order_key")
+  @@unique([organizationId, runId, id], map: "summary_claims_org_run_id_key")
+  @@unique([organizationId, runId, id, claimClass], map: "summary_claims_org_run_id_class_key")
+  @@index([organizationId, runId, sectionOrder, claimOrder], map: "summary_claims_org_run_cursor_idx")
+  @@map("summary_claims")
+}
+
+model SummaryClaimSupport {
+  id                        String                 @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  organizationId            String                 @map("organization_id") @db.Uuid
+  runId                     String                 @map("run_id") @db.Uuid
+  claimId                   String                 @map("claim_id") @db.Uuid
+  claimClass                String                 @map("claim_class")
+  ordinal                   Int
+  supportKind               String                 @map("support_kind")
+  eventId                   String?                @map("event_id") @db.Uuid
+  artifactDeclarationId     String?                @map("artifact_declaration_id") @db.Uuid
+  eventArtifactPointer      String?                @map("event_artifact_pointer")
+  jsonPointer               String?                @map("json_pointer")
+  fileOrdinal               Int?                   @map("file_ordinal")
+  entryId                   String?                @map("entry_id")
+  findingResultId           String?                @map("finding_result_id") @db.Uuid
+  findingResultKey          String?                @map("finding_result_key")
+  findingRuleId             String?                @map("finding_rule_id")
+  findingRuleVersion        Int?                   @map("finding_rule_version")
+  findingsSourceFingerprint String?                @map("findings_source_fingerprint")
+  runProjection             SummaryRunProjection   @relation("SummarySupportRun", fields: [organizationId, runId], references: [organizationId, runId], onDelete: Cascade, onUpdate: Restrict, map: "summary_supports_org_run_projection_fkey")
+  claim                     SummaryClaim           @relation(fields: [organizationId, runId, claimId, claimClass], references: [organizationId, runId, id, claimClass], onDelete: Cascade, onUpdate: Restrict, map: "summary_supports_claim_class_fkey")
+  organization              Organization           @relation(fields: [organizationId], references: [id], onDelete: Restrict, onUpdate: Restrict, map: "summary_supports_organization_id_fkey")
+  run                       Run                    @relation(fields: [organizationId, runId], references: [organizationId, id], onDelete: Restrict, onUpdate: Restrict, map: "summary_supports_org_run_fkey")
+  event                     EvidenceEvent?         @relation(fields: [organizationId, runId, eventId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "summary_supports_org_run_event_fkey")
+  artifactDeclaration       ArtifactDeclaration?   @relation(fields: [organizationId, runId, artifactDeclarationId], references: [organizationId, runId, id], onDelete: Restrict, onUpdate: Restrict, map: "summary_supports_org_run_artifact_fkey")
+  eventArtifact             EvidenceEventArtifact? @relation("SummarySupportEventArtifact", fields: [organizationId, runId, eventId, artifactDeclarationId, eventArtifactPointer], references: [organizationId, runId, eventId, artifactId, jsonPointer], onDelete: Restrict, onUpdate: Restrict, map: "summary_supports_event_artifact_pointer_fkey")
+  findingResult             FindingRuleResult?     @relation(fields: [organizationId, runId, findingResultId, findingResultKey, findingRuleId, findingRuleVersion], references: [organizationId, runId, id, resultKey, ruleId, ruleVersion], onDelete: Restrict, onUpdate: Restrict, map: "summary_supports_finding_result_fkey")
+  findingsProjection        SummaryRunProjection?  @relation("SummarySupportFindingsSnapshot", fields: [organizationId, runId, findingsSourceFingerprint], references: [organizationId, runId, findingsFingerprint], onDelete: Cascade, onUpdate: Restrict, map: "summary_supports_findings_snapshot_fkey")
+
+  @@unique([claimId, ordinal], map: "summary_supports_claim_ordinal_key")
+  @@unique([claimId, supportKind, eventId, artifactDeclarationId, eventArtifactPointer, jsonPointer, fileOrdinal, entryId, findingResultId, findingResultKey, findingRuleId, findingRuleVersion, findingsSourceFingerprint], map: "summary_supports_identity_key")
+  @@index([organizationId, runId, claimId, ordinal], map: "summary_supports_org_run_claim_cursor_idx")
+  @@map("summary_claim_supports")
 }

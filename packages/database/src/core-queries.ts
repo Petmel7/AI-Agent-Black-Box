@@ -12,11 +12,17 @@ import {
   FINDINGS_PROJECTOR_VERSION,
   inspectFindingsSourceSnapshot,
 } from './findings-processing.js';
+import {
+  SUMMARY_PROJECTOR_NAME,
+  SUMMARY_PROJECTOR_VERSION,
+  inspectSummarySourceSnapshot,
+} from './summary-processing.js';
 import { Prisma } from './generated/client/client.js';
 import type { DatabaseClient } from './client.js';
 
 export type QueryProcessingState =
   'processing' | 'stale' | 'ready' | 'incomplete' | 'failed';
+export type SummaryAvailability = 'current' | 'stale' | 'absent';
 
 export interface RunListInput {
   organizationId: string;
@@ -200,6 +206,58 @@ async function findingsState(
   return processing.state === 'READY' ? 'ready' : 'processing';
 }
 
+async function summaryStatus(
+  client: DatabaseClient | Prisma.TransactionClient,
+  organizationId: string,
+  runId: string,
+  projection: {
+    projectorName: string;
+    projectorVersion: number;
+    sourceFingerprint: string;
+  } | null,
+  processing: {
+    state: string;
+    projectorVersion: number;
+    sourceFingerprint: string | null;
+  } | null,
+): Promise<{
+  processingState: QueryProcessingState;
+  availability: SummaryAvailability;
+}> {
+  const current = await inspectSummarySourceSnapshot(
+    client,
+    organizationId,
+    runId,
+  );
+  const availability: SummaryAvailability = !projection
+    ? 'absent'
+    : !current.coreCurrent ||
+        !current.findingsCurrent ||
+        projection.projectorName !== SUMMARY_PROJECTOR_NAME ||
+        projection.projectorVersion !== SUMMARY_PROJECTOR_VERSION ||
+        projection.sourceFingerprint !== current.fingerprint
+      ? 'stale'
+      : 'current';
+  const processingVersionCurrent =
+    processing === null ||
+    processing.projectorVersion === SUMMARY_PROJECTOR_VERSION;
+  const processingState: QueryProcessingState =
+    processing?.state === 'FAILED'
+      ? 'failed'
+      : !processingVersionCurrent || availability === 'stale'
+        ? 'stale'
+        : processing?.state === 'READY'
+          ? 'ready'
+          : 'processing';
+  return { processingState, availability };
+}
+
+function summaryIsAvailable(status: {
+  availability: SummaryAvailability;
+}): boolean {
+  return status.availability === 'current';
+}
+
 async function listCoreRunsInSnapshot(
   client: Prisma.TransactionClient,
   input: RunListInput,
@@ -255,6 +313,7 @@ async function listCoreRunsInSnapshot(
         },
       },
       findingsRunProjection: true,
+      summaryRunProjection: true,
       processingStates: {
         where: {
           projectorName: {
@@ -262,6 +321,7 @@ async function listCoreRunsInSnapshot(
               CORE_PROJECTOR_NAME,
               FILES_PROJECTOR_NAME,
               FINDINGS_PROJECTOR_NAME,
+              SUMMARY_PROJECTOR_NAME,
             ],
           },
         },
@@ -312,6 +372,17 @@ async function listCoreRunsInSnapshot(
         run.findingsRunProjection,
         findingsProcessing,
       );
+      const summaryProcessing =
+        run.processingStates.find(
+          (value) => value.projectorName === SUMMARY_PROJECTOR_NAME,
+        ) ?? null;
+      const currentSummaryStatus = await summaryStatus(
+        client,
+        input.organizationId,
+        run.id,
+        run.summaryRunProjection,
+        summaryProcessing,
+      );
       return {
         runId: run.canonicalRunId,
         createdAt: run.createdAt.toISOString(),
@@ -349,6 +420,30 @@ async function listCoreRunsInSnapshot(
           currentFindingsState === 'ready'
             ? (run.findingsRunProjection?.mediumCount ?? null)
             : null,
+        summaryProcessingState: currentSummaryStatus.processingState,
+        summaryAvailability: currentSummaryStatus.availability,
+        summaryProcessingErrorCode: summaryProcessing?.lastErrorCode ?? null,
+        summaryOutcome: summaryIsAvailable(currentSummaryStatus)
+          ? (run.summaryRunProjection?.summaryOutcome ?? null)
+          : null,
+        summaryGeneratorVersion: summaryIsAvailable(currentSummaryStatus)
+          ? (run.summaryRunProjection?.generatorVersion ?? null)
+          : null,
+        summaryFormatVersion: summaryIsAvailable(currentSummaryStatus)
+          ? (run.summaryRunProjection?.formatVersion ?? null)
+          : null,
+        summaryTemplateVersion: summaryIsAvailable(currentSummaryStatus)
+          ? (run.summaryRunProjection?.templateVersion ?? null)
+          : null,
+        summarySectionCount: summaryIsAvailable(currentSummaryStatus)
+          ? (run.summaryRunProjection?.sectionCount ?? null)
+          : null,
+        summaryClaimCount: summaryIsAvailable(currentSummaryStatus)
+          ? (run.summaryRunProjection?.claimCount ?? null)
+          : null,
+        summaryClaimsTruncated: summaryIsAvailable(currentSummaryStatus)
+          ? (run.summaryRunProjection?.claimsTruncated ?? null)
+          : null,
         evidenceCompleteness:
           run.coreRunProjection?.evidenceCompleteness ?? null,
         observedOutcome: run.coreRunProjection?.observedOutcome ?? null,
@@ -677,6 +772,7 @@ async function getCoreRunDetailInSnapshot(
       },
       fileRunProjection: true,
       findingsRunProjection: true,
+      summaryRunProjection: true,
       processingStates: {
         where: {
           projectorName: {
@@ -684,6 +780,7 @@ async function getCoreRunDetailInSnapshot(
               CORE_PROJECTOR_NAME,
               FILES_PROJECTOR_NAME,
               FINDINGS_PROJECTOR_NAME,
+              SUMMARY_PROJECTOR_NAME,
             ],
           },
         },
@@ -751,6 +848,43 @@ async function getCoreRunDetailInSnapshot(
         ? (run.findingsRunProjection?.mediumCount ?? null)
         : null,
   };
+  const summaryProcessing =
+    run.processingStates.find(
+      (value) => value.projectorName === SUMMARY_PROJECTOR_NAME,
+    ) ?? null;
+  const currentSummaryStatus = await summaryStatus(
+    client,
+    input.organizationId,
+    run.id,
+    run.summaryRunProjection,
+    summaryProcessing,
+  );
+  const summaryOverview = {
+    summaryProcessingState: currentSummaryStatus.processingState,
+    summaryAvailability: currentSummaryStatus.availability,
+    summaryProcessingErrorCode: summaryProcessing?.lastErrorCode ?? null,
+    summaryOutcome: summaryIsAvailable(currentSummaryStatus)
+      ? (run.summaryRunProjection?.summaryOutcome ?? null)
+      : null,
+    summaryGeneratorVersion: summaryIsAvailable(currentSummaryStatus)
+      ? (run.summaryRunProjection?.generatorVersion ?? null)
+      : null,
+    summaryFormatVersion: summaryIsAvailable(currentSummaryStatus)
+      ? (run.summaryRunProjection?.formatVersion ?? null)
+      : null,
+    summaryTemplateVersion: summaryIsAvailable(currentSummaryStatus)
+      ? (run.summaryRunProjection?.templateVersion ?? null)
+      : null,
+    summarySectionCount: summaryIsAvailable(currentSummaryStatus)
+      ? (run.summaryRunProjection?.sectionCount ?? null)
+      : null,
+    summaryClaimCount: summaryIsAvailable(currentSummaryStatus)
+      ? (run.summaryRunProjection?.claimCount ?? null)
+      : null,
+    summaryClaimsTruncated: summaryIsAvailable(currentSummaryStatus)
+      ? (run.summaryRunProjection?.claimsTruncated ?? null)
+      : null,
+  };
   if (!projection)
     return {
       runId: run.canonicalRunId,
@@ -766,6 +900,7 @@ async function getCoreRunDetailInSnapshot(
       filesChanged:
         filesState === 'ready' ? (run.fileRunProjection?.fileCount ?? 0) : null,
       ...findingsSummary,
+      ...summaryOverview,
       projection: null,
     };
   const page = <T, R>(
@@ -794,6 +929,7 @@ async function getCoreRunDetailInSnapshot(
       run.fileRunProjection?.completenessReason ??
       (filesState === 'ready' ? null : `files_${filesState}`),
     ...findingsSummary,
+    ...summaryOverview,
     projection: {
       projectorName: projection.projectorName,
       projectorVersion: projection.projectorVersion,
@@ -1069,6 +1205,343 @@ export async function listFindings(
         nextCursor:
           rows.length > input.limit && visible.at(-1)
             ? encode({ catalogOrder: visible.at(-1)!.catalogOrder })
+            : null,
+      };
+    },
+    { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead },
+  );
+}
+
+export interface SummaryClaimListInput {
+  organizationId: string;
+  repositoryId: string;
+  canonicalRunId: string;
+  limit: number;
+  cursor?: string;
+}
+
+export interface SummarySupportListInput {
+  organizationId: string;
+  repositoryId: string;
+  canonicalRunId: string;
+  claimKey: string;
+  limit: number;
+  cursor?: string;
+}
+
+function summaryClaimCursor(
+  value: string | undefined,
+): { summaryKey: string; sectionOrder: number; claimOrder: number } | null {
+  if (!value) return null;
+  try {
+    if (value.length > 1_024 || !/^[A-Za-z0-9_-]+$/.test(value))
+      throw new Error();
+    const parsed = JSON.parse(
+      Buffer.from(value, 'base64url').toString('utf8'),
+    ) as Record<string, unknown>;
+    if (
+      Object.keys(parsed).length !== 3 ||
+      typeof parsed.summaryKey !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(parsed.summaryKey) ||
+      typeof parsed.sectionOrder !== 'number' ||
+      !Number.isSafeInteger(parsed.sectionOrder) ||
+      parsed.sectionOrder < 0 ||
+      parsed.sectionOrder > 3 ||
+      typeof parsed.claimOrder !== 'number' ||
+      !Number.isSafeInteger(parsed.claimOrder) ||
+      parsed.claimOrder < 0 ||
+      parsed.claimOrder > 99
+    )
+      throw new Error();
+    return {
+      summaryKey: parsed.summaryKey,
+      sectionOrder: parsed.sectionOrder,
+      claimOrder: parsed.claimOrder,
+    };
+  } catch {
+    throw new TypeError('Invalid summary claim pagination cursor.');
+  }
+}
+
+function summarySupportCursor(
+  value: string | undefined,
+): { summaryKey: string; claimKey: string; ordinal: number } | null {
+  if (!value) return null;
+  try {
+    if (value.length > 1_024 || !/^[A-Za-z0-9_-]+$/.test(value))
+      throw new Error();
+    const parsed = JSON.parse(
+      Buffer.from(value, 'base64url').toString('utf8'),
+    ) as Record<string, unknown>;
+    if (
+      Object.keys(parsed).length !== 3 ||
+      typeof parsed.summaryKey !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(parsed.summaryKey) ||
+      typeof parsed.claimKey !== 'string' ||
+      !/^[0-9a-f]{64}$/.test(parsed.claimKey) ||
+      typeof parsed.ordinal !== 'number' ||
+      !Number.isSafeInteger(parsed.ordinal) ||
+      parsed.ordinal < 0 ||
+      parsed.ordinal > 99
+    )
+      throw new Error();
+    return {
+      summaryKey: parsed.summaryKey,
+      claimKey: parsed.claimKey,
+      ordinal: parsed.ordinal,
+    };
+  } catch {
+    throw new TypeError('Invalid summary support pagination cursor.');
+  }
+}
+
+function mapSummarySupport(row: {
+  ordinal: number;
+  supportKind: string;
+  eventArtifactPointer: string | null;
+  jsonPointer: string | null;
+  fileOrdinal: number | null;
+  entryId: string | null;
+  findingResultKey: string | null;
+  findingRuleId: string | null;
+  findingRuleVersion: number | null;
+  findingsSourceFingerprint: string | null;
+  event: { canonicalEventId: string } | null;
+  artifactDeclaration: { canonicalArtifactId: string } | null;
+}) {
+  return row.supportKind === 'evidence'
+    ? {
+        ordinal: row.ordinal,
+        kind: 'evidence' as const,
+        eventId: row.event?.canonicalEventId ?? null,
+        artifactId: row.artifactDeclaration?.canonicalArtifactId ?? null,
+        eventArtifactPointer: row.eventArtifactPointer,
+        jsonPointer: row.jsonPointer,
+        fileOrdinal: row.fileOrdinal,
+        entryId: row.entryId,
+      }
+    : {
+        ordinal: row.ordinal,
+        kind: 'finding' as const,
+        resultKey: row.findingResultKey,
+        ruleId: row.findingRuleId,
+        ruleVersion: row.findingRuleVersion,
+        findingsSourceFingerprint: row.findingsSourceFingerprint,
+      };
+}
+
+/** Tenant-safe current summary pagination in one repeatable-read snapshot. */
+export async function listSummaryClaims(
+  client: DatabaseClient,
+  input: SummaryClaimListInput,
+  hooks: QueryConsistencyHooks = {},
+) {
+  bounded(input.limit, 100);
+  const cursor = summaryClaimCursor(input.cursor);
+  return client.$transaction(
+    async (transaction) => {
+      const run = await transaction.run.findFirst({
+        where: {
+          organizationId: input.organizationId,
+          repositoryId: input.repositoryId,
+          canonicalRunId: input.canonicalRunId,
+        },
+        select: {
+          id: true,
+          summaryRunProjection: true,
+          processingStates: {
+            where: { projectorName: SUMMARY_PROJECTOR_NAME },
+            take: 1,
+          },
+        },
+      });
+      if (!run) return null;
+      await hooks.afterBaseRead?.();
+      const processing = run.processingStates[0] ?? null;
+      const status = await summaryStatus(
+        transaction,
+        input.organizationId,
+        run.id,
+        run.summaryRunProjection,
+        processing,
+      );
+      if (!summaryIsAvailable(status) || !run.summaryRunProjection)
+        return {
+          processingState: status.processingState,
+          summaryAvailability: status.availability,
+          processingErrorCode: processing?.lastErrorCode ?? null,
+          outcome: null,
+          generatorVersion: null,
+          formatVersion: null,
+          templateVersion: null,
+          sectionCount: null,
+          claimCount: null,
+          claimsTruncated: null,
+          items: [],
+          nextCursor: null,
+        };
+      if (cursor && cursor.summaryKey !== run.summaryRunProjection.summaryKey)
+        throw new TypeError(
+          'Summary claim pagination cursor belongs to a stale snapshot.',
+        );
+      const rows = await transaction.summaryClaim.findMany({
+        where: {
+          organizationId: input.organizationId,
+          runId: run.id,
+          ...(cursor
+            ? {
+                OR: [
+                  { sectionOrder: { gt: cursor.sectionOrder } },
+                  {
+                    sectionOrder: cursor.sectionOrder,
+                    claimOrder: { gt: cursor.claimOrder },
+                  },
+                ],
+              }
+            : {}),
+        },
+        orderBy: [{ sectionOrder: 'asc' }, { claimOrder: 'asc' }],
+        take: input.limit + 1,
+        include: {
+          supports: {
+            orderBy: { ordinal: 'asc' },
+            include: {
+              event: { select: { canonicalEventId: true } },
+              artifactDeclaration: {
+                select: { canonicalArtifactId: true },
+              },
+            },
+          },
+        },
+      });
+      const visible = rows.slice(0, input.limit);
+      return {
+        processingState: status.processingState,
+        summaryAvailability: status.availability,
+        processingErrorCode: processing?.lastErrorCode ?? null,
+        outcome: run.summaryRunProjection.summaryOutcome,
+        generatorVersion: run.summaryRunProjection.generatorVersion,
+        formatVersion: run.summaryRunProjection.formatVersion,
+        templateVersion: run.summaryRunProjection.templateVersion,
+        sectionCount: run.summaryRunProjection.sectionCount,
+        claimCount: run.summaryRunProjection.claimCount,
+        claimsTruncated: run.summaryRunProjection.claimsTruncated,
+        items: visible.map((row) => ({
+          claimKey: row.claimKey,
+          stableId: row.stableId,
+          sectionId: row.sectionId,
+          sectionOrder: row.sectionOrder,
+          claimOrder: row.claimOrder,
+          class: row.claimClass,
+          templateId: row.templateId,
+          text: row.text,
+          supportCount: row.supportCount,
+          supportsTruncated: row.supportsTruncated,
+          supports: row.supports.map(mapSummarySupport),
+        })),
+        nextCursor:
+          rows.length > input.limit && visible.at(-1)
+            ? encode({
+                summaryKey: run.summaryRunProjection.summaryKey,
+                sectionOrder: visible.at(-1)!.sectionOrder,
+                claimOrder: visible.at(-1)!.claimOrder,
+              })
+            : null,
+      };
+    },
+    { isolationLevel: Prisma.TransactionIsolationLevel.RepeatableRead },
+  );
+}
+
+/** Stable support pagination for one tenant-owned current summary claim. */
+export async function listSummarySupports(
+  client: DatabaseClient,
+  input: SummarySupportListInput,
+  hooks: QueryConsistencyHooks = {},
+) {
+  bounded(input.limit, 100);
+  const cursor = summarySupportCursor(input.cursor);
+  return client.$transaction(
+    async (transaction) => {
+      const run = await transaction.run.findFirst({
+        where: {
+          organizationId: input.organizationId,
+          repositoryId: input.repositoryId,
+          canonicalRunId: input.canonicalRunId,
+        },
+        select: {
+          id: true,
+          summaryRunProjection: true,
+          processingStates: {
+            where: { projectorName: SUMMARY_PROJECTOR_NAME },
+            take: 1,
+          },
+        },
+      });
+      if (!run) return null;
+      await hooks.afterBaseRead?.();
+      const processing = run.processingStates[0] ?? null;
+      const status = await summaryStatus(
+        transaction,
+        input.organizationId,
+        run.id,
+        run.summaryRunProjection,
+        processing,
+      );
+      if (!summaryIsAvailable(status) || !run.summaryRunProjection)
+        return {
+          processingState: status.processingState,
+          summaryAvailability: status.availability,
+          processingErrorCode: processing?.lastErrorCode ?? null,
+          claimKey: null,
+          items: [],
+          nextCursor: null,
+        };
+      if (
+        cursor &&
+        (cursor.summaryKey !== run.summaryRunProjection.summaryKey ||
+          cursor.claimKey !== input.claimKey)
+      )
+        throw new TypeError(
+          'Summary support pagination cursor belongs to a stale snapshot.',
+        );
+      const claim = await transaction.summaryClaim.findFirst({
+        where: {
+          organizationId: input.organizationId,
+          runId: run.id,
+          claimKey: input.claimKey,
+        },
+        select: { id: true, claimKey: true },
+      });
+      if (!claim) return null;
+      const rows = await transaction.summaryClaimSupport.findMany({
+        where: {
+          organizationId: input.organizationId,
+          runId: run.id,
+          claimId: claim.id,
+          ...(cursor === null ? {} : { ordinal: { gt: cursor.ordinal } }),
+        },
+        orderBy: { ordinal: 'asc' },
+        take: input.limit + 1,
+        include: {
+          event: { select: { canonicalEventId: true } },
+          artifactDeclaration: { select: { canonicalArtifactId: true } },
+        },
+      });
+      const visible = rows.slice(0, input.limit);
+      return {
+        processingState: status.processingState,
+        summaryAvailability: status.availability,
+        processingErrorCode: processing?.lastErrorCode ?? null,
+        claimKey: claim.claimKey,
+        items: visible.map(mapSummarySupport),
+        nextCursor:
+          rows.length > input.limit && visible.at(-1)
+            ? encode({
+                summaryKey: run.summaryRunProjection.summaryKey,
+                claimKey: claim.claimKey,
+                ordinal: visible.at(-1)!.ordinal,
+              })
             : null,
       };
     },

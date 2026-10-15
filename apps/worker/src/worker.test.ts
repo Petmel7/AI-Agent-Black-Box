@@ -79,4 +79,26 @@ describe('worker lifecycle', () => {
       vi.mocked(owned.consumerCycle).mock.invocationCallOrder[0]!,
     );
   });
+
+  it('bounds shutdown when an in-flight consumer does not observe cancellation', async () => {
+    vi.useFakeTimers();
+    try {
+      const owned = resources();
+      owned.consumerCycle = vi.fn(() => new Promise<number>(() => undefined));
+      const worker = createWorker(async () => owned, {
+        pollDelayMs: 20,
+        shutdownWaitMs: 50,
+      });
+      await worker.start();
+      const stopping = worker.stop();
+      await vi.advanceTimersByTimeAsync(49);
+      expect(owned.close).not.toHaveBeenCalled();
+      await vi.advanceTimersByTimeAsync(1);
+      await stopping;
+      expect(worker.isRunning()).toBe(false);
+      expect(owned.close).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });

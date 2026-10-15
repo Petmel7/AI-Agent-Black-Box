@@ -1,0 +1,97 @@
+{
+  "organizationId": "00000000-0000-4000-8000-000000000001",
+  "canonicalRunId": "00000000-0000-4000-8000-000000000002",
+  "sourceFingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "findingsSourceFingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "findingsOutcome": "unknown",
+  "findingsCoverage": "partial",
+  "coreComplete": false,
+  "filesState": "missing",
+  "observedOutcome": null,
+  "observedOutcomeEvidence": null,
+  "tests": [],
+  "gitDiffs": [],
+  "findings": [
+    {
+      "resultKey": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "ruleId": "bbx.sensitive-area-change",
+      "ruleVersion": 1,
+      "severity": "high",
+      "outcome": "unknown",
+      "coverage": "partial",
+      "reasonCodes": ["file_evidence_incomplete"]
+    },
+    {
+      "resultKey": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "ruleId": "bbx.production-change-without-test-evidence",
+      "ruleVersion": 1,
+      "severity": "high",
+      "outcome": "unknown",
+      "coverage": "partial",
+      "reasonCodes": ["core_evidence_incomplete"]
+    },
+    {
+      "resultKey": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "ruleId": "bbx.tests-not-after-last-code-change",
+      "ruleVersion": 1,
+      "severity": "high",
+      "outcome": "unknown",
+      "coverage": "partial",
+      "reasonCodes": ["tested_state_timing_unavailable"]
+    },
+    {
+      "resultKey": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+      "ruleId": "bbx.final-tree-differs-from-tested-state",
+      "ruleVersion": 1,
+      "severity": "high",
+      "outcome": "unknown",
+      "coverage": "partial",
+      "reasonCodes": ["tested_tree_identity_unavailable"]
+    },
+    {
+      "resultKey": "1111111111111111111111111111111111111111111111111111111111111111",
+      "ruleId": "bbx.repeated-failed-command",
+      "ruleVersion": 1,
+      "severity": "medium",
+      "outcome": "unknown",
+      "coverage": "partial",
+      "reasonCodes": ["command_identity_incomplete"]
+    },
+    {
+      "resultKey": "2222222222222222222222222222222222222222222222222222222222222222",
+      "ruleId": "bbx.lockfile-without-manifest",
+      "ruleVersion": 1,
+      "severity": "medium",
+      "outcome": "unknown",
+      "coverage": "partial",
+      "reasonCodes": ["file_evidence_incomplete"]
+    },
+    {
+      "resultKey": "3333333333333333333333333333333333333333333333333333333333333333",
+      "ruleId": "bbx.test-removal-or-weakening",
+      "ruleVersion": 1,
+      "severity": "high",
+      "outcome": "unknown",
+      "coverage": "partial",
+      "reasonCodes": ["test_modification_semantics_unavailable"]
+    },
+    {
+      "resultKey": "4444444444444444444444444444444444444444444444444444444444444444",
+      "ruleId": "bbx.out-of-scope-change",
+      "ruleVersion": 1,
+      "severity": "high",
+      "outcome": "unknown",
+      "coverage": "partial",
+      "reasonCodes": ["declared_scope_unavailable"]
+    },
+    {
+      "resultKey": "5555555555555555555555555555555555555555555555555555555555555555",
+      "ruleId": "bbx.success-claim-without-test-evidence",
+      "ruleVersion": 1,
+      "severity": "high",
+      "outcome": "unknown",
+      "coverage": "partial",
+      "reasonCodes": ["success_claim_contract_unavailable"]
+    }
+  ]
+}

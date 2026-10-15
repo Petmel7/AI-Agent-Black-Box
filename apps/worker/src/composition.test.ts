@@ -48,6 +48,14 @@ const config = {
     retryBaseSeconds: 1,
     retryMaxSeconds: 2,
   },
+  summaryProcessing: {
+    leaseSeconds: 20,
+    attemptTimeoutMs: 10_000,
+    transitionMarginMs: 1_000,
+    maxAttempts: 2,
+    retryBaseSeconds: 1,
+    retryMaxSeconds: 2,
+  },
   storage: {
     url: 'https://example.supabase.co',
     serviceRoleKey: 'service-role-sentinel',
@@ -151,9 +159,14 @@ describe('production worker composition', () => {
       .fn()
       .mockResolvedValueOnce('applied')
       .mockResolvedValueOnce('already_applied');
+    const processSummary = vi
+      .fn()
+      .mockResolvedValueOnce('applied')
+      .mockResolvedValueOnce('already_applied');
     await consumeProcessingCycle(client, queue, config, undefined, {
       processIntent,
       processFindingsIntent: processFindings,
+      processSummaryIntent: processSummary,
       afterProcessBeforeArchive: () => {
         throw new Error('crash');
       },
@@ -162,9 +175,11 @@ describe('production worker composition', () => {
     await consumeProcessingCycle(client, queue, config, undefined, {
       processIntent,
       processFindingsIntent: processFindings,
+      processSummaryIntent: processSummary,
     });
     expect(archive).toHaveBeenCalledWith(8);
     expect(processFindings).toHaveBeenCalledTimes(2);
+    expect(processSummary).toHaveBeenCalledTimes(2);
   });
 
   it('does not archive successful dependency work when findings configuration is absent', async () => {
@@ -199,6 +214,38 @@ describe('production worker composition', () => {
     expect(archive).not.toHaveBeenCalled();
   });
 
+  it('does not archive successful dependency work when summary configuration is absent', async () => {
+    const archive = vi.fn(async () => true);
+    const queue: ProcessingQueue = {
+      verify: async () => undefined,
+      send: async () => 1,
+      read: async () => [
+        {
+          messageId: 82,
+          readCount: 1,
+          payload: {
+            schemaVersion: 1,
+            intentId: '00000000-0000-4000-8000-000000000082',
+          },
+        },
+      ],
+      archive,
+    };
+    const client = {
+      processingIntent: { findUnique: vi.fn(async () => null) },
+    } as never;
+    const processIntent = vi.fn(async () => 'applied' as const);
+    const withoutSummary = {
+      ...config,
+      summaryProcessing: undefined,
+    } as unknown as typeof config;
+    await consumeProcessingCycle(client, queue, withoutSummary, undefined, {
+      processIntent,
+    });
+    expect(processIntent).not.toHaveBeenCalled();
+    expect(archive).not.toHaveBeenCalled();
+  });
+
   it('dispatches artifact intents to the files projector and archives successful application', async () => {
     const archive = vi.fn(async () => true);
     const intentId = '00000000-0000-4000-8000-000000000003';
@@ -217,11 +264,13 @@ describe('production worker composition', () => {
     } as never;
     const processFiles = vi.fn(async () => 'applied' as const);
     const processFindings = vi.fn(async () => 'applied' as const);
+    const processSummary = vi.fn(async () => 'applied' as const);
     const artifactReader = vi.fn();
     const consumerConfig = { ...config, artifactReader };
     await consumeProcessingCycle(client, queue, consumerConfig, undefined, {
       processFilesIntent: processFiles,
       processFindingsIntent: processFindings,
+      processSummaryIntent: processSummary,
     });
     expect(processFiles).toHaveBeenCalledWith(
       client,
@@ -234,6 +283,12 @@ describe('production worker composition', () => {
       client,
       intentId,
       config.findingsProcessing,
+      {},
+    );
+    expect(processSummary).toHaveBeenCalledWith(
+      client,
+      intentId,
+      config.summaryProcessing,
       {},
     );
     expect(archive).toHaveBeenCalledWith(9);
@@ -264,6 +319,7 @@ describe('production worker composition', () => {
     const withoutFiles = {
       processing: config.processing,
       findingsProcessing: config.findingsProcessing,
+      summaryProcessing: config.summaryProcessing,
       queueBatchSize: config.queueBatchSize,
       visibilityTimeoutSeconds: config.visibilityTimeoutSeconds,
       poisonReadLimit: config.poisonReadLimit,
