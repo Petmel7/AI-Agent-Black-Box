@@ -101,6 +101,21 @@ export {
   type RunListInput,
 } from './core-queries.js';
 export {
+  DashboardQueryError,
+  listDashboardRuns,
+  listDashboardTimeline,
+  resolveDashboardEvidence,
+  type DashboardArtifactPreview,
+  type DashboardArtifactPreviewReader,
+  type DashboardArtifactPreviewUnavailableReason,
+  type DashboardEvidenceInput,
+  type DashboardEvidenceLocator,
+  type DashboardQueryErrorCode,
+  type DashboardRunListInput,
+  type DashboardTimelineInput,
+  type DashboardVerifiedArtifactSource,
+} from './dashboard-queries.js';
+export {
   createPgmqProcessingQueue,
   MalformedQueueMessageError,
   PROCESSING_QUEUE_NAME,

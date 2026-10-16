@@ -3,6 +3,8 @@
 - **Status:** Accepted
 - **Date:** 2026-10-15
 - **Decision owners:** Project architecture
+- **Security clarification:** 2026-10-15, trusted TLS termination and cursor
+  signing after BBX-012A independent review
 
 ## Context
 
@@ -53,6 +55,24 @@ storage, application log, rendered page, or analytics payload. Invalid or
 missing configuration fails closed. v0.1 adds no user table, account flow,
 session store, RBAC, SSO, invitation, or Supabase Auth dependency.
 
+The Web process does not treat `request.url`, `Forwarded`, or any
+`X-Forwarded-*` header as proof of secure transport. Production HTTPS is
+attested by a trusted TLS terminator using both a normalized
+`X-Forwarded-Proto: https` value and a fixed `X-Blackbox-Proxy-Token` header.
+The terminator removes client-supplied instances of those headers before
+injecting its own high-entropy token. The Web process stores only the token's
+lowercase SHA-256 digest in `DASHBOARD_TRUSTED_PROXY_TOKEN_SHA256`, compares the
+presented token in constant time, and removes the proof and forwarding headers
+before the request reaches a route. A forwarding header without valid proxy
+proof is untrusted and cannot make HTTP appear to be HTTPS.
+
+The TLS terminator and Web process share a private or loopback hop that is not
+directly browser-accessible. Plain HTTP without proxy proof is allowed only
+when `DASHBOARD_ALLOW_INSECURE_LOOPBACK=true`, the process is not running in
+production, and the development server is explicitly bound to a loopback
+interface. Host or forwarding headers do not turn a non-loopback deployment
+into loopback development.
+
 ### Presentation state is derived, not persisted
 
 The dashboard derives exactly one convenience state for each run while still
@@ -96,6 +116,14 @@ remain the source of projection semantics. Dashboard functions must preserve
 wrong-tenant/missing-resource indistinguishability, bounded limits, strict
 cursor decoding, deterministic ordering, current-snapshot identity, and
 repeatable-read consistency.
+
+Dashboard cursors are authenticated with HMAC-SHA-256 using a dedicated
+server-only `DASHBOARD_CURSOR_SIGNING_KEY`. The value is canonical unpadded
+base64url encoding of exactly 32 random bytes. It is independent of tenant
+identifiers, dashboard access credentials, ingestion credentials, and proxy
+credentials. Tenant and query scope remain signed cursor payload fields, never
+signing keys. The signing key must not enter a cursor, response, client bundle,
+URL, log, or error message; only the opaque signed cursor may appear in a URL.
 
 The evidence view may expose the already validated and locally redacted
 canonical event JSON, immutable timestamps and identifiers, exact evidence
@@ -163,6 +191,9 @@ BBX-012A must be complete before BBX-012B is approved for implementation.
 
 - Browser-native Basic authentication is intentionally minimal and less polished
   than a user-account login flow.
+- Production deployment requires a trusted TLS terminator with a separate
+  proxy credential, and cursor verification requires a separate rotation-bound
+  server secret.
 - The Web process needs direct server-side database connectivity.
 - Repository labels remain UUIDs in v0.1.
 - Large, binary, unsupported, or unverifiable artifact content is not rendered

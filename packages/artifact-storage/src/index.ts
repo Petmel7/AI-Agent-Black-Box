@@ -132,36 +132,38 @@ export async function readVerifiedArtifact(
     throw new TypeError('expectedSha256 must be lowercase SHA-256.');
 
   const controller = new AbortController();
-  const abort = () => controller.abort();
+  let abortCause: ArtifactReadError | null = null;
+  const currentAbortCause = (): ArtifactReadError | null => abortCause;
+  const abortWith = (cause: ArtifactReadError) => {
+    if (abortCause !== null) return;
+    abortCause = cause;
+    controller.abort(cause);
+  };
+  const abort = () =>
+    abortWith(new ArtifactReadError('artifact_read_cancelled', true));
   options.signal?.addEventListener('abort', abort, { once: true });
-  let timeoutKind: 'overall' | 'inactivity' | null = null;
   const overall = setTimeout(() => {
-    timeoutKind = 'overall';
-    controller.abort();
+    abortWith(new ArtifactReadError('artifact_read_timeout', true));
   }, options.attemptTimeoutMs);
   let inactivity: ReturnType<typeof setTimeout> | undefined;
   const resetInactivity = () => {
     if (inactivity) clearTimeout(inactivity);
     inactivity = setTimeout(() => {
-      timeoutKind = 'inactivity';
-      controller.abort();
+      abortWith(
+        new ArtifactReadError('artifact_read_inactivity_timeout', true),
+      );
     }, options.inactivityTimeoutMs);
   };
   resetInactivity();
   let stream: Readable | undefined;
   try {
-    if (options.signal?.aborted)
-      throw new ArtifactReadError('artifact_read_cancelled', true);
+    if (options.signal?.aborted) abort();
+    if (abortCause) throw abortCause;
     stream = await reader.open({ objectKey, signal: controller.signal });
     if (controller.signal.aborted) {
       stream.destroy();
-      throw new ArtifactReadError(
-        options.signal?.aborted
-          ? 'artifact_read_cancelled'
-          : timeoutKind === 'inactivity'
-            ? 'artifact_read_inactivity_timeout'
-            : 'artifact_read_timeout',
-        true,
+      throw (
+        abortCause ?? new ArtifactReadError('artifact_read_cancelled', true)
       );
     }
     const onAbort = () => stream?.destroy(new Error('aborted'));
@@ -190,19 +192,12 @@ export async function readVerifiedArtifact(
       throw new ArtifactReadError('artifact_hash_mismatch', false);
     return Buffer.concat(chunks, bytes);
   } catch (error) {
+    const cause = currentAbortCause();
+    if (cause)
+      throw new ArtifactReadError(cause.code, cause.retryable, {
+        cause: error,
+      });
     if (error instanceof ArtifactReadError) throw error;
-    if (timeoutKind === 'overall')
-      throw new ArtifactReadError('artifact_read_timeout', true, {
-        cause: error,
-      });
-    if (timeoutKind === 'inactivity')
-      throw new ArtifactReadError('artifact_read_inactivity_timeout', true, {
-        cause: error,
-      });
-    if (options.signal?.aborted)
-      throw new ArtifactReadError('artifact_read_cancelled', true, {
-        cause: error,
-      });
     throw error;
   } finally {
     clearTimeout(overall);
@@ -261,22 +256,36 @@ export class SupabaseArtifactReader implements ArtifactObjectReader {
     signal?: AbortSignal;
   }): Promise<Readable> {
     const controller = new AbortController();
-    const abort = () => controller.abort(input.signal?.reason);
+    let abortCause: ArtifactReadError | null = null;
+    const currentAbortCause = (): ArtifactReadError | null => abortCause;
+    let rejectAbort: ((error: ArtifactReadError) => void) | undefined;
+    const aborted = new Promise<never>((_, reject) => {
+      rejectAbort = reject;
+    });
+    void aborted.catch(() => undefined);
+    const abortWith = (cause: ArtifactReadError) => {
+      if (abortCause !== null) return;
+      abortCause = cause;
+      controller.abort(cause);
+      rejectAbort?.(cause);
+    };
+    const abort = () =>
+      abortWith(
+        input.signal?.reason instanceof ArtifactReadError
+          ? input.signal.reason
+          : new ArtifactReadError('artifact_read_cancelled', true),
+      );
     input.signal?.addEventListener('abort', abort, { once: true });
-    if (input.signal?.aborted) controller.abort(input.signal.reason);
+    if (input.signal?.aborted) abort();
     if (controller.signal.aborted) {
       input.signal?.removeEventListener('abort', abort);
-      throw new ArtifactReadError('artifact_read_cancelled', true);
+      throw (
+        abortCause ?? new ArtifactReadError('artifact_read_cancelled', true)
+      );
     }
-    let timedOut = false;
-    let rejectDeadline: ((error: Error) => void) | undefined;
-    const deadline = new Promise<never>((_, reject) => {
-      rejectDeadline = reject;
-    });
     const timer = setTimeout(() => {
-      timedOut = true;
-      controller.abort();
-      rejectDeadline?.(new Error('artifact_headers_timeout'));
+      const cause = new ArtifactReadError('artifact_read_timeout', true);
+      abortWith(cause);
     }, this.connectTimeoutMs);
     let response: Response;
     try {
@@ -292,20 +301,12 @@ export class SupabaseArtifactReader implements ArtifactObjectReader {
             },
           },
         ),
-        deadline,
+        aborted,
       ]);
     } catch (error) {
-      if (
-        input.signal?.aborted &&
-        input.signal.reason instanceof ArtifactReadError
-      )
-        throw input.signal.reason;
-      if (input.signal?.aborted)
-        throw new ArtifactReadError('artifact_read_cancelled', true, {
-          cause: error,
-        });
-      if (timedOut)
-        throw new ArtifactReadError('artifact_read_timeout', true, {
+      const cause = currentAbortCause();
+      if (cause)
+        throw new ArtifactReadError(cause.code, cause.retryable, {
           cause: error,
         });
       throw new ArtifactReadError('artifact_provider_unavailable', true, {

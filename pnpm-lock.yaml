@@ -76,9 +76,15 @@ importers:
 
   apps/web:
     dependencies:
+      '@blackbox/artifact-storage':
+        specifier: workspace:*
+        version: link:../../packages/artifact-storage
       '@blackbox/contracts':
         specifier: workspace:*
         version: link:../../packages/contracts
+      '@blackbox/database':
+        specifier: workspace:*
+        version: link:../../packages/database
       next:
         specifier: 16.3.5
         version: 16.3.5(@babel/core@7.29.7(supports-color@7.2.0))(@types/node@24.13.6)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)

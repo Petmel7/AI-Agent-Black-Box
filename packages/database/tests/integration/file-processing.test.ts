@@ -20,6 +20,7 @@ import {
   processFilesIntent,
   processFindingsIntent,
   replayFilesIntent,
+  resolveDashboardEvidence,
 } from '../../src/index.js';
 import { inspectFileSourceSnapshot } from '../../src/file-processing.js';
 
@@ -1699,5 +1700,203 @@ describe('files projector PostgreSQL lifecycle', () => {
       ]),
     ).toEqual(upstreamBefore);
     await Promise.all([writer.dispose(), reader.dispose()]);
+  });
+});
+
+describe('dashboard file and finding evidence ownership', () => {
+  it('resolves only exact current file entries and current finding references', async () => {
+    const scope = await repository();
+    const handle = createDatabaseClient({ connectionString });
+    const source = await addVerifiedFileSource(
+      handle,
+      scope,
+      0,
+      'src/authentication.ts',
+    );
+    const run = await handle.client.run.findUniqueOrThrow({
+      where: {
+        organizationId_canonicalRunId: {
+          organizationId: scope.organizationId,
+          canonicalRunId: scope.runId,
+        },
+      },
+      select: { id: true },
+    });
+    const coreIntent = await handle.client.processingIntent.findFirstOrThrow({
+      where: {
+        organizationId: scope.organizationId,
+        runId: run.id,
+        kind: 'EVIDENCE_BATCH_ACCEPTED',
+      },
+      select: { id: true },
+    });
+    await expect(
+      processCoreIntent(handle.client, coreIntent.id, coreOptions),
+    ).resolves.toBe('applied');
+    await expect(
+      processFilesIntent(
+        handle.client,
+        source.intentId,
+        readerFor([source]),
+        fileOptions,
+      ),
+    ).resolves.toBe('applied');
+    await expect(
+      processFindingsIntent(handle.client, source.intentId, findingsOptions),
+    ).resolves.toBe('applied');
+
+    const files = await listFileChanges(handle.client, {
+      organizationId: scope.organizationId,
+      repositoryId: scope.repositoryId,
+      canonicalRunId: scope.runId,
+      limit: 10,
+    });
+    expect(files?.processingState).toBe('ready');
+    const file = files!.items[0]!;
+    const preview = vi.fn(async () => ({
+      state: 'available' as const,
+      mediaType: 'application/json' as const,
+      text: source.bytes.toString('utf8'),
+      byteLength: source.bytes.length,
+    }));
+    const fileLocator = {
+      kind: 'file' as const,
+      eventId: file.sourceEventId,
+      artifactId: file.artifactId,
+      eventArtifactPointer: '/payload/fileListArtifact',
+      jsonPointer: `/files/${file.ordinal}`,
+      fileOrdinal: file.ordinal,
+      entryId: file.entryId,
+    };
+    const resolvedFile = await resolveDashboardEvidence(
+      handle.client,
+      {
+        organizationId: scope.organizationId,
+        repositoryId: scope.repositoryId,
+        canonicalRunId: scope.runId,
+        locator: fileLocator,
+      },
+      preview,
+    );
+    expect(resolvedFile).toMatchObject({
+      locatorKind: 'file',
+      file: {
+        ordinal: file.ordinal,
+        entryId: file.entryId,
+        displayPath: 'src/authentication.ts',
+      },
+      artifact: {
+        artifactId: file.artifactId,
+        eventArtifactPointer: '/payload/fileListArtifact',
+        jsonPointer: '/files/0',
+        verificationState: 'verified',
+      },
+    });
+    expect(JSON.stringify(resolvedFile)).not.toContain(source.objectKey);
+    for (const locator of [
+      { ...fileLocator, entryId: `${file.entryId}-mismatch` },
+      {
+        ...fileLocator,
+        fileOrdinal: file.ordinal + 1,
+        jsonPointer: '/files/1',
+      },
+      { ...fileLocator, artifactId: randomUUID() },
+      { ...fileLocator, eventId: randomUUID() },
+      { ...fileLocator, jsonPointer: '/files/9' },
+    ])
+      await expect(
+        resolveDashboardEvidence(handle.client, {
+          organizationId: scope.organizationId,
+          repositoryId: scope.repositoryId,
+          canonicalRunId: scope.runId,
+          locator,
+        }),
+      ).resolves.toBeNull();
+
+    const findings = await listFindings(handle.client, {
+      organizationId: scope.organizationId,
+      repositoryId: scope.repositoryId,
+      canonicalRunId: scope.runId,
+      limit: 9,
+    });
+    const sensitive = findings!.items.find(
+      (item) => item.ruleId === 'bbx.sensitive-area-change',
+    )!;
+    expect(sensitive.references).toHaveLength(1);
+    const resolvedFinding = await resolveDashboardEvidence(
+      handle.client,
+      {
+        organizationId: scope.organizationId,
+        repositoryId: scope.repositoryId,
+        canonicalRunId: scope.runId,
+        locator: {
+          kind: 'finding',
+          resultKey: sensitive.resultKey,
+          referenceOrdinal: sensitive.references[0]!.ordinal,
+        },
+      },
+      preview,
+    );
+    expect(resolvedFinding).toMatchObject({
+      locatorKind: 'finding',
+      finding: {
+        resultKey: sensitive.resultKey,
+        ruleId: 'bbx.sensitive-area-change',
+      },
+      file: { entryId: file.entryId },
+    });
+    await expect(
+      resolveDashboardEvidence(handle.client, {
+        organizationId: scope.organizationId,
+        repositoryId: scope.repositoryId,
+        canonicalRunId: scope.runId,
+        locator: {
+          kind: 'finding',
+          resultKey: '0'.repeat(64),
+          referenceOrdinal: 0,
+        },
+      }),
+    ).resolves.toBeNull();
+
+    await ingestEvidenceBatch(handle.client, {
+      organizationId: scope.organizationId,
+      repositoryId: scope.repositoryId,
+      batch: EvidenceBatchSchema.parse({
+        schemaVersion: 1,
+        batchId: randomUUID(),
+        runId: scope.runId,
+        sentAt: new Date().toISOString(),
+        events: [
+          {
+            schemaVersion: 1,
+            eventId: randomUUID(),
+            runId: scope.runId,
+            sequence: 1,
+            kind: 'error.observed',
+            observedAt: new Date().toISOString(),
+            source: { component: 'collector' },
+            payload: {
+              errorId: randomUUID(),
+              category: 'agent',
+              code: 'dashboard_stale_finding',
+              message: { state: 'omitted' },
+            },
+          },
+        ],
+      }),
+    });
+    await expect(
+      resolveDashboardEvidence(handle.client, {
+        organizationId: scope.organizationId,
+        repositoryId: scope.repositoryId,
+        canonicalRunId: scope.runId,
+        locator: {
+          kind: 'finding',
+          resultKey: sensitive.resultKey,
+          referenceOrdinal: sensitive.references[0]!.ordinal,
+        },
+      }),
+    ).rejects.toMatchObject({ code: 'stale_evidence_locator' });
+    await handle.dispose();
   });
 });

@@ -6,7 +6,8 @@ version 1 evidence foundation and PostgreSQL-owned integrity guards.
 
 ## Connection boundaries
 
-- `DATABASE_URL` is reserved for later deployed application composition.
+- `DATABASE_URL` is read explicitly by deployed server composition roots. The
+  BBX-012A Web runtime uses it only from a server-only module.
 - `DIRECT_URL` is reserved for later deployed migration composition.
 - `TEST_DATABASE_URL` is the only variable accepted by the checked-in database
   migration and integration helpers. The ingestion process receives its
@@ -35,6 +36,14 @@ repeatable-read query boundaries; they expose no HTTP or UI behavior. Finding
 replacement invalidates the complete summary graph atomically before referenced
 results change. Claim/support cursors carry the exact summary identity and are
 rejected after replacement instead of traversing across snapshots.
+
+`listDashboardRuns`, `listDashboardTimeline`, and
+`resolveDashboardEvidence` add the BBX-012A read-only presentation boundary.
+They use bounded tenant/snapshot-scoped cursors authenticated by a caller-owned
+dedicated 32-byte HMAC key, canonical evidence validation,
+and exact same-run evidence ownership. The evidence resolver supplies a private
+storage key only to an injected server-side preview reader and never returns it
+in the public view model.
 
 The BBX-005 migration adds mutable artifact-upload attempts, bounded verification
 leases, terminal integrity observations, partial uniqueness for active and

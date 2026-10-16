@@ -258,6 +258,18 @@ function summaryIsAvailable(status: {
   return status.availability === 'current';
 }
 
+// Dashboard queries share these exact freshness rules so BBX-012 does not
+// reinterpret the BBX-009 through BBX-011 projection contracts.
+export {
+  currentFileSource as inspectCurrentFileQuerySource,
+  currentSource as inspectCurrentCoreQuerySource,
+  fileState as deriveFileQueryState,
+  findingsState as deriveFindingsQueryState,
+  state as deriveCoreQueryState,
+  summaryIsAvailable as isCurrentSummaryAvailable,
+  summaryStatus as deriveSummaryQueryStatus,
+};
+
 async function listCoreRunsInSnapshot(
   client: Prisma.TransactionClient,
   input: RunListInput,

@@ -67,6 +67,66 @@ describe('bounded artifact reads', () => {
     });
     expect(stream.destroyed).toBe(true);
   });
+
+  it.each([
+    ['attempt', 100, 5, 'artifact_read_timeout'],
+    ['inactivity', 5, 100, 'artifact_read_inactivity_timeout'],
+  ] as const)(
+    'preserves the outer %s deadline while Supabase fetch awaits headers',
+    async (kind, inactivityTimeoutMs, attemptTimeoutMs, code) => {
+      void kind;
+      const value = new SupabaseArtifactReader({
+        url: 'https://example.supabase.co',
+        serviceRoleKey: 'secret',
+        bucket: 'private',
+        connectTimeoutMs: 200,
+        fetch: vi.fn(
+          () => new Promise<Response>(() => undefined),
+        ) as typeof fetch,
+      });
+      await expect(
+        readVerifiedArtifact(value, 'server-key', {
+          ...options,
+          inactivityTimeoutMs,
+          attemptTimeoutMs,
+        }),
+      ).rejects.toMatchObject({ code, retryable: true });
+    },
+  );
+
+  it('uses the first authoritative abort cause in timeout/cancellation races', async () => {
+    const alreadyCancelled = new AbortController();
+    alreadyCancelled.abort();
+    const signalAwareReader: ArtifactObjectReader = {
+      open: ({ signal }) =>
+        new Promise((_, reject) => {
+          signal?.addEventListener(
+            'abort',
+            () =>
+              reject(new ArtifactReadError('artifact_read_cancelled', true)),
+            { once: true },
+          );
+        }),
+    };
+    await expect(
+      readVerifiedArtifact(signalAwareReader, 'server-key', {
+        ...options,
+        attemptTimeoutMs: 5,
+        signal: alreadyCancelled.signal,
+      }),
+    ).rejects.toMatchObject({ code: 'artifact_read_cancelled' });
+
+    const laterCancellation = new AbortController();
+    const pending = readVerifiedArtifact(signalAwareReader, 'server-key', {
+      ...options,
+      attemptTimeoutMs: 5,
+      signal: laterCancellation.signal,
+    });
+    setTimeout(() => laterCancellation.abort(), 10);
+    await expect(pending).rejects.toMatchObject({
+      code: 'artifact_read_timeout',
+    });
+  });
 });
 
 describe('SupabaseArtifactReader', () => {
@@ -178,6 +238,18 @@ describe('SupabaseArtifactReader', () => {
 });
 
 describe('stream deadlines and cleanup', () => {
+  it('classifies the overall read deadline and destroys the stream', async () => {
+    const stream = new Readable({ read() {} });
+    await expect(
+      readVerifiedArtifact({ open: async () => stream }, 'server-key', {
+        ...options,
+        inactivityTimeoutMs: 100,
+        attemptTimeoutMs: 5,
+      }),
+    ).rejects.toMatchObject({ code: 'artifact_read_timeout' });
+    expect(stream.destroyed).toBe(true);
+  });
+
   it('classifies a slow body as inactivity and destroys it', async () => {
     const stream = new Readable({ read() {} });
     await expect(
