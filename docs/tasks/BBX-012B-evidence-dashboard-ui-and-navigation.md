@@ -1,14 +1,16 @@
 # BBX-012B: Evidence Dashboard UI and Navigation
 
-- **Status:** Draft
+- **Status:** Approved
 - **Owner:** Implementation Chat
 - **Review:** Review Chat
-- **Depends on:** BBX-012A completed at a committed baseline
+- **Depends on:** BBX-012A completed at committed baseline
+  `f117faeb0208b88b8e5cb0e240a35d30c9761f9d`
 - **Delivery risk:** High
 - **Execution profile:** High
 - **Risk triggers:** private evidence rendering, authentication-regression risk,
-  user-visible verdict semantics, untrusted content/XSS, snapshot pagination,
-  evidence-link integrity, accessibility, and critical browser workflow
+  server/client data boundaries, user-visible verdict semantics, untrusted
+  content/XSS, signed snapshot pagination, evidence-link integrity,
+  accessibility, browser-test infrastructure, and critical browser workflow
 - **Architecture:** Accepted ADR-0013; accepted ADR-0001 through ADR-0012
   remain unchanged
 
@@ -20,10 +22,17 @@ safe navigation from findings and summary claims to their support.
 
 ## Context
 
-BBX-012A must first provide authenticated server composition, the presentation
-state contract, tenant-wide run and timeline queries, and exact evidence
-resolution. Refine this draft against the completed 012A public types before
-approval; do not duplicate query or security semantics inside components.
+BBX-012A provides authenticated server composition, the presentation-state
+contract, signed tenant-wide run and timeline queries, and exact evidence
+resolution. Its committed Web runtime exposes `listRuns`, `listTimeline`, and
+`resolveEvidence`. The database package also exposes the existing run-detail,
+file, finding, summary-claim, and summary-support read models.
+
+BBX-012B may add server-only dashboard wrappers needed to compose those models
+safely, but it must not change their domain meaning. Legacy projection cursors
+must not be exposed directly in browser URLs. Browser-visible continuation
+state is authenticated with the dedicated dashboard cursor authority and bound
+to the exact tenant, repository, run, collection, snapshot, and position.
 
 ## In Scope
 
@@ -34,12 +43,14 @@ approval; do not duplicate query or security semantics inside components.
 - Bounded server-driven pagination with visible stale/replaced-cursor behavior.
 - Responsive, keyboard-accessible, high-contrast presentation and explicit
   loading/empty/processing/incomplete/failed/unavailable/truncated states.
+- Additive dashboard-detail read wrappers and nullable run-list metrics needed
+  by these views.
 - Focused component/route tests and critical Playwright user journeys.
 
 ## Out of Scope
 
-- Changes to ADR-0013 access semantics or BBX-012A query contracts except a
-  separately approved defect correction.
+- Reinterpretation or weakening of ADR-0013 or BBX-012A query, authentication,
+  tenant, evidence, cursor, or presentation semantics.
 - Database schema/migrations, new projections, workers, queues, ingestion,
   collector behavior, replay or mutation controls.
 - Signed or unrestricted artifact downloads, binary/active-content rendering,
@@ -49,6 +60,11 @@ approval; do not duplicate query or security semantics inside components.
 - Invented repository names, task completion claims, numeric quality scores, or
   statements that passing tests prove correctness.
 
+Additive dashboard-specific read wrappers, authenticated child cursors, and
+nullable run-list test/token aggregates are explicitly in scope. If they
+require schema changes, a new trust boundary, or changed query meaning, stop
+and return to architecture review.
+
 ## Architecture Constraints
 
 - Implement only after BBX-012A is Done and ADR-0013 is Accepted.
@@ -56,6 +72,8 @@ approval; do not duplicate query or security semantics inside components.
   BBX-012A functions. Client components receive only bounded view models.
 - Never import Prisma, database configuration, credentials, or storage
   capabilities into client code.
+- Inject the configured organization inside the server runtime; callers cannot
+  provide or override it.
 - Preserve the ADR-0013 presentation mapping and separately render exact child,
   processing, findings, and summary states.
 - Render evidence as escaped text/structured values. Do not use
@@ -63,20 +81,50 @@ approval; do not duplicate query or security semantics inside components.
   unbounded DOM output.
 - Preserve snapshot-bound cursors and fail visibly on stale replacement instead
   of silently restarting or mixing pages.
+- Never expose unsigned legacy projection cursors in browser URLs. Bind every
+  browser cursor to organization, repository, run, collection, exact snapshot,
+  and continuation position using the dedicated dashboard HMAC key.
+- Prefer React Server Components and server-only modules. Client components
+  receive only minimal serializable view models.
+- Make every private route and handler dynamic and `no-store`; builds must not
+  query the database or pre-render private evidence.
+- No new ADR is required: this task implements Accepted ADR-0013 without
+  changing its process, trust, or durable-data boundaries.
 
 ## Required Changes
 
 ### Routes and layout
 
-- Replace the placeholder home page with an authenticated redirect or run-list
-  entry point.
+- Use these canonical private routes:
+  - `/` redirects authenticated users to `/runs`;
+  - `/runs` lists runs;
+  - `/repositories/[repositoryId]/runs/[runId]` shows run detail;
+  - `/repositories/[repositoryId]/runs/[runId]/evidence` resolves one
+    allowlisted evidence locator.
+- Strictly validate UUID path segments and bounded allowlisted query values.
 - Add a tenant-wide run list with repository UUID, presentation state, creation
-  time, duration, files changed, observed tests, findings, tokens, and explicit
+  time, duration, files changed, command/tool counts, test-observation state,
+  nullable test counts, findings, nullable token aggregates, and explicit
   unavailable values.
-- Add canonical repository/run routes using validated UUID segments and generic
-  not-found behavior.
+- Use generic not-found/error behavior that does not reveal cross-tenant or
+  missing-resource distinctions.
 - Provide stable page metadata, skip navigation, semantic landmarks, focus
   management, and a compact responsive layout.
+
+### Server read facade and pagination
+
+- Extend the server-only dashboard runtime with explicit allowlisted methods
+  for run detail, files, findings, summary claims, and summary supports in
+  addition to runs, timeline, and evidence.
+- Reuse the existing database read models and their field meanings.
+- Add dashboard-specific database wrappers only where needed to prove a stable
+  snapshot or authenticated continuation for a browser-visible collection.
+- Sign browser cursors with the BBX-012A dashboard cursor key. Rotation,
+  malformed input, wrong scope, and replaced snapshots fail visibly; the UI
+  must not silently restart and mix snapshots.
+- Provide bounded server-driven pagination for runs, timeline, files, findings,
+  summary claims, summary supports, and projected child collections. Browser
+  history provides backward traversal.
 
 ### Run detail
 
@@ -90,6 +138,10 @@ approval; do not duplicate query or security semantics inside components.
   test observations, tools, errors, usage, and the canonical event timeline.
 - Represent missing evidence as unavailable/unknown, never as zero, success, or
   an empty completed section.
+- Show the overall presentation state separately from child, processing,
+  projector, findings, and summary states.
+- Page all bounded child collections instead of treating the first page as
+  complete.
 
 ### Evidence navigation
 
@@ -101,6 +153,8 @@ approval; do not duplicate query or security semantics inside components.
 - Render only BBX-012A's bounded verified text/JSON artifact preview as escaped
   text. Show explicit binary, oversized, unsupported, unavailable, and integrity
   failure states without receiving storage keys or partial bytes.
+- Do not use `dangerouslySetInnerHTML` or activate evidence-derived HTML,
+  Markdown, links, or scripts.
 - Preserve back navigation and visible focus on the referenced item. A missing,
   stale, or incompatible target renders a safe explicit state.
 
@@ -108,6 +162,8 @@ approval; do not duplicate query or security semantics inside components.
 
 - Use bounded URL-safe cursor parameters without exposing tenant identity or
   internal database IDs.
+- Allowlist query names and values exactly; reject duplicates, malformed
+  encodings, oversized values, and unknown authority-bearing fields.
 - Support complete traversal for runs, timeline, files, findings, summary
   claims/supports, and projected child collections.
 - Surface processing, stale, failed, incomplete, empty, truncated, unauthorized,
@@ -116,11 +172,26 @@ approval; do not duplicate query or security semantics inside components.
 ### Testing and documentation
 
 - Add reusable deterministic UI fixtures shaped exactly like BBX-012A outputs.
-- Add critical browser coverage for authentication, list-to-detail navigation,
-  state labels, finding/claim support navigation, pagination, stale cursors,
-  keyboard operation, and secret/XSS sentinels.
+- Add exact pinned `@playwright/test` as a Web development dependency, its
+  lockfile update, Chromium-only configuration, and a `test:e2e` script. Do not
+  commit browser binaries.
+- Run browser tests against a production Web build/start through the standard
+  listener launcher, a fresh isolated PostgreSQL 16 database, deterministic
+  evidence fixtures, and test-owned local storage/proxy infrastructure.
+- Exercise the real authenticated boundary. The local trusted TLS/proxy harness
+  strips inbound forwarding/proof headers and injects its own proof; browser
+  code never receives proxy, cursor, database, or storage credentials.
+- Shape fixtures through supported persistence, processing, and query
+  boundaries rather than inventing browser-only DTOs.
+- Add critical browser coverage for the authentication challenge,
+  list-to-detail navigation, state labels, finding/claim support navigation,
+  pagination, stale cursors, keyboard/focus operation, representative responsive
+  layouts, wrong-tenant/missing resources, and secret/XSS sentinels.
 - Document local startup, required private configuration, supported routes,
-  state meanings, and excluded artifact/export behavior.
+  browser installation, deterministic test infrastructure, state meanings, and
+  excluded artifact/export behavior.
+- Clean up test servers, browsers, database resources, temporary credentials,
+  and generated output even on failure.
 
 ## Acceptance Criteria
 
@@ -131,8 +202,12 @@ approval; do not duplicate query or security semantics inside components.
   accepted mapper and include wording that does not overstate evidence.
 - Unknown, null, incomplete, stale, failed, and truncated values are visibly
   distinct and never converted to success or zero.
-- Pagination returns every item once in deterministic order; stale cursors fail
-  visibly and never mix snapshots.
+- Run-list test/token metrics are nullable and never synthesized from absence.
+- Pagination returns every item once in deterministic order; every
+  browser-visible cursor is signed, snapshot-bound, and collection-scoped;
+  stale cursors fail visibly and never mix snapshots.
+- Legacy unsigned child cursors never appear in browser URLs or serialized
+  client view models.
 - Wrong-tenant and missing routes are indistinguishable, and no credential,
   organization ID authority, database value, storage key, or internal ID enters
   client output.
@@ -142,6 +217,8 @@ approval; do not duplicate query or security semantics inside components.
   for binary, oversized, unsupported, or unverifiable artifacts.
 - Layout and navigation work at narrow and desktop widths with keyboard-only
   operation, visible focus, semantic headings, and accessible names.
+- Private pages are dynamic and non-cacheable, and production builds do not
+  access the database or pre-render private evidence.
 - No persistence, projection, queue, worker, ingestion, collector, export,
   GitHub, policy, LLM, or artifact-byte behavior changes.
 
@@ -149,16 +226,21 @@ approval; do not duplicate query or security semantics inside components.
 
 - Unit tests for view-model formatting, unavailable values, state wording,
   bounds, and route/cursor construction.
+- Server-runtime tests for organization injection, allowlisted inputs, signed
+  child-cursor scope, key rotation, and snapshot replacement.
 - Route/server tests for auth enforcement, validated identifiers, generic
   not-found behavior, safe errors, and absence of server secrets in serialized
   output.
 - Component tests for every presentation state, projector diagnostics, summary
   class, finding outcome/severity, truncation, empty sections, and hostile text.
-- Pagination tests for every displayed collection, including terminal, malformed,
-  stale, replacement, and back-navigation behavior.
-- Playwright tests over an isolated seeded PostgreSQL database for login
-  challenge, run-list/detail journey, support-to-evidence navigation, keyboard
-  operation, responsive layout, and wrong-tenant/nonexistent routes.
+- Pagination tests for every displayed collection, including stable multi-page
+  traversal, exact replay, terminal cursors, collection binding, malformed,
+  stale/replaced snapshots, and back-navigation behavior.
+- Playwright tests over an isolated seeded PostgreSQL database and trusted local
+  proxy for the authentication challenge, run-list/detail journey, every
+  presentation-state family, support-to-evidence navigation, stale pagination,
+  keyboard/focus behavior, responsive layout, XSS/secret sentinels, and
+  indistinguishable wrong-tenant/nonexistent routes.
 - Existing database query, Web health, and production-build regressions.
 
 ## Validation
@@ -184,9 +266,15 @@ with production-like authentication and no external service. Do not install
 dependencies, download browser binaries, start Docker, use a database, or access
 a network without the applicable authorization.
 
+Use PostgreSQL 16 from an empty database and apply all checked-in migrations.
+Playwright browser installation/download requires explicit authorization when
+the exact locked browser is unavailable. PGMQ validation is unnecessary unless
+queue behavior changes.
+
 ## Deliverables
 
 - Authenticated evidence-dashboard run list and run-detail routes.
+- Server-only dashboard detail facade and signed child-cursor support.
 - Accessible reusable components for states, summaries, findings, evidence,
   files, timeline, commands, tests, errors, and usage.
 - Stable evidence navigation and bounded pagination.
@@ -211,11 +299,17 @@ a network without the applicable authorization.
   DTOs, escaped text, output bounds, and XSS sentinels are mandatory.
 - Independent collection pagination can mix snapshots; accepted snapshot-bound
   cursors and explicit stale handling prevent silent mixing.
+- Direct exposure of older child cursors can create a tamperable browser
+  authority; all browser continuation state is reissued by the dashboard.
 - The first critical browser journey adds test/runtime complexity; focused
   Playwright coverage is justified and must remain isolated and deterministic.
+- Browser-test proxy or fixture shortcuts can accidentally bypass the production
+  authentication boundary; E2E uses the real launcher and trusted proof flow.
 
 ## Open Questions
 
-- Confirm the exact BBX-012A exported view-model and error names before moving
-  this draft to `Proposed`.
-- Confirm the checked-in Playwright/browser runtime strategy before approval.
+None. The committed BBX-012A APIs and existing database read models are the
+integration baseline. Playwright uses a pinned Web development dependency,
+Chromium only, no committed browser binary, deterministic local
+PostgreSQL/storage/proxy fixtures, and explicit authorization for installation
+or infrastructure access.
