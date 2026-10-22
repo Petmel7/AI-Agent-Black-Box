@@ -127,6 +127,8 @@ describe('dashboard tenant-wide run list', () => {
         `^(?:${scope.firstRepositoryId}|${scope.secondRepositoryId})$`,
       ),
     );
+    expect(page.items[0]!.testCounts).toBeNull();
+    expect(page.items[0]!.tokenAggregates).toBeNull();
     const next = await listDashboardRuns(handle.client, {
       organizationId: scope.organizationId,
       cursorSigningKey,

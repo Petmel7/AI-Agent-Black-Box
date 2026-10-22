@@ -2,8 +2,24 @@
 
 The Web application is a private, read-only Next.js boundary. BBX-012A adds
 authentication, trusted tenant composition, bounded dashboard queries, and
-verified evidence previews. BBX-012B owns the visual run list, run detail, and
-navigation experience.
+verified evidence previews. BBX-012B provides the visual run list, run detail,
+and exact evidence navigation experience.
+
+## Supported routes
+
+- `/` redirects an authenticated request to `/runs`.
+- `/runs` lists the configured tenant's runs and accepts only a repository UUID
+  filter and the signed run cursor.
+- `/repositories/<repository UUID>/runs/<run UUID>` presents the independent
+  run, projector, finding, summary, and evidence states.
+- `/repositories/<repository UUID>/runs/<run UUID>/evidence` resolves one
+  allowlisted same-run event, artifact, file, or finding-reference locator.
+
+All routes are dynamic and non-cacheable. Child collection URLs contain only
+dashboard-signed, tenant/repository/run/collection/snapshot-bound cursors;
+legacy projection positions are never URL authority. Browser history is the
+supported previous-page control. A malformed, rotated, wrong-scope, or replaced
+cursor displays a safe restart state instead of silently mixing snapshots.
 
 ## Required server configuration
 
@@ -86,6 +102,34 @@ Evidence is rendered only as inert text or structured data. The server may
 return a small allowlisted text/JSON preview after exact length and SHA-256
 verification, strict UTF-8 and binary checks, and deadline/cancellation bounds.
 Storage keys and public or signed artifact capabilities are never returned.
+
+The UI labels `PASS`, `REVIEW`, `FAILED`, `INCOMPLETE`, and `PROCESSING` only
+through the accepted presentation mapper. Those labels do not replace the
+separately displayed process outcome, projector freshness, deterministic
+finding outcome, or summary availability. Null values are shown as
+`Unavailable`; absent tests and usage never become zero or success. Long
+structured values and projection previews are visibly truncated.
+
+## Browser validation
+
+`pnpm --filter @blackbox/web test:e2e` runs Chromium only against a production
+build through the standard listener launcher and a test-owned loopback trusted
+proxy. It intentionally requires an already authorized, empty PostgreSQL 16
+database with all migrations deployed, deterministic fixtures created through
+the supported ingestion/processing boundaries, and test-owned local artifact
+storage. The runner requires the private dashboard variables plus
+`BBX_E2E_DASHBOARD_TOKEN`, `BBX_E2E_TRUSTED_PROXY_TOKEN`,
+`BBX_E2E_REPOSITORY_ID`, `BBX_E2E_RUN_ID`,
+`BBX_E2E_HIDDEN_REPOSITORY_ID`, and `BBX_E2E_SECRET_SENTINEL`. The proxy strips
+browser forwarding/proof headers and injects its own proof; these E2E variables
+are internal test controls and are not production configuration.
+
+Install the exactly locked Chromium binary with Playwright's browser installer
+only after the installation and network access are explicitly authorized. The
+test command does not provision Docker, contact an external service, or
+download a browser. Its owning orchestration must remove the isolated database,
+storage fixture, browser/server processes, ports, and temporary credentials in
+a `finally` path.
 
 Replay, mutation, unrestricted downloads, export, public artifacts, accounts,
 RBAC, SSO, and external-provider integrations are unavailable in this slice.

@@ -509,6 +509,14 @@ export async function listDashboardRuns(
             toolCallCount: run.coreRunProjection?.toolCallCount ?? null,
             testObservationState:
               run.coreRunProjection?.testObservationState ?? 'not_observed',
+            testCounts:
+              coreState === 'ready' || coreState === 'incomplete'
+                ? (run.coreRunProjection?.testCounts ?? null)
+                : null,
+            tokenAggregates:
+              coreState === 'ready' || coreState === 'incomplete'
+                ? (run.coreRunProjection?.tokenAggregates ?? null)
+                : null,
             filesChanged:
               filesState === 'ready'
                 ? (run.fileRunProjection?.fileCount ?? 0)

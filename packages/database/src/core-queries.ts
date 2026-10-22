@@ -571,6 +571,7 @@ async function listFileChangesInSnapshot(
     return {
       processingState,
       processingErrorCode: processing?.lastErrorCode ?? null,
+      snapshotFingerprint: null,
       items: [],
       nextCursor: null,
     };
@@ -616,6 +617,7 @@ async function listFileChangesInSnapshot(
   return {
     processingState,
     processingErrorCode: null,
+    snapshotFingerprint: run.fileRunProjection!.sourceFingerprint,
     items: visible.map((row) => ({
       sourceEventId: row.source_event_id,
       sourceSequence: Number(row.source_sequence),
@@ -1160,6 +1162,7 @@ export async function listFindings(
         return {
           processingState,
           processingErrorCode: processing?.lastErrorCode ?? null,
+          snapshotFingerprint: null,
           deterministicOutcome: null,
           coverage: null,
           items: [],
@@ -1187,6 +1190,7 @@ export async function listFindings(
       return {
         processingState,
         processingErrorCode: null,
+        snapshotFingerprint: run.findingsRunProjection.sourceFingerprint,
         deterministicOutcome: run.findingsRunProjection.deterministicOutcome,
         coverage: run.findingsRunProjection.coverage,
         items: visible.map((row) => ({
@@ -1389,6 +1393,7 @@ export async function listSummaryClaims(
           sectionCount: null,
           claimCount: null,
           claimsTruncated: null,
+          snapshotKey: null,
           items: [],
           nextCursor: null,
         };
@@ -1438,6 +1443,7 @@ export async function listSummaryClaims(
         sectionCount: run.summaryRunProjection.sectionCount,
         claimCount: run.summaryRunProjection.claimCount,
         claimsTruncated: run.summaryRunProjection.claimsTruncated,
+        snapshotKey: run.summaryRunProjection.summaryKey,
         items: visible.map((row) => ({
           claimKey: row.claimKey,
           stableId: row.stableId,
@@ -1506,6 +1512,7 @@ export async function listSummarySupports(
           summaryAvailability: status.availability,
           processingErrorCode: processing?.lastErrorCode ?? null,
           claimKey: null,
+          snapshotKey: null,
           items: [],
           nextCursor: null,
         };
@@ -1546,6 +1553,7 @@ export async function listSummarySupports(
         summaryAvailability: status.availability,
         processingErrorCode: processing?.lastErrorCode ?? null,
         claimKey: claim.claimKey,
+        snapshotKey: run.summaryRunProjection.summaryKey,
         items: visible.map(mapSummarySupport),
         nextCursor:
           rows.length > input.limit && visible.at(-1)

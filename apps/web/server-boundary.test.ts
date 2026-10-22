@@ -51,8 +51,29 @@ describe('Web server/client boundary', () => {
   });
 
   it('contains no active-content rendering escape hatch', async () => {
-    for (const file of ['app/page.tsx', 'lib/presentation.ts']) {
-      const source = await readFile(`${root}/${file}`, 'utf8');
+    for (const file of await (async function walk(
+      directory: string,
+    ): Promise<string[]> {
+      const entries = await readdir(directory, { withFileTypes: true });
+      return (
+        await Promise.all(
+          entries.map(async (entry) => {
+            const path = `${directory}/${entry.name}`;
+            if (
+              entry.isDirectory() &&
+              ['node_modules', '.next'].includes(entry.name)
+            )
+              return [];
+            if (entry.isDirectory()) return walk(path);
+            return /\.(?:ts|tsx)$/.test(entry.name) &&
+              !/\.test\.(?:ts|tsx)$/.test(entry.name)
+              ? [path]
+              : [];
+          }),
+        )
+      ).flat();
+    })(root)) {
+      const source = await readFile(file, 'utf8');
       expect(source).not.toContain('dangerouslySetInnerHTML');
     }
   });

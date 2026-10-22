@@ -1,7 +1,9 @@
 # Private dashboard operations
 
-BBX-012A establishes a read-only application boundary. It does not add replay,
-evidence mutation, export, public artifact access, or dashboard design.
+BBX-012A establishes the read-only application boundary and BBX-012B presents
+that boundary as an authenticated run list, evidence-rich run detail, and exact
+evidence view. Neither slice adds replay, evidence mutation, export, or public
+artifact access.
 
 ## Configuration and startup
 
@@ -85,6 +87,33 @@ evidence and projections are unaffected.
 - Missing, unsupported, oversized, binary, invalid, timed-out, cancelled, or
   provider-failed previews return a stable unavailable reason and no partial
   bytes.
+- Files, findings, summary claims/supports, and projected child collections use
+  independent bounded pages. Their browser cursors are signed with the
+  dashboard key and bind the configured organization, repository, run,
+  collection, exact projection snapshot, and continuation position. Summary
+  support cursors also bind the selected claim. Replaced snapshots fail visibly.
+
+## Evidence presentation
+
+The canonical private routes are `/runs`,
+`/repositories/<repository UUID>/runs/<run UUID>`, and the nested `/evidence`
+route. Repository UUID remains the v0.1 display fallback; the browser cannot
+select an organization. Missing and wrong-tenant resources use the same generic
+not-found behavior. All private pages force dynamic, no-store rendering, so a
+production build neither queries the database nor pre-renders evidence.
+
+Evidence values, claim text, finding explanations, paths, captures, and artifact
+previews are untrusted. They are emitted only through escaped React text or
+bounded structured `<pre>` output. Evidence-derived HTML, Markdown, links, CSS,
+and scripts are never activated. Verified previews remain limited to the
+BBX-012A allowlist and integrity checks; binary, oversized, unsupported,
+unavailable, or unverifiable artifacts expose no bytes and have no download
+capability.
+
+The presentation badge is not a policy or correctness verdict. Operators must
+read it alongside the observed process outcome, individual projector states,
+finding coverage/outcome, summary state, explicit test-observation state, and
+unavailable/truncated markers.
 
 Do not log authorization headers, raw credentials, database URLs, service-role
 keys, storage keys, or evidence content. Safe errors contain no tenant, run,

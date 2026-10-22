@@ -1,6 +1,6 @@
 # BBX-012B: Evidence Dashboard UI and Navigation
 
-- **Status:** Approved
+- **Status:** Done
 - **Owner:** Implementation Chat
 - **Review:** Review Chat
 - **Depends on:** BBX-012A completed at committed baseline

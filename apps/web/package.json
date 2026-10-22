@@ -9,6 +9,7 @@
     "lint": "eslint .",
     "start": "node ./scripts/dashboard-next.mjs start",
     "test": "vitest run",
+    "test:e2e": "node ./test/e2e-controller.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
@@ -20,6 +21,7 @@
     "react-dom": "19.3.0"
   },
   "devDependencies": {
+    "@playwright/test": "1.51.1",
     "@blackbox/config": "workspace:*",
     "@types/node": "24.13.6",
     "@types/react": "19.3.0",

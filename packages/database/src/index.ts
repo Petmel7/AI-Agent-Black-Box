@@ -116,6 +116,12 @@ export {
   type DashboardVerifiedArtifactSource,
 } from './dashboard-queries.js';
 export {
+  dashboardCursorScope,
+  decodeDashboardCursor,
+  encodeDashboardCursor,
+  InvalidDashboardCursorError,
+} from './dashboard-cursors.js';
+export {
   createPgmqProcessingQueue,
   MalformedQueueMessageError,
   PROCESSING_QUEUE_NAME,
