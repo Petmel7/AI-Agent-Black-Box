@@ -23,6 +23,8 @@ export default defineConfig({
     },
   },
   test: {
+    // Live process-ownership and real-Next suites require serialized file execution.
+    fileParallelism: false,
     include: ['**/*.test.ts', '**/*.test.tsx'],
   },
 });
