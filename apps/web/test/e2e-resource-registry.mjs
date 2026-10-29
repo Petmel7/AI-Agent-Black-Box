@@ -123,7 +123,7 @@ export function createParentResourceRegistry(plan, importAuthority) {
   const registrations = new Map(
     [...plan].map(([resource, entry]) => [
       resource,
-      { entry, authority: undefined, completed: false },
+      { entry, authority: undefined, state: 'planned' },
     ]),
   );
 
@@ -132,8 +132,7 @@ export function createParentResourceRegistry(plan, importAuthority) {
     if (
       candidate?.version !== 1 ||
       registration === undefined ||
-      registration.completed ||
-      registration.authority !== undefined ||
+      registration.state !== 'planned' ||
       candidate.resourceId !== registration.entry.resourceId ||
       typeof expectedRole !== 'string'
     )
@@ -143,14 +142,36 @@ export function createParentResourceRegistry(plan, importAuthority) {
       metadataDirectory: registration.entry.metadataDirectory,
     });
     registration.authority = authority;
+    registration.state = 'accepted';
     return authority;
   }
 
-  function complete(resource) {
+  async function completeAfter(resource, cleanup) {
     const registration = registrations.get(resource);
-    if (registration === undefined || registration.completed)
+    if (registration === undefined || typeof cleanup !== 'function')
       throw new Error('Invalid completed E2E resource identity.');
-    registration.completed = true;
+    if (registration.state === 'completed') return { alreadyCompleted: true };
+    if (registration.state === 'completing')
+      throw new Error('E2E resource completion is already in progress.');
+    if (
+      registration.state !== 'accepted' ||
+      registration.authority === undefined
+    )
+      throw new Error('Invalid completed E2E resource identity.');
+    registration.state = 'completing';
+    try {
+      await cleanup(
+        Object.freeze({
+          authority: registration.authority,
+          entry: registration.entry,
+        }),
+      );
+      registration.state = 'completed';
+      return { alreadyCompleted: false };
+    } catch (error) {
+      registration.state = 'accepted';
+      throw error;
+    }
   }
 
   function entry(resource) {
@@ -166,7 +187,20 @@ export function createParentResourceRegistry(plan, importAuthority) {
       .filter((authority) => authority !== undefined);
   }
 
-  return Object.freeze({ accept, authorities, complete, entry });
+  function state(resource) {
+    const registration = registrations.get(resource);
+    if (registration === undefined)
+      throw new Error('Unknown E2E parent resource identity.');
+    return registration.state;
+  }
+
+  return Object.freeze({
+    accept,
+    authorities,
+    completeAfter,
+    entry,
+    state,
+  });
 }
 
 export const E2E_PARENT_RESOURCE_ENVIRONMENT = ENVIRONMENT_NAME;

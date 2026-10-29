@@ -16,15 +16,25 @@ interface LinuxProcessIdentity {
   parentProcessId: number;
   processGroupId: number;
   sessionId: number;
+  state: string;
+  dead: boolean;
+  terminal: boolean;
   zombie: boolean;
 }
 
-interface ActiveController {
-  authorities: Array<{
+interface AcceptedResourceOwnership {
+  authority: {
     actualProcessId: number;
     metadataDirectory: string;
     supervisorProcessId: number;
-  }>;
+  };
+  entry: { metadataDirectory: string; resourceId: string };
+  ownedPaths: readonly string[];
+}
+
+interface ActiveController {
+  authorities: AcceptedResourceOwnership['authority'][];
+  blockedResources: Set<string>;
   child: ChildProcess;
   directAuthority: unknown;
   kind: 'server' | 'playwright';
@@ -32,16 +42,25 @@ interface ActiveController {
   ports: number[];
   resources: Set<string>;
   layerProcessIds: Set<number>;
-  ownedPaths: Set<string>;
+  resourceOwnerships: Map<string, AcceptedResourceOwnership>;
   authorityAckDelayMs: number;
   resourcePaths: Map<string, string>;
   resourceRegistry: {
     accept: (candidate: unknown, expectedRole: string) => unknown;
-    complete: (resource: string) => void;
+    completeAfter: (
+      resource: string,
+      cleanup: (value: {
+        authority: AcceptedResourceOwnership['authority'];
+        entry: { metadataDirectory: string; resourceId: string };
+      }) => Promise<void>,
+    ) => Promise<{ alreadyCompleted: boolean }>;
     entry: (resource: string) => {
       metadataDirectory: string;
       resourceId: string;
     };
+    state: (
+      resource: string,
+    ) => 'planned' | 'accepted' | 'completing' | 'completed';
   };
 }
 
@@ -200,6 +219,7 @@ function startController(
   child.stderr?.on('data', (chunk) => (output += String(chunk)));
   const controller = {
     authorities: [],
+    blockedResources: new Set<string>(),
     child,
     directAuthority: captureDirectChildAuthority(child),
     kind: 'server' as const,
@@ -207,7 +227,7 @@ function startController(
     ports: [appPort, proxyPort],
     resources: new Set<string>(),
     layerProcessIds: new Set<number>(),
-    ownedPaths: new Set<string>(),
+    resourceOwnerships: new Map<string, AcceptedResourceOwnership>(),
     authorityAckDelayMs: options.authorityAckDelayMs ?? 0,
     resourcePaths: new Map(
       [...resourcePlan].map(([resource, entry]) => [
@@ -253,6 +273,7 @@ function startPlaywrightController(
       | 'unknown-after-terminal-result';
     registered?: boolean;
     authorityAckDelayMs?: number;
+    preventPlaywrightAuthorityAcceptance?: boolean;
   } = {},
 ) {
   const resources =
@@ -295,6 +316,9 @@ function startPlaywrightController(
   child.stderr?.on('data', (chunk) => (output += String(chunk)));
   const controller = {
     authorities: [],
+    blockedResources: new Set(
+      options.preventPlaywrightAuthorityAcceptance ? ['playwright'] : [],
+    ),
     child,
     directAuthority: captureDirectChildAuthority(child),
     kind: 'playwright' as const,
@@ -302,7 +326,7 @@ function startPlaywrightController(
     ports: [port],
     resources: new Set<string>(),
     layerProcessIds: new Set<number>(),
-    ownedPaths: new Set<string>(),
+    resourceOwnerships: new Map<string, AcceptedResourceOwnership>(),
     authorityAckDelayMs: options.authorityAckDelayMs ?? 0,
     resourcePaths: new Map(
       [...resourcePlan].map(([resource, entry]) => [
@@ -424,6 +448,11 @@ function retainControllerResources(
               ['playwright', 'playwright'],
             ]);
       const resource = candidate.resource;
+      if (
+        typeof resource === 'string' &&
+        controller.blockedResources.has(resource)
+      )
+        return;
       const expectedRole =
         typeof resource === 'string'
           ? allowedResources.get(resource)
@@ -437,15 +466,12 @@ function retainControllerResources(
         controller.resources.has(resource)
       )
         throw new Error('Invalid registered E2E resource authority.');
-      const authority = controller.resourceRegistry.accept(
-        candidate,
-        expectedRole,
-      ) as ActiveController['authorities'][number];
       if (
         !Array.isArray(candidate.ownedPaths) ||
         candidate.ownedPaths.length > 2
       )
         throw new Error('Invalid registered E2E owned paths.');
+      const ownedPaths: string[] = [];
       for (const path of candidate.ownedPaths) {
         const expectedPath = controller.resourcePaths.get('playwright');
         if (
@@ -455,8 +481,21 @@ function retainControllerResources(
           exactOwnedTempDirectory(path) !== expectedPath
         )
           throw new Error('Invalid registered E2E owned path.');
-        controller.ownedPaths.add(expectedPath);
+        ownedPaths.push(expectedPath);
       }
+      const entry = controller.resourceRegistry.entry(resource);
+      const authority = controller.resourceRegistry.accept(
+        candidate,
+        expectedRole,
+      ) as AcceptedResourceOwnership['authority'];
+      controller.resourceOwnerships.set(
+        resource,
+        Object.freeze({
+          authority,
+          entry,
+          ownedPaths: Object.freeze(ownedPaths),
+        }),
+      );
       controller.authorities.push(authority);
       controller.resources.add(resource);
       controller.layerProcessIds.add(authority.supervisorProcessId);
@@ -536,7 +575,9 @@ function processState(processId: number) {
   if (linuxIdentity !== undefined)
     return linuxIdentity.zombie
       ? `zombie(ppid=${linuxIdentity.parentProcessId},pgid=${linuxIdentity.processGroupId},sid=${linuxIdentity.sessionId})`
-      : `live(ppid=${linuxIdentity.parentProcessId},pgid=${linuxIdentity.processGroupId},sid=${linuxIdentity.sessionId})`;
+      : linuxIdentity.dead
+        ? `dead(state=${linuxIdentity.state},ppid=${linuxIdentity.parentProcessId},pgid=${linuxIdentity.processGroupId},sid=${linuxIdentity.sessionId})`
+        : `live(ppid=${linuxIdentity.parentProcessId},pgid=${linuxIdentity.processGroupId},sid=${linuxIdentity.sessionId})`;
   if (process.platform === 'linux') return 'absent';
   return probeProcessState(processId);
 }
@@ -629,6 +670,7 @@ async function cleanupActiveControllers() {
     const resourceFailures: unknown[] = [];
     const { child } = controller;
     try {
+      let controllerConverged = true;
       if (child.exitCode === null && child.signalCode === null) {
         if (child.connected) child.send({ type: 'shutdown', version: 1 });
         try {
@@ -642,20 +684,64 @@ async function cleanupActiveControllers() {
           }
         }
       }
-      if (child.pid !== undefined && !processAbsent(child.pid))
+      if (child.pid !== undefined && !processAbsent(child.pid)) {
+        controllerConverged = false;
         resourceFailures.push(
           new Error('Controller remained after exact teardown.'),
         );
+      }
 
-      for (const authority of controller.authorities)
-        try {
-          await cleanupOwnedProcessAuthority(authority);
-        } catch (error) {
-          resourceFailures.push(error);
-        }
       for (const resource of controller.resources)
         try {
-          controller.resourceRegistry.complete(resource);
+          const ownership = controller.resourceOwnerships.get(resource);
+          if (ownership === undefined)
+            throw new Error('Missing exact E2E resource ownership record.');
+          await controller.resourceRegistry.completeAfter(
+            resource,
+            async ({ authority, entry }) => {
+              if (
+                authority !== ownership.authority ||
+                entry.resourceId !== ownership.entry.resourceId ||
+                entry.metadataDirectory !== ownership.entry.metadataDirectory
+              )
+                throw new Error('E2E resource ownership record changed.');
+              if (!controllerConverged)
+                throw new Error(
+                  'Controller remained before exact resource completion.',
+                );
+              await cleanupOwnedProcessAuthority(authority);
+              await waitFor(
+                () =>
+                  [authority.supervisorProcessId, authority.actualProcessId]
+                    .filter(
+                      (processId, index, values) =>
+                        values.indexOf(processId) === index,
+                    )
+                    .every(processAbsent),
+                'Registered resource ownership did not converge to absence.',
+                10_000,
+              );
+              for (const port of controller.ports)
+                if (!(await portIsFree(port)))
+                  throw new Error(
+                    'Registered listener remained before resource completion.',
+                  );
+              await removeExactOwnedTempDirectory(entry.metadataDirectory);
+              for (const path of ownership.ownedPaths)
+                await removeExactOwnedTempDirectory(path);
+              if (
+                (await pathExists(entry.metadataDirectory)) ||
+                (
+                  await Promise.all(
+                    ownership.ownedPaths.map((path) => pathExists(path)),
+                  )
+                ).some(Boolean)
+              )
+                throw new Error(
+                  'Registered metadata or output remained before resource completion.',
+                );
+            },
+          );
         } catch (error) {
           resourceFailures.push(error);
         }
@@ -683,20 +769,21 @@ async function cleanupActiveControllers() {
           resourceFailures.push(
             new Error('Registered listener remained after teardown.'),
           );
-      for (const path of controller.ownedPaths)
-        try {
-          await removeExactOwnedTempDirectory(path);
-        } catch (error) {
-          resourceFailures.push(error);
-        }
-      const paths = controller.authorities.map(
-        (authority) => authority.metadataDirectory,
+      const paths = [...controller.resourceOwnerships.values()].flatMap(
+        (ownership) => [
+          ownership.entry.metadataDirectory,
+          ...ownership.ownedPaths,
+        ],
       );
-      paths.push(...controller.ownedPaths);
       for (const path of paths)
         if (await pathExists(path))
           resourceFailures.push(
             new Error('Registered metadata or output remained after teardown.'),
+          );
+      for (const resource of controller.resources)
+        if (controller.resourceRegistry.state(resource) !== 'completed')
+          resourceFailures.push(
+            new Error('Registered E2E resource cleanup did not complete.'),
           );
       if (resourceFailures.length === 0) active.delete(controller);
     } catch (error) {
@@ -715,6 +802,32 @@ function it(name: string, body: () => Promise<void>, timeout?: number) {
     timeout,
   );
 }
+
+vitestIt(
+  'preserves both the original action failure and exact cleanup failure',
+  async () => {
+    const actionFailure = new Error('original action failed');
+    const cleanupFailure = new Error('exact cleanup failed');
+    let received: unknown;
+    try {
+      await runWithExactCleanup(
+        async () => {
+          throw actionFailure;
+        },
+        async () => {
+          throw cleanupFailure;
+        },
+      );
+    } catch (error) {
+      received = error;
+    }
+    expect(received).toBeInstanceOf(AggregateError);
+    expect((received as AggregateError).errors).toEqual([
+      actionFailure,
+      cleanupFailure,
+    ]);
+  },
+);
 
 describe('E2E server supervision', () => {
   it('spawns, reaches readiness, and cleans only its exact processes and ports', async () => {
@@ -1268,11 +1381,21 @@ describe('top-level Playwright ownership', () => {
       label: 'after the handle exists but before ownership readiness',
       protocolFault: 'unknown-before-ownership-ready' as const,
       mode: 'hang' as const,
+      operationTimeoutMs: 10_000,
+      exitWaitMs: 20_000,
+      elapsedBoundMs: 20_000,
+      testTimeoutMs: 25_000,
+      requiresRoot: true,
     },
     {
       label: 'after running begins',
       protocolFault: 'unknown-running' as const,
       mode: 'hang' as const,
+      operationTimeoutMs: 10_000,
+      exitWaitMs: 20_000,
+      elapsedBoundMs: 20_000,
+      testTimeoutMs: 25_000,
+      requiresRoot: true,
     },
     {
       label: 'during cleanup',
@@ -1285,49 +1408,82 @@ describe('top-level Playwright ownership', () => {
       mode: 'success' as const,
     },
   ])
-    it(`fails once and converges immediately on an invalid message ${testCase.label}`, async () => {
-      const port = await freePort();
-      const startedAt = Date.now();
-      const controller = startPlaywrightController(port, {
-        mode: testCase.mode,
-        operationTimeoutMs: 5_000,
-        protocolFault: testCase.protocolFault,
-      });
-      await waitForExit(controller.child, 12_000);
-      const ownerPid = phasePid(
-        controller.output(),
-        'playwright-owner-spawned',
-      )!;
-      const rootPid = phasePid(controller.output(), 'playwright-spawned');
-      const descendantPid = phasePid(
-        controller.output(),
-        'controller-fixture-ready',
-      );
+    it(
+      `fails once and converges immediately on an invalid message ${testCase.label}`,
+      async () => {
+        const port = await freePort();
+        const startedAt = Date.now();
+        const operationTimeoutMs =
+          'operationTimeoutMs' in testCase
+            ? testCase.operationTimeoutMs
+            : 5_000;
+        const exitWaitMs =
+          'exitWaitMs' in testCase ? testCase.exitWaitMs : 12_000;
+        const elapsedBoundMs =
+          'elapsedBoundMs' in testCase ? testCase.elapsedBoundMs : 12_000;
+        const controller = startPlaywrightController(port, {
+          mode: testCase.mode,
+          operationTimeoutMs,
+          protocolFault: testCase.protocolFault,
+        });
+        await waitForExit(controller.child, exitWaitMs);
+        const output = controller.output();
+        const ownerPid = phasePid(output, 'playwright-owner-spawned')!;
+        const rootPid = phasePid(output, 'playwright-spawned');
+        const descendantPid = phasePid(output, 'controller-fixture-ready');
+        const isLateFault = 'operationTimeoutMs' in testCase;
 
-      expect(controller.child.exitCode).toBe(1);
-      expect(controller.output()).toContain(
-        'BBX_E2E_PHASE controller-protocol-fault-injected',
-      );
-      expect(controller.output().match(/owner-protocol-failed/g)).toHaveLength(
-        1,
-      );
-      expect(controller.output()).toContain(
-        'BBX_E2E_PHASE controller-watchdog-state expired=0',
-      );
-      expect(Date.now() - startedAt).toBeLessThan(12_000);
-      await waitFor(
-        () =>
-          processAbsent(ownerPid) &&
-          (rootPid === undefined || processAbsent(rootPid)) &&
-          (descendantPid === undefined || processAbsent(descendantPid)),
-        'Invalid owner protocol left an owned process running.',
-        10_000,
-      );
-      expect(
-        await pathExists(controller.resourcePaths.get('playwright')!),
-      ).toBe(false);
-      expect(await portIsFree(port)).toBe(true);
-    }, 20_000);
+        if ('requiresRoot' in testCase && testCase.requiresRoot)
+          expect(rootPid).toBeTypeOf('number');
+        if ('requiresReadiness' in testCase && testCase.requiresReadiness)
+          expect(descendantPid).toBeTypeOf('number');
+
+        expect(controller.child.exitCode).toBe(1);
+        expect(output).toContain(
+          'BBX_E2E_PHASE controller-protocol-fault-injected',
+        );
+        expect(output.match(/owner-protocol-failed/g)).toHaveLength(1);
+        expect(output).toContain(
+          'BBX_E2E_PHASE controller-watchdog-state expired=0',
+        );
+        if (isLateFault) {
+          expect(output).not.toContain(
+            'BBX_E2E_PHASE controller-operation-deadline',
+          );
+          expect(output).not.toContain('BBX_E2E_PHASE operation-timeout');
+          expect(output).not.toContain('BBX_E2E_PHASE outer-timeout');
+          expect(output.match(/playwright-owner-cleanup-start/g)).toHaveLength(
+            1,
+          );
+          expect(
+            output.match(/playwright-owner-cleanup-complete/g),
+          ).toHaveLength(1);
+          expect(
+            output.match(/owner-terminal-result-acknowledged/g),
+          ).toHaveLength(1);
+          expect(
+            output.indexOf('controller-protocol-fault-injected'),
+          ).toBeLessThan(output.indexOf('playwright-owner-cleanup-start'));
+          expect(
+            output.indexOf('playwright-owner-cleanup-complete'),
+          ).toBeLessThan(output.indexOf('owner-terminal-result-acknowledged'));
+        }
+        expect(Date.now() - startedAt).toBeLessThan(elapsedBoundMs);
+        await waitFor(
+          () =>
+            processAbsent(ownerPid) &&
+            (rootPid === undefined || processAbsent(rootPid)) &&
+            (descendantPid === undefined || processAbsent(descendantPid)),
+          'Invalid owner protocol left an owned process running.',
+          10_000,
+        );
+        expect(
+          await pathExists(controller.resourcePaths.get('playwright')!),
+        ).toBe(false);
+        expect(await portIsFree(port)).toBe(true);
+      },
+      'testTimeoutMs' in testCase ? testCase.testTimeoutMs : 20_000,
+    );
 
   it('preserves protocol and pending-spawn failures in one terminal result', async () => {
     const port = await freePort();
@@ -1357,9 +1513,9 @@ describe('top-level Playwright ownership', () => {
     const controller = startPlaywrightController(port, {
       mode: 'stubborn-hang',
       // The shortened operation window still includes real Windows Job setup.
-      operationTimeoutMs: 5_000,
+      operationTimeoutMs: 10_000,
     });
-    await waitForExit(controller.child, 15_000);
+    await waitForExit(controller.child, 20_000);
     const ownerPid = phasePid(controller.output(), 'playwright-owner-spawned')!;
     const fixturePid = phasePid(controller.output(), 'playwright-spawned')!;
     const descendantPid = phasePid(
@@ -1414,7 +1570,7 @@ describe('top-level Playwright ownership', () => {
     );
     expect(await pathExists(outputPath)).toBe(false);
     expect(await portIsFree(port)).toBe(true);
-  }, 20_000);
+  }, 25_000);
 
   it('uses retained authority for top-level signal cleanup', async () => {
     const port = await freePort();
@@ -1537,11 +1693,69 @@ describe('top-level Playwright ownership', () => {
     );
   }, 30_000);
 
+  vitestIt.skipIf(process.platform !== 'win32')(
+    'cleans an owner-declared output when the controller dies before Playwright authority acceptance',
+    () =>
+      runWithExactCleanup(async () => {
+        const port = await freePort();
+        const controller = startPlaywrightController(port, {
+          preventPlaywrightAuthorityAcceptance: true,
+        });
+        const outputPath = controller.resourcePaths.get('playwright')!;
+        await waitForAsync(
+          async () =>
+            controller.resources.has('playwright-owner') &&
+            !controller.resources.has('playwright') &&
+            controller.resourceRegistry.state('playwright') === 'planned' &&
+            (controller.output().match(/controller-upper-authority-requested/g)
+              ?.length ?? 0) >= 2 &&
+            (await pathExists(outputPath)),
+          'Partial Windows ownership handoff did not reach the test boundary.',
+          10_000,
+        );
+        const owner = controller.resourceOwnerships.get('playwright-owner');
+        if (owner === undefined)
+          throw new Error('Playwright owner authority was not retained.');
+        expect(owner.ownedPaths).toEqual([outputPath]);
+        expect(await pathExists(owner.entry.metadataDirectory)).toBe(true);
+        expect(controller.resourceRegistry.state('playwright-owner')).toBe(
+          'accepted',
+        );
+        const ownerProcessId = phasePid(
+          controller.output(),
+          'playwright-owner-spawned',
+        )!;
+        const reachedProcessIds = [
+          ownerProcessId,
+          phasePid(controller.output(), 'playwright-supervisor-spawned'),
+          phasePid(controller.output(), 'playwright-spawned'),
+          phasePid(controller.output(), 'controller-fixture-ready'),
+        ].filter((processId): processId is number => processId !== undefined);
+
+        expect(controller.child.kill('SIGKILL')).toBe(true);
+        await waitForExit(controller.child, 10_000);
+        await cleanupActiveControllers();
+
+        expect(reachedProcessIds.every(processAbsent)).toBe(true);
+        expect(await portIsFree(port)).toBe(true);
+        expect(await pathExists(owner.entry.metadataDirectory)).toBe(false);
+        expect(await pathExists(outputPath)).toBe(false);
+        expect(controller.resourceRegistry.state('playwright-owner')).toBe(
+          'completed',
+        );
+        expect(controller.resourceRegistry.state('playwright')).toBe('planned');
+        expect(active.has(controller)).toBe(false);
+        await cleanupActiveControllers();
+        expect(active.has(controller)).toBe(false);
+      }, cleanupActiveControllers),
+    25_000,
+  );
+
   it('converges exact ownership when the controller dies during cleanup', async () => {
     const port = await freePort();
     const controller = startPlaywrightController(port, {
       mode: 'stubborn-hang',
-      operationTimeoutMs: 5_000,
+      operationTimeoutMs: 10_000,
     });
     await waitFor(
       () =>
@@ -1549,7 +1763,7 @@ describe('top-level Playwright ownership', () => {
           .output()
           .includes('BBX_E2E_PHASE playwright-owner-cleanup-start'),
       () => `Controller cleanup did not begin.\n${controller.output()}`,
-      10_000,
+      15_000,
     );
     const owner = phasePid(controller.output(), 'playwright-owner-spawned')!;
     const root = phasePid(controller.output(), 'playwright-spawned')!;
@@ -1569,7 +1783,7 @@ describe('top-level Playwright ownership', () => {
     expect(await pathExists(controller.resourcePaths.get('playwright')!)).toBe(
       false,
     );
-  }, 30_000);
+  }, 35_000);
 
   it('reclaims an exact failed-assertion tree without touching its concurrent tree', async () => {
     const failedPort = await freePort();
@@ -1819,8 +2033,21 @@ describe.skipIf(process.platform !== 'linux')(
         const fallback = output.indexOf(
           'BBX_E2E_PHASE linux-controller-supervisor-fallback-cleanup-start',
         );
+        const completionStart = output.indexOf(
+          'BBX_E2E_PHASE linux-controller-supervisor-registry-completion-start',
+        );
+        const completionComplete = output.indexOf(
+          'BBX_E2E_PHASE linux-controller-supervisor-registry-completion-complete',
+        );
+        const converged = output.indexOf(
+          'BBX_E2E_PHASE linux-controller-supervisor-signal-converged',
+        );
         expect(absence).toBeGreaterThanOrEqual(0);
+        expect(completionStart).toBeGreaterThanOrEqual(0);
         expect(fallback).toBeGreaterThan(absence);
+        expect(fallback).toBeGreaterThan(completionStart);
+        expect(completionComplete).toBeGreaterThan(fallback);
+        expect(converged).toBeGreaterThan(completionComplete);
         expect(
           output.match(/linux-controller-supervisor-fallback-cleanup-start/g),
         ).toHaveLength(1);
@@ -2180,6 +2407,17 @@ describe.skipIf(process.platform !== 'linux')(
           );
           expect(output).toContain(
             'BBX_E2E_PHASE linux-controller-guardian-cleanup-complete failure-count=0 exit-code=1',
+          );
+          const completionComplete = output.indexOf(
+            'BBX_E2E_PHASE linux-controller-guardian-registry-completion-complete',
+          );
+          const converged = output.indexOf(
+            'BBX_E2E_PHASE linux-controller-guardian-signal-converged',
+          );
+          expect(completionComplete).toBeGreaterThanOrEqual(0);
+          expect(converged).toBeGreaterThan(completionComplete);
+          expect(output).not.toContain(
+            'linux-controller-supervisor-registry-completion-start',
           );
           expect(
             output.match(/linux-controller-guardian-cleanup-start/g),

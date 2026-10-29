@@ -18,6 +18,8 @@ interface LinuxIdentity {
   sessionId: number;
   startTime: string;
   state: string;
+  dead: boolean;
+  terminal: boolean;
   zombie: boolean;
 }
 
@@ -136,6 +138,8 @@ const identity = (overrides: Partial<LinuxIdentity> = {}): LinuxIdentity => ({
   sessionId: 4242,
   startTime: '900719925474099312345',
   state: 'S',
+  dead: false,
+  terminal: false,
   zombie: false,
   ...overrides,
 });
@@ -216,18 +220,55 @@ function linuxRuntime(overrides: Partial<ProcessControlRuntime> = {}) {
 }
 
 describe('Linux process identity', () => {
+  const stat = (state: string) =>
+    `4242 (worker ) name) ${state} 7 4242 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 900719925474099312345 0`;
+
   it('parses a final parenthesized command boundary and exact start time text', () => {
-    const value =
-      '4242 (worker ) name) S 7 4242 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 900719925474099312345 0';
-    expect(parseLinuxProcessStat(4242, value)).toMatchObject({
+    expect(parseLinuxProcessStat(4242, stat('S'))).toMatchObject({
       parentProcessId: 7,
       processGroupId: 4242,
       sessionId: 4242,
       startTime: '900719925474099312345',
       state: 'S',
+      dead: false,
+      terminal: false,
       zombie: false,
     });
   });
+
+  it.each([
+    ['R', false, false],
+    ['S', false, false],
+    ['D', false, false],
+    ['Z', true, false],
+    ['T', false, false],
+    ['t', false, false],
+    ['X', true, true],
+    ['x', true, true],
+    ['K', false, false],
+    ['W', false, false],
+    ['P', false, false],
+    ['I', false, false],
+  ])(
+    'accepts documented Linux state %s with terminal=%s and dead=%s',
+    (state, terminal, dead) => {
+      expect(parseLinuxProcessStat(4242, stat(state))).toMatchObject({
+        state,
+        terminal,
+        dead,
+        zombie: state === 'Z',
+      });
+    },
+  );
+
+  it.each(['', 'RR', ' ', '1', 'Q', 'r', 'z', '*'])(
+    'rejects undocumented or malformed Linux state %j',
+    (state) => {
+      expect(() => parseLinuxProcessStat(4242, stat(state))).toThrow(
+        'Malformed Linux process identity.',
+      );
+    },
+  );
 
   it('rejects a noncanonical or negative start time', () => {
     const prefix = '4242 (worker) S 7 4242 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 ';
@@ -235,6 +276,34 @@ describe('Linux process identity', () => {
       'Malformed Linux process identity.',
     );
     expect(() => parseLinuxProcessStat(4242, `${prefix}01 0`)).toThrow(
+      'Malformed Linux process identity.',
+    );
+  });
+
+  it.each([
+    ['process argument', 4243, stat('S')],
+    [
+      'stat PID',
+      4242,
+      '4243 (worker) S 7 4242 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0',
+    ],
+    [
+      'parent PID',
+      4242,
+      '4242 (worker) S -1 4242 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0',
+    ],
+    [
+      'process group',
+      4242,
+      '4242 (worker) S 7 0 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0',
+    ],
+    [
+      'session',
+      4242,
+      '4242 (worker) S 7 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0',
+    ],
+  ])('rejects malformed %s identity fields', (_label, processId, value) => {
+    expect(() => parseLinuxProcessStat(processId, value)).toThrow(
       'Malformed Linux process identity.',
     );
   });
@@ -362,7 +431,13 @@ describe('Linux group ownership revalidation', () => {
 
   it('accepts a verified member that becomes a zombie with unreadable environment', () => {
     const recorded = identity({ processId: 4343, startTime: '22' });
-    const zombie = { ...recorded, state: 'Z', zombie: true };
+    const zombie = {
+      ...recorded,
+      state: 'Z',
+      dead: false,
+      terminal: true,
+      zombie: true,
+    };
     expect(
       inspect({ 4343: zombie }, { 4343: undefined }, [recorded])(),
     ).toEqual({ state: 'owned', members: [zombie] });
@@ -373,6 +448,7 @@ describe('Linux group ownership revalidation', () => {
       processId: 4343,
       startTime: '22',
       state: 'Z',
+      terminal: true,
       zombie: true,
     });
     expect(inspect({ 4343: zombie }, { 4343: undefined })).toThrow(
@@ -386,10 +462,39 @@ describe('Linux group ownership revalidation', () => {
       processId: 4343,
       startTime: '23',
       state: 'Z',
+      terminal: true,
       zombie: true,
     });
     expect(
       inspect({ 4343: replacement }, { 4343: undefined }, [recorded]),
+    ).toThrow('token identity changed');
+  });
+
+  it.each(['X', 'x'])(
+    'accepts an exact recorded terminal %s member with an unreadable environment',
+    (state) => {
+      const recorded = identity({ processId: 4343, startTime: '22' });
+      const terminal = {
+        ...recorded,
+        state,
+        dead: true,
+        terminal: true,
+        zombie: false,
+      };
+      expect(
+        inspect({ 4343: terminal }, { 4343: undefined }, [recorded])(),
+      ).toEqual({ state: 'owned', members: [terminal] });
+    },
+  );
+
+  it('keeps lowercase tracing-stop t live and token-protected', () => {
+    const tracingStop = identity({
+      processId: 4343,
+      startTime: '22',
+      state: 't',
+    });
+    expect(
+      inspect({ 4343: tracingStop }, { 4343: undefined }, [tracingStop]),
     ).toThrow('token identity changed');
   });
 });
@@ -436,7 +541,13 @@ describe('owned E2E process cleanup', () => {
 
   it('allows a verified zombie to be reaped before the deadline', async () => {
     const live = identity();
-    const zombie = { ...live, state: 'Z', zombie: true };
+    const zombie = {
+      ...live,
+      state: 'Z',
+      dead: false,
+      terminal: true,
+      zombie: true,
+    };
     const inspectLinuxOwnership = vi
       .fn()
       .mockReturnValueOnce({ state: 'owned', members: [live] })
@@ -459,7 +570,13 @@ describe('owned E2E process cleanup', () => {
 
   it('does not signal a zombie that persists through the final deadline', async () => {
     const live = identity();
-    const zombie = { ...live, state: 'Z', zombie: true };
+    const zombie = {
+      ...live,
+      state: 'Z',
+      dead: false,
+      terminal: true,
+      zombie: true,
+    };
     const inspectLinuxOwnership = vi
       .fn()
       .mockReturnValueOnce({ state: 'owned', members: [live] })
@@ -471,9 +588,52 @@ describe('owned E2E process cleanup', () => {
       }),
     });
     await expect(terminateOwnedProcess(child(), runtime)).rejects.toThrow(
-      'zombie did not reap',
+      'terminal process did not reap',
     );
     expect(runtime.signalProcessGroup).toHaveBeenCalledTimes(1);
+    expect(runtime.signalProcessGroup).toHaveBeenCalledWith(4242, 'SIGTERM');
+  });
+
+  it.each(['Z', 'X', 'x'])(
+    'does not signal an already-terminal %s process group',
+    async (state) => {
+      const terminal = identity({
+        state,
+        dead: state !== 'Z',
+        terminal: true,
+        zombie: state === 'Z',
+      });
+      const runtime = linuxRuntime({
+        inspectLinuxOwnership: vi
+          .fn()
+          .mockReturnValueOnce({ state: 'owned', members: [terminal] })
+          .mockReturnValue({ state: 'absent', members: [] }),
+        waitForOwnedGroupExit: vi.fn(async (inspect) => {
+          expect(inspect?.().state).toBe('absent');
+        }),
+      });
+      await expect(terminateOwnedProcess(child(), runtime)).resolves.toEqual({
+        alreadyAbsent: false,
+        forced: false,
+      });
+      expect(runtime.signalProcessGroup).not.toHaveBeenCalled();
+    },
+  );
+
+  it('continues to signal lowercase tracing-stop t as live', async () => {
+    const runtime = linuxRuntime({
+      inspectLinuxOwnership: vi
+        .fn()
+        .mockReturnValueOnce({
+          state: 'owned',
+          members: [identity({ state: 't' })],
+        })
+        .mockReturnValue({ state: 'absent', members: [] }),
+    });
+    await expect(terminateOwnedProcess(child(), runtime)).resolves.toEqual({
+      alreadyAbsent: false,
+      forced: false,
+    });
     expect(runtime.signalProcessGroup).toHaveBeenCalledWith(4242, 'SIGTERM');
   });
 

@@ -193,26 +193,28 @@ export async function runLinuxControllerGuardian({
   const ownershipToken = randomBytes(32).toString('base64url');
   const resource = plan.get('playwright');
   const listenerPort = ownedListenerPort(environment);
+  const validGuardianResult = (message) =>
+    message?.type === 'guardian-result' &&
+    message.version === 1 &&
+    Number.isInteger(message.exitCode) &&
+    message.exitCode >= 0 &&
+    message.exitCode <= 255 &&
+    typeof message.cleanupSucceeded === 'boolean' &&
+    (message.cleanupErrorCode === 0 || message.cleanupErrorCode === 1) &&
+    message.cleanupSucceeded === (message.cleanupErrorCode === 0) &&
+    Number.isInteger(message.failureCount) &&
+    message.failureCount >= 0 &&
+    message.failureCount <= 8 &&
+    typeof message.eventualConvergence === 'boolean' &&
+    Number.isInteger(message.reasonCode) &&
+    message.reasonCode >= 0 &&
+    message.reasonCode <= 8;
   const resultPromise = waitForLifecycleResult(
     groupGuardian,
     (message) => {
       if (message?.type !== 'guardian-result') return false;
-      const valid =
-        message.version === 1 &&
-        Number.isInteger(message.exitCode) &&
-        message.exitCode >= 0 &&
-        message.exitCode <= 255 &&
-        typeof message.cleanupSucceeded === 'boolean' &&
-        (message.cleanupErrorCode === 0 || message.cleanupErrorCode === 1) &&
-        message.cleanupSucceeded === (message.cleanupErrorCode === 0) &&
-        Number.isInteger(message.failureCount) &&
-        message.failureCount >= 0 &&
-        message.failureCount <= 8 &&
-        typeof message.eventualConvergence === 'boolean' &&
-        Number.isInteger(message.reasonCode) &&
-        message.reasonCode >= 0 &&
-        message.reasonCode <= 8;
-      if (!valid) throw new Error('Invalid Linux guardian result.');
+      if (!validGuardianResult(message))
+        throw new Error('Invalid Linux guardian result.');
       return true;
     },
     timing.outerDeadlineAt,
@@ -290,37 +292,55 @@ export async function runLinuxControllerGuardian({
       emitE2ePhase('linux-controller-guardian-failover-start');
       if (signalAuthority.snapshot().state === 'guardian-authority')
         signalAuthority.guardianCleaning();
-      await terminateDirectChild(groupGuardianAuthority, {
-        deadlineAt: timing.outerDeadlineAt,
-        termConvergenceMs: 500,
-        killConvergenceMs: 500,
-      });
-      if (
-        probeProcessState(groupGuardianAuthority.processId) !== 'absent' ||
-        (groupGuardian.exitCode === null && groupGuardian.signalCode === null)
-      )
-        throw new Error('Linux group guardian absence was not proven.');
-      emitE2ePhase('linux-controller-guardian-absence-confirmed');
-      signalAuthority.supervisorFallback(true);
-      if (remainingLifecycleMs(timing.outerDeadlineAt) < 1)
-        throw new Error('Linux guardian fallback deadline exhausted.');
-      emitE2ePhase('linux-controller-supervisor-fallback-cleanup-start');
-      const cleanupResult = await cleanupOwnedProcessAuthority(
-        retainedAuthority,
-        {
-          deadlineAt: timing.outerDeadlineAt,
-          beforeMetadataCleanup: async () => {
-            if (!(await portIsFree(listenerPort)))
-              throw new Error('Owned Linux listener remained during failover.');
-          },
+      let cleanupResult;
+      emitE2ePhase('linux-controller-supervisor-registry-completion-start');
+      const completion = await registry.completeAfter(
+        'playwright',
+        async ({ authority, entry }) => {
+          if (
+            authority !== retainedAuthority ||
+            entry.resourceId !== resource.resourceId ||
+            entry.metadataDirectory !== resource.metadataDirectory
+          )
+            throw new Error('Linux guardian resource identity changed.');
+          await terminateDirectChild(groupGuardianAuthority, {
+            deadlineAt: timing.outerDeadlineAt,
+            termConvergenceMs: 500,
+            killConvergenceMs: 500,
+          });
+          if (
+            probeProcessState(groupGuardianAuthority.processId) !== 'absent' ||
+            (groupGuardian.exitCode === null &&
+              groupGuardian.signalCode === null)
+          )
+            throw new Error('Linux group guardian absence was not proven.');
+          emitE2ePhase('linux-controller-guardian-absence-confirmed');
+          signalAuthority.supervisorFallback(true);
+          if (remainingLifecycleMs(timing.outerDeadlineAt) < 1)
+            throw new Error('Linux guardian fallback deadline exhausted.');
+          emitE2ePhase('linux-controller-supervisor-fallback-cleanup-start');
+          cleanupResult = await cleanupOwnedProcessAuthority(authority, {
+            deadlineAt: timing.outerDeadlineAt,
+            beforeMetadataCleanup: async () => {
+              if (!(await portIsFree(listenerPort)))
+                throw new Error(
+                  'Owned Linux listener remained during failover.',
+                );
+            },
+          });
+          if (!(await retainedResourcesConverged()))
+            throw new Error('Linux supervisor fallback did not converge.');
+          if (!(await outputIsAbsent()))
+            throw new Error('Linux supervisor output remained after cleanup.');
         },
       );
+      if (completion.alreadyCompleted || cleanupResult === undefined)
+        throw new Error('Linux supervisor cleanup was not first completion.');
+      emitE2ePhase('linux-controller-supervisor-registry-completion-complete');
       if (cleanupResult.forced)
         emitE2ePhase('linux-controller-supervisor-fallback-forced-cleanup');
-      if (!(await retainedResourcesConverged()))
-        throw new Error('Linux supervisor fallback did not converge.');
       signalAuthority.converged('supervisor');
-      registry.complete('playwright');
+      emitE2ePhase('linux-controller-supervisor-signal-converged');
       emitE2ePhase('linux-controller-supervisor-fallback-cleanup-complete');
       return cleanupResult;
     });
@@ -382,12 +402,7 @@ export async function runLinuxControllerGuardian({
   emitE2ePhase('linux-controller-guardian-result-received');
   await pauseAt('after-terminal-result');
   let guardianResultTrusted = guardianResult.cleanupSucceeded;
-  if (guardianResultTrusted)
-    try {
-      guardianResultTrusted = await retainedResourcesConverged();
-    } catch {
-      guardianResultTrusted = false;
-    }
+  let guardianExitObserved = true;
   sendToGuardian({ type: 'result-ack', version: 1 });
   try {
     await waitForOwnedProcessExit(
@@ -397,18 +412,43 @@ export async function runLinuxControllerGuardian({
         E2E_LIFECYCLE_BOUNDS.controllerReportingMarginMs,
       ),
     );
-    if (
-      groupGuardian.signalCode !== null ||
-      groupGuardian.exitCode !== guardianResult.exitCode
-    )
-      guardianResultTrusted = false;
   } catch {
-    guardianResultTrusted = false;
+    guardianExitObserved = false;
   }
   if (guardianResultTrusted) {
-    signalAuthority.converged('guardian');
-    registry.complete('playwright');
-  } else {
+    try {
+      emitE2ePhase('linux-controller-guardian-registry-completion-start');
+      const completion = await registry.completeAfter(
+        'playwright',
+        async ({ authority, entry }) => {
+          if (
+            authority !== retainedAuthority ||
+            entry.resourceId !== resource.resourceId ||
+            entry.metadataDirectory !== resource.metadataDirectory ||
+            !validGuardianResult(guardianResult) ||
+            !guardianResult.cleanupSucceeded ||
+            !guardianExitObserved ||
+            groupGuardian.signalCode !== null ||
+            groupGuardian.exitCode !== guardianResult.exitCode ||
+            probeProcessState(groupGuardianAuthority.processId) !== 'absent'
+          )
+            throw new Error('Linux guardian result was not trusted.');
+          if (!(await retainedResourcesConverged()))
+            throw new Error('Linux guardian cleanup did not converge.');
+          if (!(await outputIsAbsent()))
+            throw new Error('Linux guardian output remained after cleanup.');
+        },
+      );
+      if (completion.alreadyCompleted)
+        throw new Error('Linux guardian cleanup was not first completion.');
+      emitE2ePhase('linux-controller-guardian-registry-completion-complete');
+      signalAuthority.converged('guardian');
+      emitE2ePhase('linux-controller-guardian-signal-converged');
+    } catch {
+      guardianResultTrusted = false;
+    }
+  }
+  if (!guardianResultTrusted) {
     requestedExitCode = Math.max(requestedExitCode, 1);
     try {
       await supervisorFallback();

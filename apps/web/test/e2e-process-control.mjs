@@ -8,6 +8,7 @@ import {
 const PHASE = /^[a-z0-9-]+$/;
 const PROCESS_GROUP_POLL_MS = 25;
 const CANONICAL_INTEGER = /^(0|[1-9][0-9]*)$/;
+const LINUX_PROCESS_STATE = /^[RSDZTtXxKWPI]$/;
 
 export function assertSupportedE2ePlatform(platform = process.platform) {
   if (platform !== 'linux' && platform !== 'win32')
@@ -79,7 +80,7 @@ export function parseLinuxProcessStat(processId, value) {
     .trim()
     .split(/\s+/);
   // The suffix begins with proc(5) field 3. Start time is field 22.
-  if (fields.length < 20 || !/^[A-Z]$/.test(fields[0]))
+  if (fields.length < 20 || !LINUX_PROCESS_STATE.test(fields[0]))
     throw new Error('Malformed Linux process identity.');
   const [state, rawParent, rawGroup, rawSession] = fields;
   const rawStartTime = fields[19];
@@ -109,6 +110,8 @@ export function parseLinuxProcessStat(processId, value) {
     sessionId,
     startTime: rawStartTime,
     state,
+    dead: state === 'X' || state === 'x',
+    terminal: state === 'Z' || state === 'X' || state === 'x',
     zombie: state === 'Z',
   };
 }
@@ -233,7 +236,7 @@ export function inspectLinuxOwnedGroup(
         (member) => member.processId === identity.processId,
       );
       if (
-        !identity.zombie ||
+        !identity.terminal ||
         token !== undefined ||
         recorded === undefined ||
         !sameLinuxIdentity(identity, recorded)
@@ -311,7 +314,7 @@ export async function terminateLinuxOwnedGroup(
     ),
   );
   const inspect = () => inspectWithMembers(verifiedMembers);
-  const liveBeforeTerm = first.members.some((member) => !member.zombie);
+  const liveBeforeTerm = first.members.some((member) => !member.terminal);
   if (liveBeforeTerm && !signalGroup(ownership.processGroupId, 'SIGTERM'))
     return { alreadyAbsent: true, forced: false };
   let forced = false;
@@ -328,7 +331,9 @@ export async function terminateLinuxOwnedGroup(
     forced = true;
     const beforeKill = inspect();
     if (beforeKill.state === 'absent') return { alreadyAbsent: false, forced };
-    const liveBeforeKill = beforeKill.members.some((member) => !member.zombie);
+    const liveBeforeKill = beforeKill.members.some(
+      (member) => !member.terminal,
+    );
     if (!liveBeforeKill) {
       forced = false;
       try {
@@ -341,12 +346,15 @@ export async function terminateLinuxOwnedGroup(
           ),
         );
       } catch (error) {
-        throw new Error('Owned E2E zombie did not reap before the deadline.', {
-          cause: error ?? terminationError,
-        });
+        throw new Error(
+          'Owned E2E terminal process did not reap before the deadline.',
+          {
+            cause: error ?? terminationError,
+          },
+        );
       }
       if (inspect().state !== 'absent')
-        throw new Error('Owned E2E zombie cleanup did not converge.');
+        throw new Error('Owned E2E terminal cleanup did not converge.');
       return { alreadyAbsent: false, forced };
     }
     if (!signalGroup(ownership.processGroupId, 'SIGKILL'))
