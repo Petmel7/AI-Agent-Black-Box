@@ -63,6 +63,7 @@ const {
   inspectLinuxOwnedGroup,
   parseLinuxProcessStat,
   probeProcessState,
+  readLinuxProcessIdentity,
   terminateDirectChild,
   terminateOwnedProcess,
 } = processControlModule as unknown as {
@@ -108,6 +109,10 @@ const {
     processId: number,
     kill?: (processId: number, signal: 0) => true,
   ) => 'live' | 'absent' | 'unverifiable';
+  readLinuxProcessIdentity: (
+    processId: number,
+    readFile?: (path: string, encoding: 'utf8') => string,
+  ) => LinuxIdentity | undefined;
   terminateDirectChild: (
     authority: unknown,
     runtime?: {
@@ -145,6 +150,49 @@ const identity = (overrides: Partial<LinuxIdentity> = {}): LinuxIdentity => ({
 });
 const ownership: OwnershipIdentity = { ...identity(), ownershipToken: token };
 const metadataDirectory = resolve(tmpdir(), 'bbx-e2e-server-worker-4242');
+
+function linuxStat(
+  overrides: {
+    processId?: number;
+    parentProcessId?: number;
+    processGroupId?: number;
+    sessionId?: number;
+    startTime?: string;
+    state?: string;
+  } = {},
+) {
+  const {
+    processId = 4242,
+    parentProcessId = 1,
+    processGroupId = 4242,
+    sessionId = 4242,
+    startTime = '900719925474099312345',
+    state = 'S',
+  } = overrides;
+  return `${processId} (worker ) name) ${[
+    state,
+    parentProcessId,
+    processGroupId,
+    sessionId,
+    ...Array.from({ length: 15 }, () => 0),
+    startTime,
+    0,
+  ].join(' ')}`;
+}
+
+function readProcLinuxIdentity(
+  processId: number,
+  readFile: (path: string, encoding: 'utf8') => string,
+) {
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform');
+  if (!platform) throw new Error('Missing process platform descriptor.');
+  Object.defineProperty(process, 'platform', { ...platform, value: 'linux' });
+  try {
+    return readLinuxProcessIdentity(processId, readFile);
+  } finally {
+    Object.defineProperty(process, 'platform', platform);
+  }
+}
 
 const {
   importOwnedProcessAuthority,
@@ -346,6 +394,70 @@ describe('Linux process identity', () => {
   });
 });
 
+describe('Linux process identity reread', () => {
+  const malformed = '4242 (truncated';
+  const missing = (code: 'ENOENT' | 'ESRCH') =>
+    Object.assign(new Error(code), { code });
+
+  it('rereads the same stat path once after a structured malformed result', () => {
+    const readFile = vi
+      .fn()
+      .mockReturnValueOnce(malformed)
+      .mockReturnValueOnce(linuxStat());
+
+    expect(readProcLinuxIdentity(4242, readFile)).toEqual(identity());
+    expect(readFile.mock.calls).toEqual([
+      ['/proc/4242/stat', 'utf8'],
+      ['/proc/4242/stat', 'utf8'],
+    ]);
+  });
+
+  it.each(['ENOENT', 'ESRCH'] as const)(
+    'classifies a %s reread as absent',
+    (code) => {
+      const readFile = vi
+        .fn()
+        .mockReturnValueOnce(malformed)
+        .mockImplementationOnce(() => {
+          throw missing(code);
+        });
+
+      expect(readProcLinuxIdentity(4242, readFile)).toBeUndefined();
+      expect(readFile).toHaveBeenCalledTimes(2);
+    },
+  );
+
+  it('fails closed after a second structured malformed result', () => {
+    const readFile = vi.fn(() => malformed);
+
+    expect(() => readProcLinuxIdentity(4242, readFile)).toThrow(
+      expect.objectContaining({
+        code: 'malformed-linux-process-identity',
+        message: 'Malformed Linux process identity.',
+      }),
+    );
+    expect(readFile).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([
+    ['EACCES', 'EACCES'],
+    ['EPERM', 'EPERM'],
+    ['unexpected I/O', 'EIO'],
+    ['programming error', undefined],
+  ])('propagates %s from the reread', (_label, code) => {
+    const failure = Object.assign(new Error('reread failure'), { code });
+    const readFile = vi
+      .fn()
+      .mockReturnValueOnce(malformed)
+      .mockImplementationOnce(() => {
+        throw failure;
+      });
+
+    expect(() => readProcLinuxIdentity(4242, readFile)).toThrow(failure);
+    expect(readFile).toHaveBeenCalledTimes(2);
+  });
+});
+
 describe('supported ownership platforms', () => {
   it.each(['darwin', 'freebsd', 'aix'])(
     'rejects %s before any launch configuration can mutate state',
@@ -441,6 +553,14 @@ describe('Linux group ownership revalidation', () => {
     expect(
       inspect({ 4343: zombie }, { 4343: undefined }, [recorded])(),
     ).toEqual({ state: 'owned', members: [zombie] });
+  });
+
+  it('keeps general process-group identity parent-agnostic after reparenting', () => {
+    const recorded = identity({ processId: 4343, parentProcessId: 4242 });
+    const reparented = { ...recorded, parentProcessId: 1 };
+    expect(
+      inspect({ 4343: reparented }, { 4343: token }, [recorded])(),
+    ).toEqual({ state: 'owned', members: [reparented] });
   });
 
   it('rejects a previously unseen zombie with unreadable environment', () => {
@@ -756,6 +876,100 @@ describe('direct-child emergency cleanup authority', () => {
       }),
     ).resolves.toEqual({ alreadyAbsent: false, forced: false });
     expect(terminate).toHaveBeenCalledWith(ownedChild, 'SIGTERM');
+  });
+
+  it.each([
+    ['start time', { startTime: '900719925474099312346' }],
+    ['parent', { parentProcessId: 5151 }],
+    ['process group', { processGroupId: 5151 }],
+    ['session', { sessionId: 5151 }],
+  ])(
+    'rejects a valid reread with changed %s before signaling',
+    async (_label, replacement) => {
+      const ownedChild = child();
+      const authority = captureDirectChildAuthority(ownedChild, {
+        platform: 'linux',
+        parentProcessId: 1,
+        readLinuxProcessIdentity: () => identity(),
+      });
+      const readFile = vi
+        .fn()
+        .mockReturnValueOnce('4242 (truncated')
+        .mockReturnValueOnce(linuxStat(replacement));
+      const terminate = vi.fn(() => true);
+
+      await expect(
+        terminateDirectChild(authority, {
+          readLinuxProcessIdentity: () => readProcLinuxIdentity(4242, readFile),
+          terminateDirectChild: terminate,
+          waitForOwnedProcessExit: vi.fn(async () => undefined),
+        }),
+      ).rejects.toThrow('Direct child immutable identity changed.');
+      expect(readFile).toHaveBeenCalledTimes(2);
+      expect(terminate).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['ENOENT', 'ESRCH'] as const)(
+    'treats %s after one malformed pre-TERM read as already absent',
+    async (code) => {
+      const ownedChild = child();
+      const authority = captureDirectChildAuthority(ownedChild, {
+        platform: 'linux',
+        parentProcessId: 1,
+        readLinuxProcessIdentity: () => identity(),
+      });
+      const readFile = vi
+        .fn()
+        .mockReturnValueOnce('4242 (truncated')
+        .mockImplementationOnce(() => {
+          throw Object.assign(new Error(code), { code });
+        });
+      const terminate = vi.fn(() => true);
+      const wait = vi.fn(async () => undefined);
+
+      await expect(
+        terminateDirectChild(authority, {
+          readLinuxProcessIdentity: () => readProcLinuxIdentity(4242, readFile),
+          terminateDirectChild: terminate,
+          waitForOwnedProcessExit: wait,
+        }),
+      ).resolves.toEqual({ alreadyAbsent: true, forced: false });
+      expect(readFile).toHaveBeenCalledTimes(2);
+      expect(terminate).not.toHaveBeenCalled();
+      expect(wait).not.toHaveBeenCalled();
+    },
+  );
+
+  it('does not force-kill or wait again when the child is absent after TERM', async () => {
+    const ownedChild = child();
+    const authority = captureDirectChildAuthority(ownedChild, {
+      platform: 'linux',
+      parentProcessId: 1,
+      readLinuxProcessIdentity: () => identity(),
+    });
+    const readFile = vi
+      .fn()
+      .mockReturnValueOnce(linuxStat())
+      .mockReturnValueOnce('4242 (truncated')
+      .mockImplementationOnce(() => {
+        throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+      });
+    const terminate = vi.fn(() => true);
+    const wait = vi.fn(async () => {
+      throw new Error('TERM convergence timeout');
+    });
+
+    await expect(
+      terminateDirectChild(authority, {
+        readLinuxProcessIdentity: () => readProcLinuxIdentity(4242, readFile),
+        terminateDirectChild: terminate,
+        waitForOwnedProcessExit: wait,
+      }),
+    ).resolves.toEqual({ alreadyAbsent: false, forced: false });
+    expect(terminate.mock.calls).toEqual([[ownedChild, 'SIGTERM']]);
+    expect(wait).toHaveBeenCalledTimes(1);
+    expect(readFile).toHaveBeenCalledTimes(3);
   });
 });
 

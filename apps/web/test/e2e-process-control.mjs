@@ -10,6 +10,18 @@ const PROCESS_GROUP_POLL_MS = 25;
 const CANONICAL_INTEGER = /^(0|[1-9][0-9]*)$/;
 const LINUX_PROCESS_STATE = /^[RSDZTtXxKWPI]$/;
 
+class MalformedLinuxProcessIdentityError extends Error {
+  constructor() {
+    super('Malformed Linux process identity.');
+    this.name = 'MalformedLinuxProcessIdentityError';
+    this.code = 'malformed-linux-process-identity';
+  }
+}
+
+function malformedLinuxProcessIdentity() {
+  return new MalformedLinuxProcessIdentityError();
+}
+
 export function assertSupportedE2ePlatform(platform = process.platform) {
   if (platform !== 'linux' && platform !== 'win32')
     throw Object.assign(new Error('Unsupported E2E ownership platform.'), {
@@ -74,14 +86,14 @@ export function parseLinuxProcessStat(processId, value) {
     close <= open ||
     value.slice(0, open).trim() !== String(processId)
   )
-    throw new Error('Malformed Linux process identity.');
+    throw malformedLinuxProcessIdentity();
   const fields = value
     .slice(close + 2)
     .trim()
     .split(/\s+/);
   // The suffix begins with proc(5) field 3. Start time is field 22.
   if (fields.length < 20 || !LINUX_PROCESS_STATE.test(fields[0]))
-    throw new Error('Malformed Linux process identity.');
+    throw malformedLinuxProcessIdentity();
   const [state, rawParent, rawGroup, rawSession] = fields;
   const rawStartTime = fields[19];
   if (
@@ -90,7 +102,7 @@ export function parseLinuxProcessStat(processId, value) {
     !CANONICAL_INTEGER.test(rawSession) ||
     !CANONICAL_INTEGER.test(rawStartTime)
   )
-    throw new Error('Malformed Linux process identity.');
+    throw malformedLinuxProcessIdentity();
   const parentProcessId = Number(rawParent);
   const processGroupId = Number(rawGroup);
   const sessionId = Number(rawSession);
@@ -101,7 +113,7 @@ export function parseLinuxProcessStat(processId, value) {
     !Number.isSafeInteger(sessionId) ||
     sessionId < 1
   )
-    throw new Error('Malformed Linux process identity.');
+    throw malformedLinuxProcessIdentity();
   BigInt(rawStartTime);
   return {
     processId,
@@ -120,11 +132,17 @@ export function readLinuxProcessIdentity(processId, readFile = readFileSync) {
   if (process.platform !== 'linux') return undefined;
   if (!Number.isSafeInteger(processId) || processId < 1)
     throw new Error('Invalid Linux process identity PID.');
+  const statPath = `/proc/${processId}/stat`;
+  const readIdentity = () =>
+    parseLinuxProcessStat(processId, readFile(statPath, 'utf8'));
   try {
-    return parseLinuxProcessStat(
-      processId,
-      readFile(`/proc/${processId}/stat`, 'utf8'),
-    );
+    return readIdentity();
+  } catch (error) {
+    if (error?.code === 'ENOENT' || error?.code === 'ESRCH') return undefined;
+    if (!(error instanceof MalformedLinuxProcessIdentityError)) throw error;
+  }
+  try {
+    return readIdentity();
   } catch (error) {
     if (error?.code === 'ENOENT' || error?.code === 'ESRCH') return undefined;
     throw error;
@@ -419,15 +437,19 @@ export async function terminateDirectChild(authority, runtime = {}) {
     return { alreadyAbsent: true, forced: false };
 
   const revalidate = () => {
-    if (authority.platform !== 'linux') return;
+    if (authority.platform !== 'linux') return 'owned';
     const current = (
       runtime.readLinuxProcessIdentity ?? readLinuxProcessIdentity
     )(authority.processId);
-    if (current === undefined) return;
-    if (!sameLinuxIdentity(current, authority.linuxIdentity))
+    if (current === undefined) return 'absent';
+    if (
+      current.parentProcessId !== authority.parentProcessId ||
+      !sameLinuxIdentity(current, authority.linuxIdentity)
+    )
       throw new Error('Direct child immutable identity changed.');
+    return 'owned';
   };
-  revalidate();
+  if (revalidate() === 'absent') return { alreadyAbsent: true, forced: false };
   const terminate =
     runtime.terminateDirectChild ??
     ((ownedChild, signal) => ownedChild.kill(signal));
@@ -444,7 +466,8 @@ export async function terminateDirectChild(authority, runtime = {}) {
     );
     return { alreadyAbsent: false, forced: false };
   } catch (terminationError) {
-    revalidate();
+    if (revalidate() === 'absent')
+      return { alreadyAbsent: false, forced: false };
     if (terminate(child, 'SIGKILL') !== true)
       throw new Error('Direct child forced termination failed.', {
         cause: terminationError,
