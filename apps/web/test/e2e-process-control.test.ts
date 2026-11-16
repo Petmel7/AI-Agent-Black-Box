@@ -374,6 +374,23 @@ describe('Linux process identity', () => {
   });
 
   it.each([
+    ['zero group and session', 1, 0, 0],
+    ['zero group', 1, 0, 4242],
+    ['zero session', 1, 4242, 0],
+    ['zero parent', 0, 4242, 4242],
+  ])(
+    'accepts canonical %s namespace mapping',
+    (_label, parentProcessId, processGroupId, sessionId) => {
+      expect(
+        parseLinuxProcessStat(
+          4242,
+          linuxStat({ parentProcessId, processGroupId, sessionId }),
+        ),
+      ).toEqual(identity({ parentProcessId, processGroupId, sessionId }));
+    },
+  );
+
+  it.each([
     ['negative parent outside the sentinel', -1, -1, -1],
     ['mixed sentinel group', 0, -1, 4242],
     ['mixed sentinel session', 0, 4242, -1],
@@ -389,6 +406,16 @@ describe('Linux process identity', () => {
   });
 
   it.each([
+    ['parent PID', { parentProcessId: Number.MAX_SAFE_INTEGER + 1 }],
+    ['process group', { processGroupId: Number.MAX_SAFE_INTEGER + 1 }],
+    ['session', { sessionId: Number.MAX_SAFE_INTEGER + 1 }],
+  ])('rejects an unsafe namespace mapping %s', (_label, change) => {
+    expect(() => parseLinuxProcessStat(4242, linuxStat(change))).toThrow(
+      'Malformed Linux process identity.',
+    );
+  });
+
+  it.each([
     ['process argument', 4243, stat('S')],
     [
       'stat PID',
@@ -399,16 +426,6 @@ describe('Linux process identity', () => {
       'parent PID',
       4242,
       '4242 (worker) S -1 4242 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0',
-    ],
-    [
-      'process group',
-      4242,
-      '4242 (worker) S 7 0 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0',
-    ],
-    [
-      'session',
-      4242,
-      '4242 (worker) S 7 4242 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 0',
     ],
   ])('rejects malformed %s identity fields', (_label, processId, value) => {
     expect(() => parseLinuxProcessStat(processId, value)).toThrow(
@@ -548,6 +565,104 @@ describe('Linux group ownership revalidation', () => {
 
   it('permits an exact identity and ownership token', () => {
     expect(inspect({ 4242: identity() }, { 4242: token })()).toEqual(owned());
+  });
+
+  it.each([
+    ['zero group and session', 0, 0],
+    ['zero group', 0, 4242],
+    ['zero session', 4242, 0],
+  ])(
+    'skips a sole unrecorded %s namespace mapping without reading its token',
+    (_label, processGroupId, sessionId) => {
+      const zeroMapped = parseLinuxProcessStat(
+        4343,
+        linuxStat({
+          processId: 4343,
+          parentProcessId: 1,
+          processGroupId,
+          sessionId,
+          startTime: '22',
+        }),
+      );
+      const readToken = vi.fn(() => token);
+
+      expect(
+        inspectLinuxOwnedGroup(ownership, [], {
+          listProcessIds: () => [4343],
+          readIdentity: () => zeroMapped,
+          readToken,
+        }),
+      ).toEqual(absent());
+      expect(readToken).not.toHaveBeenCalled();
+    },
+  );
+
+  it('ignores an unrecorded zero-session mapping alongside an ordinary owned group', () => {
+    const zeroMapped = identity({
+      processId: 4343,
+      processGroupId: 4242,
+      sessionId: 0,
+      startTime: '22',
+    });
+    const readToken = vi.fn((processId: number) =>
+      processId === 4242 ? token : 'unexpected-token-read',
+    );
+
+    expect(
+      inspectLinuxOwnedGroup(ownership, [], {
+        listProcessIds: () => [4242, 4343],
+        readIdentity: (processId) =>
+          processId === 4242 ? identity() : zeroMapped,
+        readToken,
+      }),
+    ).toEqual(owned());
+    expect(readToken.mock.calls).toEqual([[4242]]);
+  });
+
+  it.each([
+    ['zero process group', { processGroupId: 0 }],
+    ['zero session', { sessionId: 0 }],
+  ])('rejects a captured root with %s', (_label, change) => {
+    const readToken = vi.fn(() => token);
+
+    expect(() =>
+      inspectLinuxOwnedGroup(ownership, [], {
+        listProcessIds: () => [4242],
+        readIdentity: () => identity(change),
+        readToken,
+      }),
+    ).toThrow('Owned Linux root identity changed.');
+    expect(readToken).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['zero process group', { processGroupId: 0 }],
+    ['zero session', { sessionId: 0 }],
+  ])('rejects a recorded member with %s before filtering', (_label, change) => {
+    const recorded = identity({ processId: 4343, startTime: '22' });
+    const readToken = vi.fn(() => token);
+
+    expect(() =>
+      inspectLinuxOwnedGroup(ownership, [recorded], {
+        listProcessIds: () => [4343],
+        readIdentity: () => ({ ...recorded, ...change }),
+        readToken,
+      }),
+    ).toThrow('Recorded Linux member identity changed.');
+    expect(readToken).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['changed positive process group', { processGroupId: 9999 }],
+    ['changed positive session', { sessionId: 9999 }],
+  ])('rejects a recorded member with %s before filtering', (_label, change) => {
+    const recorded = identity({ processId: 4343, startTime: '22' });
+
+    expect(
+      inspect({ 4343: { ...recorded, ...change } }, { 4343: token }, [
+        recorded,
+      ]),
+    ).toThrow('Recorded Linux member identity changed.');
   });
 
   it('retains a sole unrecorded relationship-unavailable descendant with the exact ownership token', () => {
@@ -809,6 +924,76 @@ describe('owned E2E process cleanup', () => {
     });
     expect(runtime.signalProcessGroup).toHaveBeenCalledTimes(1);
     expect(runtime.signalProcessGroup).toHaveBeenCalledWith(4242, 'SIGTERM');
+  });
+
+  it('does not signal for a sole unrecorded zero namespace mapping', async () => {
+    const zeroMapped = identity({
+      processId: 4343,
+      processGroupId: 4242,
+      sessionId: 0,
+      startTime: '22',
+    });
+    const readToken = vi.fn(() => token);
+    const inspectLinuxOwnership = vi.fn(() =>
+      inspectLinuxOwnedGroup(ownership, [], {
+        listProcessIds: () => [4343],
+        readIdentity: () => zeroMapped,
+        readToken,
+      }),
+    );
+    const runtime = linuxRuntime({ inspectLinuxOwnership });
+
+    await expect(terminateOwnedProcess(child(), runtime)).resolves.toEqual({
+      alreadyAbsent: true,
+      forced: false,
+    });
+    expect(readToken).not.toHaveBeenCalled();
+    expect(runtime.signalProcessGroup).not.toHaveBeenCalled();
+    expect(runtime.waitForOwnedGroupExit).not.toHaveBeenCalled();
+  });
+
+  it('does not let an unrecorded zero namespace mapping suppress ordinary TERM to SIGKILL escalation', async () => {
+    const zeroMapped = identity({
+      processId: 4343,
+      processGroupId: 4242,
+      sessionId: 0,
+      startTime: '22',
+    });
+    const readToken = vi.fn((processId: number) =>
+      processId === 4242 ? token : 'unexpected-token-read',
+    );
+    let exited = false;
+    const inspectLinuxOwnership = vi.fn(() => {
+      if (exited) return absent();
+      return inspectLinuxOwnedGroup(ownership, [], {
+        listProcessIds: () => [4242, 4343],
+        readIdentity: (processId) =>
+          processId === 4242 ? identity() : zeroMapped,
+        readToken,
+      });
+    });
+    const waitForOwnedGroupExit = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('TERM convergence timeout'))
+      .mockImplementationOnce(async (inspect) => {
+        exited = true;
+        expect(inspect?.().state).toBe('absent');
+      });
+    const runtime = linuxRuntime({
+      inspectLinuxOwnership,
+      waitForOwnedGroupExit,
+    });
+
+    await expect(terminateOwnedProcess(child(), runtime)).resolves.toEqual({
+      alreadyAbsent: false,
+      forced: true,
+    });
+    expect(readToken.mock.calls).toEqual([[4242], [4242]]);
+    expect(runtime.signalProcessGroup.mock.calls).toEqual([
+      [4242, 'SIGTERM'],
+      [4242, 'SIGKILL'],
+    ]);
+    expect(waitForOwnedGroupExit).toHaveBeenCalledTimes(2);
   });
 
   it('TERM ESRCH converges ownership uncertainty to exact absence', async () => {

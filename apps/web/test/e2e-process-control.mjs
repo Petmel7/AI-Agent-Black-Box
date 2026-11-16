@@ -112,8 +112,7 @@ export function parseLinuxProcessStat(processId, value) {
   if (
     !Number.isSafeInteger(parentProcessId) ||
     !Number.isSafeInteger(processGroupId) ||
-    !Number.isSafeInteger(sessionId) ||
-    (!relationshipsUnavailable && (processGroupId < 1 || sessionId < 1))
+    !Number.isSafeInteger(sessionId)
   )
     throw malformedLinuxProcessIdentity();
   BigInt(rawStartTime);
@@ -251,13 +250,12 @@ export function inspectLinuxOwnedGroup(
   for (const processId of listProcessIds()) {
     const identity = readIdentity(processId);
     if (!identity) continue;
+    const recorded = recordedMembers.find(
+      (member) => member.processId === identity.processId,
+    );
     if (identity.relationshipState === 'unavailable') {
       const expected =
-        identity.processId === ownership.processId
-          ? ownership
-          : recordedMembers.find(
-              (member) => member.processId === identity.processId,
-            );
+        identity.processId === ownership.processId ? ownership : recorded;
       if (
         expected !== undefined &&
         !sameLinuxProcessInstance(identity, expected)
@@ -278,17 +276,21 @@ export function inspectLinuxOwnedGroup(
     }
     if (
       identity.processId === ownership.processId &&
-      identity.processGroupId !== ownership.processGroupId
+      !sameLinuxIdentity(identity, ownership)
     )
-      throw new Error('Owned Linux root process-group identity changed.');
+      throw new Error('Owned Linux root identity changed.');
+    if (
+      recorded !== undefined &&
+      (identity.processGroupId !== recorded.processGroupId ||
+        identity.sessionId !== recorded.sessionId)
+    )
+      throw new Error('Recorded Linux member identity changed.');
+    if (identity.processGroupId === 0 || identity.sessionId === 0) continue;
     if (identity.processGroupId !== ownership.processGroupId) continue;
     if (identity.sessionId !== ownership.sessionId)
       throw new Error('Owned Linux group session identity changed.');
     const token = readToken(processId);
     if (token !== ownership.ownershipToken) {
-      const recorded = recordedMembers.find(
-        (member) => member.processId === identity.processId,
-      );
       if (
         !identity.terminal ||
         token !== undefined ||
