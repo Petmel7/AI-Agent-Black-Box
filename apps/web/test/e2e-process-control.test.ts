@@ -16,6 +16,7 @@ interface LinuxIdentity {
   parentProcessId: number;
   processGroupId: number;
   sessionId: number;
+  relationshipState: 'available' | 'unavailable';
   startTime: string;
   state: string;
   dead: boolean;
@@ -37,8 +38,9 @@ interface ProcessControlRuntime {
     jobCleanupCompleted: boolean;
   };
   inspectLinuxOwnership?: () => {
-    state: 'owned' | 'absent';
+    state: 'owned' | 'uncertain' | 'absent';
     members: LinuxIdentity[];
+    uncertain?: LinuxIdentity[];
   };
   signalProcessGroup?: (
     processGroupId: number,
@@ -103,7 +105,11 @@ const {
       readIdentity: (processId: number) => LinuxIdentity | undefined;
       readToken: (processId: number) => string | undefined;
     },
-  ) => { state: 'owned' | 'absent'; members: LinuxIdentity[] };
+  ) => {
+    state: 'owned' | 'uncertain' | 'absent';
+    members: LinuxIdentity[];
+    uncertain?: LinuxIdentity[];
+  };
   parseLinuxProcessStat: (processId: number, value: string) => LinuxIdentity;
   probeProcessState: (
     processId: number,
@@ -141,6 +147,7 @@ const identity = (overrides: Partial<LinuxIdentity> = {}): LinuxIdentity => ({
   parentProcessId: 1,
   processGroupId: 4242,
   sessionId: 4242,
+  relationshipState: 'available',
   startTime: '900719925474099312345',
   state: 'S',
   dead: false,
@@ -148,6 +155,19 @@ const identity = (overrides: Partial<LinuxIdentity> = {}): LinuxIdentity => ({
   zombie: false,
   ...overrides,
 });
+const unavailableIdentity = (
+  overrides: Partial<LinuxIdentity> = {},
+): LinuxIdentity =>
+  identity({
+    parentProcessId: 0,
+    processGroupId: -1,
+    sessionId: -1,
+    relationshipState: 'unavailable',
+    state: 'X',
+    dead: true,
+    terminal: true,
+    ...overrides,
+  });
 const ownership: OwnershipIdentity = { ...identity(), ownershipToken: token };
 const metadataDirectory = resolve(tmpdir(), 'bbx-e2e-server-worker-4242');
 
@@ -276,6 +296,7 @@ describe('Linux process identity', () => {
       parentProcessId: 7,
       processGroupId: 4242,
       sessionId: 4242,
+      relationshipState: 'available',
       startTime: '900719925474099312345',
       state: 'S',
       dead: false,
@@ -326,6 +347,45 @@ describe('Linux process identity', () => {
     expect(() => parseLinuxProcessStat(4242, `${prefix}01 0`)).toThrow(
       'Malformed Linux process identity.',
     );
+  });
+
+  it('preserves the exact kernel relationship-unavailable sentinel', () => {
+    expect(
+      parseLinuxProcessStat(
+        4242,
+        linuxStat({
+          parentProcessId: 0,
+          processGroupId: -1,
+          sessionId: -1,
+          state: 'X',
+        }),
+      ),
+    ).toEqual(
+      identity({
+        parentProcessId: 0,
+        processGroupId: -1,
+        sessionId: -1,
+        relationshipState: 'unavailable',
+        state: 'X',
+        dead: true,
+        terminal: true,
+      }),
+    );
+  });
+
+  it.each([
+    ['negative parent outside the sentinel', -1, -1, -1],
+    ['mixed sentinel group', 0, -1, 4242],
+    ['mixed sentinel session', 0, 4242, -1],
+    ['arbitrary negative group', 0, -2, -1],
+    ['arbitrary negative session', 0, -1, -2],
+  ])('rejects %s', (_label, parentProcessId, processGroupId, sessionId) => {
+    expect(() =>
+      parseLinuxProcessStat(
+        4242,
+        linuxStat({ parentProcessId, processGroupId, sessionId }),
+      ),
+    ).toThrow('Malformed Linux process identity.');
   });
 
   it.each([
@@ -490,6 +550,117 @@ describe('Linux group ownership revalidation', () => {
     expect(inspect({ 4242: identity() }, { 4242: token })()).toEqual(owned());
   });
 
+  it('retains a sole unrecorded relationship-unavailable descendant with the exact ownership token', () => {
+    const unavailable = unavailableIdentity({
+      processId: 4343,
+      startTime: '22',
+    });
+
+    expect(inspect({ 4343: unavailable }, { 4343: token })()).toEqual({
+      state: 'owned',
+      members: [unavailable],
+    });
+    expect(unavailable.processGroupId).toBe(-1);
+  });
+
+  it('reports bounded uncertainty for a sole unrecorded relationship-unavailable PID without a readable token', () => {
+    const unavailable = unavailableIdentity({
+      processId: 4343,
+      startTime: '22',
+    });
+
+    expect(inspect({ 4343: unavailable }, { 4343: undefined })()).toEqual({
+      state: 'uncertain',
+      members: [],
+      uncertain: [unavailable],
+    });
+  });
+
+  it('skips a sole unrecorded relationship-unavailable PID with a definite different token', () => {
+    const unavailable = unavailableIdentity({
+      processId: 4343,
+      startTime: '22',
+    });
+    const readToken = vi.fn(() => 'b'.repeat(43));
+
+    expect(
+      inspectLinuxOwnedGroup(ownership, [], {
+        listProcessIds: () => [4343],
+        readIdentity: () => unavailable,
+        readToken,
+      }),
+    ).toEqual({ state: 'absent', members: [] });
+    expect(readToken).toHaveBeenCalledTimes(1);
+    expect(readToken).toHaveBeenCalledWith(4343);
+  });
+
+  it('does not let a known-different unavailable PID affect an ordinary owned group', () => {
+    const unavailable = unavailableIdentity({
+      processId: 4343,
+      startTime: '22',
+    });
+    const readToken = vi.fn((processId: number) =>
+      processId === 4242 ? token : 'b'.repeat(43),
+    );
+
+    expect(
+      inspectLinuxOwnedGroup(ownership, [], {
+        listProcessIds: () => [4242, 4343],
+        readIdentity: (processId) =>
+          processId === 4242 ? identity() : unavailable,
+        readToken,
+      }),
+    ).toEqual(owned());
+    expect(readToken).toHaveBeenCalledTimes(2);
+    expect(readToken).toHaveBeenCalledWith(4242);
+    expect(readToken).toHaveBeenCalledWith(4343);
+  });
+
+  it.each([
+    ['root', ownership, []],
+    [
+      'recorded member',
+      identity({ processId: 4343, startTime: '22' }),
+      [identity({ processId: 4343, startTime: '22' })],
+    ],
+  ])(
+    'retains a matching relationship-unavailable %s for convergence',
+    (_label, expected, recorded) => {
+      const unavailable = identity({
+        processId: expected.processId,
+        parentProcessId: 0,
+        processGroupId: -1,
+        sessionId: -1,
+        relationshipState: 'unavailable',
+        startTime: expected.startTime,
+        state: 'X',
+        dead: true,
+        terminal: true,
+      });
+
+      expect(
+        inspect({ [expected.processId]: unavailable }, {}, recorded)(),
+      ).toEqual({ state: 'owned', members: [unavailable] });
+    },
+  );
+
+  it('rejects PID reuse hidden behind relationship-unavailable fields', () => {
+    const unavailableReplacement = identity({
+      parentProcessId: 0,
+      processGroupId: -1,
+      sessionId: -1,
+      relationshipState: 'unavailable',
+      startTime: 'replacement',
+      state: 'X',
+      dead: true,
+      terminal: true,
+    });
+
+    expect(inspect({ 4242: unavailableReplacement }, {})).toThrow(
+      'Owned Linux root identity changed.',
+    );
+  });
+
   it.each([
     ['start time', { startTime: '2' }],
     ['session', { sessionId: 9999 }],
@@ -638,6 +809,437 @@ describe('owned E2E process cleanup', () => {
     });
     expect(runtime.signalProcessGroup).toHaveBeenCalledTimes(1);
     expect(runtime.signalProcessGroup).toHaveBeenCalledWith(4242, 'SIGTERM');
+  });
+
+  it('TERM ESRCH converges ownership uncertainty to exact absence', async () => {
+    const unavailable = unavailableIdentity({
+      processId: 4343,
+      startTime: '22',
+    });
+    const inspections = [
+      {
+        state: 'uncertain' as const,
+        members: [identity()],
+        uncertain: [unavailable],
+      },
+      absent(),
+      absent(),
+    ];
+    const inspectLinuxOwnership = vi.fn(() => inspections.shift() ?? absent());
+    const waitForOwnedGroupExit = vi.fn(async (inspect) => {
+      expect(inspect?.().state).toBe('absent');
+    });
+    const runtime = linuxRuntime({
+      inspectLinuxOwnership,
+      signalProcessGroup: vi.fn(() => false),
+      waitForOwnedGroupExit,
+    });
+
+    await expect(terminateOwnedProcess(child(), runtime)).resolves.toEqual({
+      alreadyAbsent: false,
+      forced: false,
+    });
+    expect(inspectLinuxOwnership).toHaveBeenCalledTimes(3);
+    expect(inspections).toHaveLength(0);
+    expect(runtime.signalProcessGroup.mock.calls).toEqual([[4242, 'SIGTERM']]);
+    expect(waitForOwnedGroupExit).toHaveBeenCalledTimes(1);
+  });
+
+  it('TERM ESRCH rejects persistent ownership uncertainty', async () => {
+    const unavailable = unavailableIdentity({
+      processId: 4343,
+      startTime: '22',
+    });
+    const inspectLinuxOwnership = vi.fn(() => ({
+      state: 'uncertain' as const,
+      members: [identity()],
+      uncertain: [unavailable],
+    }));
+    const waitForOwnedGroupExit = vi.fn(async () => {
+      throw new Error('deadline');
+    });
+    const runtime = linuxRuntime({
+      inspectLinuxOwnership,
+      signalProcessGroup: vi.fn(() => false),
+      waitForOwnedGroupExit,
+    });
+
+    await expect(terminateOwnedProcess(child(), runtime)).rejects.toThrow(
+      'unavailable or uncertain ownership did not converge',
+    );
+    expect(inspectLinuxOwnership).toHaveBeenCalledTimes(1);
+    expect(runtime.signalProcessGroup.mock.calls).toEqual([[4242, 'SIGTERM']]);
+    expect(waitForOwnedGroupExit).toHaveBeenCalledTimes(1);
+  });
+
+  it('TERM ESRCH converges a token-matched unavailable member to exact absence', async () => {
+    const unavailable = unavailableIdentity({
+      processId: 4343,
+      startTime: '22',
+    });
+    const inspections = [
+      { state: 'owned' as const, members: [identity(), unavailable] },
+      absent(),
+      absent(),
+    ];
+    const inspectLinuxOwnership = vi.fn(() => inspections.shift() ?? absent());
+    const waitForOwnedGroupExit = vi.fn(async (inspect) => {
+      expect(inspect?.().state).toBe('absent');
+    });
+    const runtime = linuxRuntime({
+      inspectLinuxOwnership,
+      signalProcessGroup: vi.fn(() => false),
+      waitForOwnedGroupExit,
+    });
+
+    await expect(terminateOwnedProcess(child(), runtime)).resolves.toEqual({
+      alreadyAbsent: false,
+      forced: false,
+    });
+    expect(inspectLinuxOwnership).toHaveBeenCalledTimes(3);
+    expect(inspections).toHaveLength(0);
+    expect(runtime.signalProcessGroup.mock.calls).toEqual([[4242, 'SIGTERM']]);
+    expect(waitForOwnedGroupExit).toHaveBeenCalledTimes(1);
+  });
+
+  it('TERM ESRCH rejects a persistent token-matched unavailable member', async () => {
+    const unavailable = unavailableIdentity({
+      processId: 4343,
+      startTime: '22',
+    });
+    const inspectLinuxOwnership = vi.fn(() => ({
+      state: 'owned' as const,
+      members: [identity(), unavailable],
+    }));
+    const waitForOwnedGroupExit = vi.fn(async () => {
+      throw new Error('deadline');
+    });
+    const runtime = linuxRuntime({
+      inspectLinuxOwnership,
+      signalProcessGroup: vi.fn(() => false),
+      waitForOwnedGroupExit,
+    });
+
+    await expect(terminateOwnedProcess(child(), runtime)).rejects.toThrow(
+      'unavailable or uncertain ownership did not converge',
+    );
+    expect(inspectLinuxOwnership).toHaveBeenCalledTimes(1);
+    expect(runtime.signalProcessGroup.mock.calls).toEqual([[4242, 'SIGTERM']]);
+    expect(waitForOwnedGroupExit).toHaveBeenCalledTimes(1);
+  });
+
+  it('TERM ESRCH keeps verified-only ownership on the immediate absent path', async () => {
+    const inspectLinuxOwnership = vi.fn(() => owned());
+    const waitForOwnedGroupExit = vi.fn(async () => undefined);
+    const runtime = linuxRuntime({
+      inspectLinuxOwnership,
+      signalProcessGroup: vi.fn(() => false),
+      waitForOwnedGroupExit,
+    });
+
+    await expect(terminateOwnedProcess(child(), runtime)).resolves.toEqual({
+      alreadyAbsent: true,
+      forced: false,
+    });
+    expect(inspectLinuxOwnership).toHaveBeenCalledTimes(1);
+    expect(runtime.signalProcessGroup.mock.calls).toEqual([[4242, 'SIGTERM']]);
+    expect(waitForOwnedGroupExit).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['root', 4242, '900719925474099312345'],
+    ['recorded member', 4343, '22'],
+    ['unrecorded token-matched descendant', 4444, '23'],
+  ])(
+    'waits without signaling when only a matching %s relationship is unavailable before TERM',
+    async (_label, processId, startTime) => {
+      const unavailable = identity({
+        processId,
+        parentProcessId: 0,
+        processGroupId: -1,
+        sessionId: -1,
+        relationshipState: 'unavailable',
+        startTime,
+        state: 'X',
+        dead: true,
+        terminal: true,
+      });
+      const inspectLinuxOwnership = vi
+        .fn()
+        .mockReturnValueOnce({ state: 'owned', members: [unavailable] })
+        .mockReturnValue({ state: 'absent', members: [] });
+      const waitForOwnedGroupExit = vi.fn(async (inspect) => {
+        expect(inspect?.().state).toBe('absent');
+      });
+      const runtime = linuxRuntime({
+        inspectLinuxOwnership,
+        waitForOwnedGroupExit,
+      });
+
+      await expect(terminateOwnedProcess(child(), runtime)).resolves.toEqual({
+        alreadyAbsent: false,
+        forced: false,
+      });
+      expect(runtime.signalProcessGroup).not.toHaveBeenCalled();
+      expect(waitForOwnedGroupExit).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('does not escalate to SIGKILL when relationships become unavailable after TERM', async () => {
+    const unavailable = identity({
+      parentProcessId: 0,
+      processGroupId: -1,
+      sessionId: -1,
+      relationshipState: 'unavailable',
+      state: 'X',
+      dead: true,
+      terminal: true,
+    });
+    const inspectLinuxOwnership = vi
+      .fn()
+      .mockReturnValueOnce(owned())
+      .mockReturnValueOnce({ state: 'owned', members: [unavailable] })
+      .mockReturnValue({ state: 'absent', members: [] });
+    const waitForOwnedGroupExit = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('TERM convergence timeout'))
+      .mockImplementationOnce(async (inspect) => {
+        expect(inspect?.().state).toBe('absent');
+      });
+    const runtime = linuxRuntime({
+      inspectLinuxOwnership,
+      waitForOwnedGroupExit,
+    });
+
+    await expect(terminateOwnedProcess(child(), runtime)).resolves.toEqual({
+      alreadyAbsent: false,
+      forced: false,
+    });
+    expect(runtime.signalProcessGroup.mock.calls).toEqual([[4242, 'SIGTERM']]);
+    expect(waitForOwnedGroupExit).toHaveBeenCalledTimes(2);
+  });
+
+  it('converges bounded ownership uncertainty without signaling', async () => {
+    const unavailable = unavailableIdentity({
+      processId: 4343,
+      startTime: '22',
+    });
+    const inspectLinuxOwnership = vi
+      .fn()
+      .mockReturnValueOnce({
+        state: 'uncertain',
+        members: [],
+        uncertain: [unavailable],
+      })
+      .mockReturnValue({ state: 'absent', members: [] });
+    const waitForOwnedGroupExit = vi.fn(async (inspect) => {
+      expect(inspect?.().state).toBe('absent');
+    });
+    const runtime = linuxRuntime({
+      inspectLinuxOwnership,
+      waitForOwnedGroupExit,
+    });
+
+    await expect(terminateOwnedProcess(child(), runtime)).resolves.toEqual({
+      alreadyAbsent: false,
+      forced: false,
+    });
+    expect(runtime.signalProcessGroup).not.toHaveBeenCalled();
+    expect(waitForOwnedGroupExit).toHaveBeenCalledTimes(1);
+  });
+
+  it('fails closed when ownership uncertainty persists to the deadline', async () => {
+    const unavailable = unavailableIdentity({
+      processId: 4343,
+      startTime: '22',
+    });
+    const inspectLinuxOwnership = vi.fn(() => ({
+      state: 'uncertain' as const,
+      members: [],
+      uncertain: [unavailable],
+    }));
+    const waitForOwnedGroupExit = vi.fn(async () => {
+      throw new Error('deadline');
+    });
+    const runtime = linuxRuntime({
+      inspectLinuxOwnership,
+      waitForOwnedGroupExit,
+    });
+
+    await expect(terminateOwnedProcess(child(), runtime)).rejects.toThrow(
+      'unavailable or uncertain ownership did not converge',
+    );
+    expect(runtime.signalProcessGroup).not.toHaveBeenCalled();
+    expect(waitForOwnedGroupExit).toHaveBeenCalledTimes(1);
+  });
+
+  it('prohibits SIGKILL for a mixed unavailable and ordinary live post-TERM snapshot', async () => {
+    const unavailableRoot = unavailableIdentity();
+    const liveMember = identity({
+      processId: 4343,
+      parentProcessId: 4242,
+      startTime: '22',
+    });
+    const inspectLinuxOwnership = vi
+      .fn()
+      .mockReturnValueOnce(owned())
+      .mockReturnValueOnce({
+        state: 'owned',
+        members: [unavailableRoot, liveMember],
+      })
+      .mockReturnValue({ state: 'absent', members: [] });
+    const waitForOwnedGroupExit = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('TERM convergence timeout'))
+      .mockImplementationOnce(async (inspect) => {
+        expect(inspect?.().state).toBe('absent');
+      });
+    const runtime = linuxRuntime({
+      inspectLinuxOwnership,
+      waitForOwnedGroupExit,
+    });
+
+    await expect(terminateOwnedProcess(child(), runtime)).resolves.toEqual({
+      alreadyAbsent: false,
+      forced: false,
+    });
+    expect(runtime.signalProcessGroup.mock.calls).toEqual([[4242, 'SIGTERM']]);
+    expect(waitForOwnedGroupExit).toHaveBeenCalledTimes(2);
+  });
+
+  it('prohibits SIGKILL for mixed ownership uncertainty and an ordinary live post-TERM member', async () => {
+    const liveMember = identity({
+      processId: 4343,
+      parentProcessId: 4242,
+      startTime: '22',
+    });
+    const uncertain = unavailableIdentity({
+      processId: 4444,
+      startTime: '23',
+    });
+    const inspectLinuxOwnership = vi
+      .fn()
+      .mockReturnValueOnce(owned())
+      .mockReturnValueOnce({
+        state: 'uncertain',
+        members: [liveMember],
+        uncertain: [uncertain],
+      })
+      .mockReturnValue({ state: 'absent', members: [] });
+    const waitForOwnedGroupExit = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('TERM convergence timeout'))
+      .mockImplementationOnce(async (inspect) => {
+        expect(inspect?.().state).toBe('absent');
+      });
+    const runtime = linuxRuntime({
+      inspectLinuxOwnership,
+      waitForOwnedGroupExit,
+    });
+
+    await expect(terminateOwnedProcess(child(), runtime)).resolves.toEqual({
+      alreadyAbsent: false,
+      forced: false,
+    });
+    expect(runtime.signalProcessGroup.mock.calls).toEqual([[4242, 'SIGTERM']]);
+    expect(waitForOwnedGroupExit).toHaveBeenCalledTimes(2);
+  });
+
+  it('fails closed without SIGKILL when a mixed post-TERM snapshot does not converge', async () => {
+    const mixed = {
+      state: 'owned' as const,
+      members: [
+        unavailableIdentity(),
+        identity({
+          processId: 4343,
+          parentProcessId: 4242,
+          startTime: '22',
+        }),
+      ],
+    };
+    const inspectLinuxOwnership = vi
+      .fn()
+      .mockReturnValueOnce(owned())
+      .mockReturnValue(mixed);
+    const waitForOwnedGroupExit = vi.fn(async () => {
+      throw new Error('deadline');
+    });
+    const runtime = linuxRuntime({
+      inspectLinuxOwnership,
+      waitForOwnedGroupExit,
+    });
+
+    await expect(terminateOwnedProcess(child(), runtime)).rejects.toThrow(
+      'unavailable or uncertain ownership did not converge',
+    );
+    expect(runtime.signalProcessGroup.mock.calls).toEqual([[4242, 'SIGTERM']]);
+    expect(waitForOwnedGroupExit).toHaveBeenCalledTimes(2);
+  });
+
+  it('retains TERM to SIGKILL escalation for only ordinary verified live members', async () => {
+    const inspectLinuxOwnership = vi
+      .fn()
+      .mockReturnValueOnce(owned())
+      .mockReturnValueOnce(owned())
+      .mockReturnValue({ state: 'absent', members: [] });
+    const waitForOwnedGroupExit = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('TERM convergence timeout'))
+      .mockImplementationOnce(async (inspect) => {
+        expect(inspect?.().state).toBe('absent');
+      });
+    const runtime = linuxRuntime({
+      inspectLinuxOwnership,
+      waitForOwnedGroupExit,
+    });
+
+    await expect(terminateOwnedProcess(child(), runtime)).resolves.toEqual({
+      alreadyAbsent: false,
+      forced: true,
+    });
+    expect(runtime.signalProcessGroup.mock.calls).toEqual([
+      [4242, 'SIGTERM'],
+      [4242, 'SIGKILL'],
+    ]);
+    expect(waitForOwnedGroupExit).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not let a known-different unavailable PID suppress ordinary TERM to SIGKILL escalation', async () => {
+    const unrelated = unavailableIdentity({
+      processId: 4343,
+      startTime: '22',
+    });
+    let exited = false;
+    const inspectLinuxOwnership = vi.fn(() => {
+      if (exited) return absent();
+      return inspectLinuxOwnedGroup(ownership, [], {
+        listProcessIds: () => [4242, 4343],
+        readIdentity: (processId) =>
+          processId === 4242 ? identity() : unrelated,
+        readToken: (processId) => (processId === 4242 ? token : 'b'.repeat(43)),
+      });
+    });
+    const waitForOwnedGroupExit = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('TERM convergence timeout'))
+      .mockImplementationOnce(async (inspect) => {
+        exited = true;
+        expect(inspect?.().state).toBe('absent');
+      });
+    const runtime = linuxRuntime({
+      inspectLinuxOwnership,
+      waitForOwnedGroupExit,
+    });
+
+    await expect(terminateOwnedProcess(child(), runtime)).resolves.toEqual({
+      alreadyAbsent: false,
+      forced: true,
+    });
+    expect(runtime.signalProcessGroup.mock.calls).toEqual([
+      [4242, 'SIGTERM'],
+      [4242, 'SIGKILL'],
+    ]);
+    expect(waitForOwnedGroupExit).toHaveBeenCalledTimes(2);
   });
 
   it('prevents SIGKILL when identity changes after SIGTERM', async () => {
@@ -833,6 +1435,77 @@ describe('owned E2E process cleanup', () => {
 });
 
 describe('direct-child emergency cleanup authority', () => {
+  it('waits on the retained child handle without signaling when relationships are unavailable before TERM', async () => {
+    const ownedChild = child();
+    const authority = captureDirectChildAuthority(ownedChild, {
+      platform: 'linux',
+      parentProcessId: 1,
+      readLinuxProcessIdentity: () => identity(),
+    });
+    const terminate = vi.fn(() => true);
+    const wait = vi.fn(async () => undefined);
+
+    await expect(
+      terminateDirectChild(authority, {
+        readLinuxProcessIdentity: () => unavailableIdentity(),
+        terminateDirectChild: terminate,
+        waitForOwnedProcessExit: wait,
+      }),
+    ).resolves.toEqual({ alreadyAbsent: false, forced: false });
+    expect(terminate).not.toHaveBeenCalled();
+    expect(wait).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not escalate to SIGKILL when relationships become unavailable after TERM', async () => {
+    const ownedChild = child();
+    const authority = captureDirectChildAuthority(ownedChild, {
+      platform: 'linux',
+      parentProcessId: 1,
+      readLinuxProcessIdentity: () => identity(),
+    });
+    const readIdentity = vi
+      .fn()
+      .mockReturnValueOnce(identity())
+      .mockReturnValueOnce(unavailableIdentity());
+    const terminate = vi.fn(() => true);
+    const wait = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('TERM convergence timeout'))
+      .mockResolvedValueOnce(undefined);
+
+    await expect(
+      terminateDirectChild(authority, {
+        readLinuxProcessIdentity: readIdentity,
+        terminateDirectChild: terminate,
+        waitForOwnedProcessExit: wait,
+      }),
+    ).resolves.toEqual({ alreadyAbsent: false, forced: false });
+    expect(terminate.mock.calls).toEqual([[ownedChild, 'SIGTERM']]);
+    expect(wait).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects a replacement whose relationships are unavailable before signaling', async () => {
+    const ownedChild = child();
+    const authority = captureDirectChildAuthority(ownedChild, {
+      platform: 'linux',
+      parentProcessId: 1,
+      readLinuxProcessIdentity: () => identity(),
+    });
+    const terminate = vi.fn(() => true);
+    const wait = vi.fn(async () => undefined);
+
+    await expect(
+      terminateDirectChild(authority, {
+        readLinuxProcessIdentity: () =>
+          unavailableIdentity({ startTime: 'replacement' }),
+        terminateDirectChild: terminate,
+        waitForOwnedProcessExit: wait,
+      }),
+    ).rejects.toThrow('Direct child immutable identity changed.');
+    expect(terminate).not.toHaveBeenCalled();
+    expect(wait).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['PID reuse', { startTime: '900719925474099312346' }],
     ['PGID reuse', { processGroupId: 5151 }],

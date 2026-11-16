@@ -96,10 +96,13 @@ export function parseLinuxProcessStat(processId, value) {
     throw malformedLinuxProcessIdentity();
   const [state, rawParent, rawGroup, rawSession] = fields;
   const rawStartTime = fields[19];
+  const relationshipsUnavailable =
+    rawParent === '0' && rawGroup === '-1' && rawSession === '-1';
   if (
-    !CANONICAL_INTEGER.test(rawParent) ||
-    !CANONICAL_INTEGER.test(rawGroup) ||
-    !CANONICAL_INTEGER.test(rawSession) ||
+    (!relationshipsUnavailable &&
+      (!CANONICAL_INTEGER.test(rawParent) ||
+        !CANONICAL_INTEGER.test(rawGroup) ||
+        !CANONICAL_INTEGER.test(rawSession))) ||
     !CANONICAL_INTEGER.test(rawStartTime)
   )
     throw malformedLinuxProcessIdentity();
@@ -109,9 +112,8 @@ export function parseLinuxProcessStat(processId, value) {
   if (
     !Number.isSafeInteger(parentProcessId) ||
     !Number.isSafeInteger(processGroupId) ||
-    processGroupId < 1 ||
     !Number.isSafeInteger(sessionId) ||
-    sessionId < 1
+    (!relationshipsUnavailable && (processGroupId < 1 || sessionId < 1))
   )
     throw malformedLinuxProcessIdentity();
   BigInt(rawStartTime);
@@ -120,6 +122,7 @@ export function parseLinuxProcessStat(processId, value) {
     parentProcessId,
     processGroupId,
     sessionId,
+    relationshipState: relationshipsUnavailable ? 'unavailable' : 'available',
     startTime: rawStartTime,
     state,
     dead: state === 'X' || state === 'x',
@@ -222,6 +225,13 @@ function sameLinuxIdentity(actual, expected) {
   );
 }
 
+function sameLinuxProcessInstance(actual, expected) {
+  return (
+    actual.processId === expected.processId &&
+    actual.startTime === expected.startTime
+  );
+}
+
 export function sameImmutableLinuxIdentity(actual, expected) {
   return sameLinuxIdentity(actual, expected);
 }
@@ -237,9 +247,35 @@ export function inspectLinuxOwnedGroup(
   const readToken = io.readToken ?? readLinuxOwnershipToken;
   const listProcessIds = io.listProcessIds ?? linuxProcessIds;
   const members = [];
+  const uncertain = [];
   for (const processId of listProcessIds()) {
     const identity = readIdentity(processId);
     if (!identity) continue;
+    if (identity.relationshipState === 'unavailable') {
+      const expected =
+        identity.processId === ownership.processId
+          ? ownership
+          : recordedMembers.find(
+              (member) => member.processId === identity.processId,
+            );
+      if (
+        expected !== undefined &&
+        !sameLinuxProcessInstance(identity, expected)
+      )
+        throw new Error(
+          identity.processId === ownership.processId
+            ? 'Owned Linux root identity changed.'
+            : 'Recorded Linux member identity changed.',
+        );
+      if (expected !== undefined) {
+        members.push(identity);
+        continue;
+      }
+      const token = readToken(processId);
+      if (token === ownership.ownershipToken) members.push(identity);
+      else if (token === undefined) uncertain.push(identity);
+      continue;
+    }
     if (
       identity.processId === ownership.processId &&
       identity.processGroupId !== ownership.processGroupId
@@ -263,19 +299,29 @@ export function inspectLinuxOwnedGroup(
     }
     members.push(identity);
   }
-  if (members.length === 0) return { state: 'absent', members: [] };
+  if (members.length === 0 && uncertain.length === 0)
+    return { state: 'absent', members: [] };
   const root = members.find(
     (member) => member.processId === ownership.processId,
   );
-  if (root && !sameLinuxIdentity(root, ownership))
+  if (
+    root &&
+    root.relationshipState !== 'unavailable' &&
+    !sameLinuxIdentity(root, ownership)
+  )
     throw new Error('Owned Linux root identity changed.');
   for (const recorded of recordedMembers) {
     const current = members.find(
       (member) => member.processId === recorded.processId,
     );
-    if (current && !sameLinuxIdentity(current, recorded))
+    if (
+      current &&
+      current.relationshipState !== 'unavailable' &&
+      !sameLinuxIdentity(current, recorded)
+    )
       throw new Error('Recorded Linux member identity changed.');
   }
+  if (uncertain.length > 0) return { state: 'uncertain', members, uncertain };
   return { state: 'owned', members };
 }
 
@@ -310,6 +356,41 @@ async function waitForOwnedGroupExit(inspect, timeoutMs) {
   throw new Error('Owned E2E process group did not exit.');
 }
 
+function hasUnsignalableLinuxOwnership(inspection) {
+  return (
+    inspection.state === 'uncertain' ||
+    inspection.members.some(
+      (member) => member.relationshipState === 'unavailable',
+    )
+  );
+}
+
+async function waitForUnsignalableLinuxOwnership(
+  inspect,
+  waitForGroupExit,
+  runtime,
+) {
+  try {
+    await waitForGroupExit(
+      inspect,
+      convergenceBound(
+        runtime,
+        'killConvergenceMs',
+        E2E_LIFECYCLE_BOUNDS.killConvergenceMs,
+      ),
+    );
+  } catch (error) {
+    throw new Error(
+      'Owned E2E process with unavailable or uncertain ownership did not converge.',
+      { cause: error },
+    );
+  }
+  if (inspect().state !== 'absent')
+    throw new Error(
+      'Owned E2E process with unavailable or uncertain ownership did not converge.',
+    );
+}
+
 export async function terminateLinuxOwnedGroup(
   ownership,
   recordedMembers = [],
@@ -324,7 +405,12 @@ export async function terminateLinuxOwnedGroup(
   const first = inspectWithMembers(recordedMembers);
   if (first.state === 'absent') return { alreadyAbsent: true, forced: false };
   const verifiedMembers = Object.freeze(
-    [...recordedMembers, ...first.members].filter(
+    [
+      ...recordedMembers,
+      ...first.members.filter(
+        (member) => member.relationshipState !== 'unavailable',
+      ),
+    ].filter(
       (member, index, members) =>
         members.findIndex(
           (candidate) => candidate.processId === member.processId,
@@ -332,9 +418,19 @@ export async function terminateLinuxOwnedGroup(
     ),
   );
   const inspect = () => inspectWithMembers(verifiedMembers);
-  const liveBeforeTerm = first.members.some((member) => !member.terminal);
-  if (liveBeforeTerm && !signalGroup(ownership.processGroupId, 'SIGTERM'))
-    return { alreadyAbsent: true, forced: false };
+  const liveBeforeTerm = first.members.some(
+    (member) => member.relationshipState !== 'unavailable' && !member.terminal,
+  );
+  const unsignalableBeforeTerm = hasUnsignalableLinuxOwnership(first);
+  if (!liveBeforeTerm && unsignalableBeforeTerm) {
+    await waitForUnsignalableLinuxOwnership(inspect, waitForGroupExit, runtime);
+    return { alreadyAbsent: false, forced: false };
+  }
+  if (liveBeforeTerm && !signalGroup(ownership.processGroupId, 'SIGTERM')) {
+    if (!unsignalableBeforeTerm) return { alreadyAbsent: true, forced: false };
+    await waitForUnsignalableLinuxOwnership(inspect, waitForGroupExit, runtime);
+    return { alreadyAbsent: false, forced: false };
+  }
   let forced = false;
   try {
     await waitForGroupExit(
@@ -350,9 +446,12 @@ export async function terminateLinuxOwnedGroup(
     const beforeKill = inspect();
     if (beforeKill.state === 'absent') return { alreadyAbsent: false, forced };
     const liveBeforeKill = beforeKill.members.some(
-      (member) => !member.terminal,
+      (member) =>
+        member.relationshipState !== 'unavailable' && !member.terminal,
     );
-    if (!liveBeforeKill) {
+    const killProhibited =
+      unsignalableBeforeTerm || hasUnsignalableLinuxOwnership(beforeKill);
+    if (killProhibited || !liveBeforeKill) {
       forced = false;
       try {
         await waitForGroupExit(
@@ -365,14 +464,20 @@ export async function terminateLinuxOwnedGroup(
         );
       } catch (error) {
         throw new Error(
-          'Owned E2E terminal process did not reap before the deadline.',
+          killProhibited
+            ? 'Owned E2E process with unavailable or uncertain ownership did not converge.'
+            : 'Owned E2E terminal process did not reap before the deadline.',
           {
             cause: error ?? terminationError,
           },
         );
       }
       if (inspect().state !== 'absent')
-        throw new Error('Owned E2E terminal cleanup did not converge.');
+        throw new Error(
+          killProhibited
+            ? 'Owned E2E process with unavailable or uncertain ownership did not converge.'
+            : 'Owned E2E terminal cleanup did not converge.',
+        );
       return { alreadyAbsent: false, forced };
     }
     if (!signalGroup(ownership.processGroupId, 'SIGKILL'))
@@ -442,6 +547,9 @@ export async function terminateDirectChild(authority, runtime = {}) {
       runtime.readLinuxProcessIdentity ?? readLinuxProcessIdentity
     )(authority.processId);
     if (current === undefined) return 'absent';
+    if (!sameLinuxProcessInstance(current, authority.linuxIdentity))
+      throw new Error('Direct child immutable identity changed.');
+    if (current.relationshipState === 'unavailable') return 'unavailable';
     if (
       current.parentProcessId !== authority.parentProcessId ||
       !sameLinuxIdentity(current, authority.linuxIdentity)
@@ -449,7 +557,26 @@ export async function terminateDirectChild(authority, runtime = {}) {
       throw new Error('Direct child immutable identity changed.');
     return 'owned';
   };
-  if (revalidate() === 'absent') return { alreadyAbsent: true, forced: false };
+  const beforeTerm = revalidate();
+  if (beforeTerm === 'absent') return { alreadyAbsent: true, forced: false };
+  if (beforeTerm === 'unavailable') {
+    try {
+      await waitForChildExit(
+        child,
+        convergenceBound(
+          runtime,
+          'killConvergenceMs',
+          E2E_LIFECYCLE_BOUNDS.killConvergenceMs,
+        ),
+      );
+    } catch (error) {
+      throw new Error(
+        'Direct child with unavailable relationships did not converge.',
+        { cause: error },
+      );
+    }
+    return { alreadyAbsent: false, forced: false };
+  }
   const terminate =
     runtime.terminateDirectChild ??
     ((ownedChild, signal) => ownedChild.kill(signal));
@@ -466,8 +593,26 @@ export async function terminateDirectChild(authority, runtime = {}) {
     );
     return { alreadyAbsent: false, forced: false };
   } catch (terminationError) {
-    if (revalidate() === 'absent')
+    const beforeKill = revalidate();
+    if (beforeKill === 'absent') return { alreadyAbsent: false, forced: false };
+    if (beforeKill === 'unavailable') {
+      try {
+        await waitForChildExit(
+          child,
+          convergenceBound(
+            runtime,
+            'killConvergenceMs',
+            E2E_LIFECYCLE_BOUNDS.killConvergenceMs,
+          ),
+        );
+      } catch (error) {
+        throw new Error(
+          'Direct child with unavailable relationships did not converge.',
+          { cause: error ?? terminationError },
+        );
+      }
       return { alreadyAbsent: false, forced: false };
+    }
     if (terminate(child, 'SIGKILL') !== true)
       throw new Error('Direct child forced termination failed.', {
         cause: terminationError,
