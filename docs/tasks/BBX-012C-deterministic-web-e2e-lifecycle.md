@@ -7,67 +7,96 @@
   implementation starting state
 - **Delivery risk:** High
 - **Execution profile:** High
-- **Risk triggers:** cross-platform process and listener ownership, concurrent
-  test isolation, watchdog and teardown races, terminal-result protocol
-  integrity, cleanup after partial failure, and a deliberately dirty recovery
-  baseline
-- **Architecture:** No new ADR is required for a narrow lifecycle or teardown
-  correction inside the restored test harness. A solution that needs a broader
-  process, trust, infrastructure, or platform ownership boundary must stop and
-  request an architecture decision.
+- **Risk triggers:** cross-platform process-group and process-tree ownership,
+  concurrent test isolation, bounded forced teardown, hook-deadline races,
+  preservation of primary and cleanup outcomes, and a deliberately dirty
+  recovery baseline
+- **Architecture:** Option S is the selected task-level architecture. No new ADR
+  is required because it simplifies the internal test-harness lifecycle without
+  changing a product, trust, durable-data, infrastructure, or public-contract
+  boundary. If the required guarantee needs a guardian, Job Object, native
+  helper, registry, or broader supervisor, implementation must stop and return
+  to architecture.
 
 ## Goal
 
-Produce the smallest deterministic, baseline-compatible lifecycle correction
-that makes the restored Web E2E harness reliably terminate and clean its owned
-controller, owner, child processes, listeners, and exact output paths on
-success, failure, watchdog expiry, protocol failure, and test teardown.
+Replace the invalidated multi-group lifecycle correction with one deterministic,
+parent-owned process lifecycle for each Web E2E run. Exactly one detached
+ownership root may exist; every descendant remains non-detached in that root's
+process group or tree; and the test parent retains the real root `ChildProcess`
+handle through bounded cleanup and exact absence verification.
 
 This task stabilizes test infrastructure only. It adds no product capability
-and does not change dashboard, evidence, authentication, persistence, or
-runtime contracts.
+and does not change dashboard, evidence, authentication, persistence, or runtime
+contracts.
 
 ## Context
 
-Independent review showed that file serialization alone is insufficient. Two
-fresh serialized Web runs each failed 6 of 238 tests in
-`apps/web/test/e2e-harness.test.ts` and left 17 Node processes. One run also
-left seven listeners. The failures were observed after restoring the Option R
-baseline and retaining `fileParallelism: false`.
+Independent review invalidated the prior narrow BBX-012C implementation:
 
-At proposal time, the repository is based on
-`99aac9f992c24bbc1824c5fae24422afa56077a3` with exactly 36 intentional
-unstaged paths under `apps/web/**`, no staged paths, and no other untracked
-paths. The effective `apps/web` tree equals product baseline
-`8f61b75aaaa858d3a2a62959e7f26fdc1cf62f04` except for
-`fileParallelism: false` in `apps/web/vitest.config.ts`. `apps/cli` remains
+1. `afterEach` had a 10-second hook deadline while cleanup could consume a
+   10-second cooperative wait, another 5 seconds after fallback, and 10 seconds
+   of resource verification.
+2. Nested detached processes created multiple process groups, so forced
+   fallback owned only part of the descendant tree.
+3. Cleanup failure could overwrite the primary child or test outcome.
+4. A forced fallback could be reported as successful ordinary cleanup.
+
+Review independently reproduced focused, complete-harness, and full-Web
+failures with leaked processes and listeners. The prior diagnosis gate and its
+synthetic expectation that detached descendants recover autonomously are no
+longer valid acceptance contracts.
+
+At this amendment checkpoint, the repository is on `main` at
+`a23832d95b91ac5e877162654384002276a120a8`. `HEAD` contains the previously
+Approved task. The index is empty, there are no untracked files, and exactly 36
+intentional unstaged paths exist under `apps/web/**`. The failed four-file
+BBX-012C delta is:
+
+- `apps/web/test/e2e-controller.mjs`
+- `apps/web/test/e2e-harness.test.ts`
+- `apps/web/test/e2e-playwright-owner.mjs`
+- `apps/web/test/e2e-server.mjs`
+
+Hashing their patch from recovery reference
+`8f61b75aaaa858d3a2a62959e7f26fdc1cf62f04` with
+`git diff <reference> -- <the four paths> | git hash-object --stdin` yields
+`4d4788506f45911a179071e2bc38b761809a9070`.
+
+Before Option S implementation begins, those four files must be restored to the
+Option R recovery content and the reset must be proved. The effective
+`apps/web` tree must equal `8f61b75aaaa858d3a2a62959e7f26fdc1cf62f04`
+except for `fileParallelism: false` in `apps/web/vitest.config.ts`; the 36-path
+recovery patch fingerprint must be
+`32b44cec3227725c28d48dd5f1a59d614f45d9c8`; and `apps/cli` must remain
 identical to `1c263cc49ee687cfb15404736968488ecb2865c4`.
 
-Those existing changes are the Option R recovery, not BBX-012C implementation
-work. Approval must commit only the unchanged task specification. Implementation
-must treat the effective Option R tree as its starting state, must not revert it
-to the current `HEAD` versions, and must distinguish the narrow BBX-012C delta
-from the pre-existing recovery in its report.
-
-The removed 39-path Linux guardian, Windows Job, preload, and resource-registry
-experiment is intentionally not part of the baseline and is not a source to
-restore selectively.
+The 36 Web paths are pre-existing recovery and failed-implementation state, not
+part of this specification amendment. Approval must commit only the unchanged
+task specification. Implementation must report the reset proof separately from
+the Option S delta and must not stage, commit, or accidentally revert the
+recovery paths.
 
 ## In Scope
 
-- Reproduce and classify the process-heavy harness failure before changing
-  behavior.
-- Correct only the demonstrated narrow lifecycle, terminal-protocol, or
-  teardown defect inside the restored Web E2E harness.
-- Make ownership, terminal-result ordering, cleanup convergence, and teardown
-  assertions deterministic for success and every existing failure path.
-- Preserve concurrent-run isolation for processes, listeners, and exact output
-  paths.
-- Add or strengthen focused regression fixtures and assertions needed to prove
-  the correction, without weakening existing scenarios.
+- Prove and perform the exact four-file reset to the Option R recovery state
+  before changing lifecycle behavior.
+- Establish exactly one detached ownership root per E2E run and retain its real
+  `ChildProcess` handle in the test parent.
+- Make every nested controller, owner, Playwright fixture, server worker,
+  application, and test descendant non-detached so it inherits the same owned
+  process group or tree.
+- Implement one monotonic cleanup budget that covers cooperative shutdown,
+  bounded forced fallback, and exact absence verification and is strictly
+  smaller than the Vitest hook timeout.
+- Preserve the primary child or test outcome independently from cleanup outcome
+  and forced-fallback use.
+- Preserve exact run-ID output ownership and concurrent-run isolation.
+- Replace detached-descendant autonomous-recovery scenarios with deterministic
+  parent-owned forced-teardown coverage.
 
-Implementation edits are limited to the restored baseline harness files that
-directly participate in the demonstrated defect, normally a subset of:
+Implementation edits are limited to the smallest necessary subset of these
+restored baseline harness files:
 
 - `apps/web/test/e2e-harness.test.ts`
 - `apps/web/test/e2e-controller.mjs`
@@ -75,186 +104,250 @@ directly participate in the demonstrated defect, normally a subset of:
 - `apps/web/test/e2e-process-control.mjs`
 - `apps/web/test/e2e-server.mjs`
 - `apps/web/test/e2e-server-worker.mjs`
-- existing E2E fixture files, only when required for regression coverage
+- existing controller and server fixture files, only when required for focused
+  regression coverage
 - `apps/web/vitest.config.ts`, only to preserve the existing
   `fileParallelism: false`
 
-Any required edit outside this set is an explicit scope stop and returns the
-task to architecture review before that file is changed.
+Any required edit outside this set, any new helper file, or any broader
+ownership mechanism is an explicit scope stop and returns the task to
+architecture before that file or mechanism is introduced.
 
 ## Out of Scope
 
 - Product routes, dashboard UI, authentication, queries, database code,
   migrations, schemas, contracts, dependencies, or the lockfile.
-- Browser-journey expansion, PostgreSQL, Docker, PGMQ, collector, ingestion,
-  worker, summary, finding, or export behavior.
-- Changes to `apps/cli`, `next-env.d.ts`, BBX-012B status, another task, an ADR,
-  or accepted product or architecture documents.
-- Restoring any removed guardian, native supervisor, Windows Job, preload or
-  spawn guard, generalized resource registry, `/proc` parser, or multi-layer
-  ownership architecture.
-- Adding a native dependency, PowerShell supervisor, preload hook, or
-  platform-specific binary.
-- Timeout increases, sleeps, retries, broad process enumeration, process-name
-  killing, PID-prefix cleanup, or shared-directory deletion as a correctness
-  mechanism.
+- Changes to `apps/cli`, `apps/web/next-env.d.ts`, BBX-012B status, another task,
+  an ADR, or accepted product or architecture documents.
+- Linux guardians or subreapers.
+- Windows Job Objects or native supervisors.
+- Resource or PID registries, preload or spawn guards, PowerShell or native
+  ownership helpers, and `/proc` ownership parsers.
+- PID reconstruction, process-name matching, broad process enumeration as a
+  cleanup target source, PID-prefix cleanup, sibling cleanup, or shared-parent
+  deletion.
+- Timeout increases, arbitrary sleeps, or retries as correctness mechanisms.
+- Restoring any removed experimental supervisor file or recreating it under a
+  different name.
 - Committing, pushing, hosted-CI finalization, or marking this task Approved or
   Done as part of implementation.
 
 ## Architecture Constraints
 
-- Preserve the Option R rollback and `fileParallelism: false`. Do not restore
-  or imitate the removed supervisor stack under different names.
-- Prefer fewer ownership hops and simpler lifecycle topology over another
-  supervisory layer.
-- Every launched process has exactly one explicit owner. The owner retains the
-  exact child handle or identity needed to await termination; ownership must
-  not be reconstructed from process names, PID prefixes, or system-wide scans.
-- Every listener and generated path has one explicit current-run owner. Cleanup
-  targets exact owned handles and paths and cannot affect a concurrent run.
-- Cleanup is idempotent and awaited before terminal success or failure is
-  emitted. Repeated cleanup requests converge on the same promise and outcome.
-- The primary child/protocol failure and any cleanup failure remain separately
-  observable. Cleanup must not erase, replace, or falsely convert the primary
-  outcome; terminal success requires both primary success and completed exact
-  cleanup.
-- Failed tests and `afterEach` teardown await cleanup and surface cleanup
-  failure. Teardown must not swallow a non-converged process, listener, or path.
-- Assertions may verify exact known process IDs, handles, ports, and paths.
-  Broad enumeration may be used only as bounded diagnostic evidence, never to
-  discover cleanup targets or make the implementation correct.
-- Sanitized phase evidence is test-only, bounded, and monotonic. It must not
-  contain credentials, environment secrets, tenant data, database values, or
-  unbounded child output.
-- Exact cross-platform ownership must be achieved by a small change compatible
-  with the restored baseline. If that is not possible, implementation stops
-  and requests an architecture decision instead of approximating ownership.
+### Single ownership root
+
+- Exactly one detached ownership root may exist for each E2E run. The test
+  parent creates it and retains the actual `ChildProcess` handle until cleanup
+  and verification finish.
+- Every process launched below that root is non-detached and inherits the same
+  root process group on POSIX or descendant tree on Windows. Nested detached
+  descendants and additional ownership roots are forbidden.
+- Each launched process has one explicit direct owner. Ownership and cleanup
+  authority cannot be reconstructed from a PID file, process name, path prefix,
+  system-wide scan, or registry.
+- POSIX forced fallback may target only the retained ownership-root PGID.
+  Windows forced fallback may target only the retained ownership-root process
+  tree. Cleanup cannot target a sibling or another run.
+- Assertions may inspect exact current-run handles, PIDs, ports, and paths.
+  Bounded broad observation may be recorded as diagnostic evidence only; it
+  cannot discover cleanup targets or make cleanup correct.
+
+### One bounded cleanup lifecycle
+
+- `afterEach` declares one explicit monotonic cleanup budget and a separate
+  Vitest hook timeout. The cleanup budget must be strictly smaller than the
+  hook timeout, and a test must enforce that invariant.
+- The single budget includes, in order, cooperative shutdown, bounded forced
+  fallback when needed, and exact absence verification. Phase limits derive
+  from one absolute monotonic deadline; they are not additive waits that can
+  exceed the hook.
+- The hook awaits final convergence and cannot return, pass, or throw a terminal
+  result while cleanup is still pending.
+- Cleanup is idempotent. All callers for one run converge on the same promise,
+  outcome, deadline, and exact resource set.
+- Successful completion requires verified absence of the exact owned process
+  tree, listeners, and run-ID output paths. An already-absent resource is a
+  converged result, not an error and not authority to broaden the target.
+
+### Outcome integrity
+
+- The primary child or test outcome becomes immutable once observed. Cleanup
+  cannot replace, erase, or convert it.
+- Cleanup outcome and forced-fallback use are transmitted separately from the
+  primary outcome. Callers and failure messages must preserve both when both
+  fail.
+- Any forced fallback makes cleanup non-clean even if the exact resources later
+  converge. Convergence after force is reported distinctly from ordinary clean
+  cooperative shutdown.
+- Terminal success requires primary success, cooperative cleanup without forced
+  fallback, and verified exact absence.
+
+### Guarantee boundary
+
+- The repository harness guarantees convergence only while the test parent or
+  its CI job remains able to use the retained ownership-root handle and exact
+  process group or tree.
+- Hard-kill of the sole ownership root when no test parent or CI job remains is
+  explicitly outside the repository harness guarantee. Hosted CI or job
+  isolation owns cleanup after uncatchable destruction of the final owner.
+- The implementation and tests must not reintroduce an autonomous guardian to
+  extend this boundary.
 
 ## Required Changes
 
-### Diagnosis gate
+### Mandatory reset-to-recovery gate
 
-Before changing lifecycle behavior, run the affected process-heavy file in a
-fresh process and capture enough sanitized monotonic phase evidence to identify:
+Before editing lifecycle behavior:
 
-- each direct launch and its explicit owner;
-- readiness, terminal-result, IPC disconnect, signal, and exit ordering;
-- watchdog start and expiry;
-- cleanup request, cleanup completion, and teardown-hook completion;
-- the exact known process IDs, listeners, and output paths that should converge.
+1. Confirm the branch, approved-baseline commit, empty index, absence of
+   untracked files, and exactly 36 unstaged `apps/web/**` paths.
+2. Recompute the four-file failed-implementation fingerprint against
+   `8f61b75aaaa858d3a2a62959e7f26fdc1cf62f04`. Stop if it is not
+   `4d4788506f45911a179071e2bc38b761809a9070`.
+3. Restore only the four named failed-implementation files to their Option R
+   recovery bytes. Do not broadly restore, delete, or stage the Web tree.
+4. Before any Option S edit, prove all of the following and record the evidence:
+   - the effective `apps/web` tree equals
+     `8f61b75aaaa858d3a2a62959e7f26fdc1cf62f04` except for exactly
+     `fileParallelism: false` in `apps/web/vitest.config.ts`;
+   - `git diff -- apps/web | git hash-object --stdin` yields the recovery
+     fingerprint `32b44cec3227725c28d48dd5f1a59d614f45d9c8`;
+   - `apps/cli` is identical to
+     `1c263cc49ee687cfb15404736968488ecb2865c4`;
+   - the index remains empty, no untracked files exist, and the same 36 recovery
+     paths remain unstaged.
 
-Diagnostic instrumentation may touch only the allowed test-harness files. It
-must be reverted unless it is necessary, bounded regression observability in
-the final design. Do not change production code to diagnose this task.
+If any proof fails, stop before implementation and return to architecture with
+the exact mismatch. Do not approximate or repair an unknown baseline.
 
-Record exactly one primary classification in the implementation report and
-apply its required action:
+### Option S lifecycle
 
-| Classification                                       | Required evidence and action                                                                                                                                                                                                                               |
-| ---------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Deadline-only contention**                         | Lifecycle and protocol ordering are correct and exact cleanup converges, but the test deadline expires under serialized load. Stop without increasing timeouts, adding sleeps, or retrying. Report the evidence and return to architecture.                |
-| **Lifecycle/protocol completion defect**             | A direct owner fails to complete, acknowledge, or await an existing terminal/cleanup transition. Proceed only when the correction is narrow, deterministic, and contained in the allowed files.                                                            |
-| **Detached-descendant ownership loss**               | A launched descendant can outlive the only component able to identify and await it. Proceed only if simplifying the restored topology establishes exact cross-platform ownership without a new layer; otherwise stop and request an architecture decision. |
-| **Teardown-hook defect**                             | The test hook loses a direct handle, fails to await cleanup, or hides cleanup failure. Proceed with the smallest hook/fixture correction in the allowed files.                                                                                             |
-| **Platform behavior requiring broader architecture** | Exact ownership depends on a native supervisor, Job object, `/proc`, preload interception, platform binary, or another new boundary. Stop and request an architecture decision.                                                                            |
-
-An unreproduced, mixed, or inconclusive result is also a stop. Only a
-demonstrated narrow lifecycle/protocol or teardown defect may proceed directly
-to implementation.
-
-### Lifecycle and cleanup correction
-
-- Correct the demonstrated defect at its existing owner instead of adding a
-  parallel owner or fallback supervisor.
-- Establish one unambiguous terminal sequence for success, child failure,
-  signal, watchdog expiry, malformed or missing terminal protocol, IPC
-  disconnect, and external test teardown.
-- Await exact descendant and listener termination before an owner reports
-  cleanup completion or exits. A watchdog or teardown path may force an exact
-  known child to terminate, but it must still await convergence and report a
-  cleanup failure when convergence cannot be proved.
-- Preserve the primary exit or protocol outcome alongside a distinct cleanup
-  outcome. The controller exits successfully only after receiving one valid
-  terminal result, observing exact cleanup success, and observing owner exit.
-- Give every generated output location a collision-resistant current-run
-  identity and delete only the exact owned location. Verify absence after
-  cleanup; do not delete shared parents or another run's outputs.
-- Ensure a concurrent controller/owner pair remains alive and retains its
-  listener and output while the other pair fails or is torn down.
+- Launch one detached ownership root from the test parent and retain its real
+  handle for the whole run.
+- Remove every nested `detached` launch in the controller, owner, Playwright,
+  server, worker, application, and fixture chain so all descendants inherit the
+  root group or tree.
+- Route cooperative shutdown through the existing explicit owner chain. Use
+  forced fallback only when cooperative shutdown fails to converge within its
+  share of the single deadline.
+- On POSIX, force only the retained root PGID. On Windows, force only the
+  retained root process tree. Await exit and exact resource absence within the
+  same overall budget.
+- Make cleanup requests from test completion, primary failure, watchdog,
+  protocol failure, external teardown, and `afterEach` converge on one cleanup
+  promise and one final cleanup result.
+- Preserve exact run-ID output directories and delete or verify only those
+  current-run paths. Do not delete shared parents, reports, results, or output
+  owned by a concurrent run.
+- Carry primary outcome, cleanup outcome, and forced-fallback use as separate
+  terminal facts through the controller and test boundary.
 
 ### Regression proof
 
-- Preserve the original controller-exit, watchdog, cleanup-hook, and
-  concurrent-owner scenarios and their failure-sensitive assertions.
-- Add the smallest regression that deterministically exercises the diagnosed
-  race or missed transition on both success and forced-failure paths.
-- Assert cleanup convergence after successful execution, primary failure,
-  watchdog expiry, protocol failure, and `afterEach` teardown using the exact
-  process IDs, ports, handles, and paths learned from the current run.
-- Prove the regression is effective either by running it against the vulnerable
-  Option R behavior or by applying a temporary local mutation that restores the
-  defect, observing the expected failure, reverting the mutation completely,
-  and rerunning on the final implementation. Do not leave mutation artifacts.
-- Keep test assertions at least as strong as the restored baseline. A passing
-  result obtained by removing a scenario, reducing an ownership assertion, or
-  suppressing a cleanup error is not acceptance evidence.
+- Preserve the existing success, child-failure, signal, IPC disconnect,
+  watchdog, startup-failure, cleanup-hook, and concurrent-run scenarios unless
+  this task explicitly replaces their invalid detached-descendant assumption.
+- Replace synthetic “controller dies but detached descendants autonomously
+  recover” coverage with parent-owned forced teardown of the single root and
+  exact verification of the inherited tree.
+- Add deterministic coverage for cooperative cleanup and forced fallback. The
+  forced case must prove both eventual convergence and a non-clean cleanup
+  result.
+- Inject a primary failure and a cleanup failure in the same run and prove that
+  both outcomes remain observable and correctly attributed.
+- Prove the hook budget covers cooperative shutdown, bounded force, and exact
+  verification without returning while cleanup is pending.
+- Prove concurrent runs retain distinct root handles, process trees, listeners,
+  and run-ID outputs and cannot clean one another.
+- Demonstrate regression sensitivity against the vulnerable baseline or a
+  temporary local mutation that reintroduces the defect. Observe the expected
+  failure, revert the mutation completely, and rerun on the final state. Do not
+  leave mutation artifacts.
 
 ## Acceptance Criteria
 
-- The diagnosis report contains sanitized monotonic phase evidence, one primary
-  classification, and the resulting proceed/stop decision.
-- Only a demonstrated narrow lifecycle/protocol or teardown defect is
-  implemented. A broader platform requirement stops for architecture review.
-- The original failing controller-exit, watchdog, cleanup-hook, and
-  concurrent-owner scenarios pass without weakened assertions.
-- Mutation or vulnerable-baseline proof demonstrates that the new regression
-  detects the actual defect.
-- Each launched process, listener, and output path has one explicit owner;
-  cleanup is idempotent, awaited, exact, and convergent on every terminal path.
-- Primary and cleanup failures are both observable, and no terminal success is
-  reported before exact cleanup and owner exit complete.
-- Cleanup convergence is asserted after both successful and failed test
-  execution, including `afterEach` cleanup.
-- No current-run Node process, listener, owned output, `.next` harness
-  directory, Playwright report, or `test-results` directory remains after an
-  affected run.
-- Concurrent runs cannot delete, close, signal, or terminate one another's
-  resources.
-- At least three independent fresh-process executions of
+- The reset-to-recovery evidence proves the expected four-file input
+  fingerprint, effective Web tree, 36-path recovery fingerprint, unchanged CLI
+  tree, empty index, and absence of untracked files before Option S edits.
+- Each E2E run has exactly one detached ownership root, one retained real root
+  handle in the test parent, and one inherited process group or tree.
+- No nested controller, owner, Playwright fixture, server worker, application,
+  fixture, or test descendant is detached.
+- POSIX fallback targets only the retained root PGID; Windows fallback targets
+  only the retained root process tree. No PID reconstruction, name matching,
+  broad enumeration, prefix cleanup, or sibling cleanup participates in
+  correctness.
+- `afterEach` has one explicit monotonic cleanup budget strictly smaller than
+  its declared Vitest hook timeout. Cooperative shutdown, bounded force, and
+  exact absence verification complete within that one budget.
+- The hook awaits the shared cleanup promise through final convergence and
+  never returns with cleanup pending.
+- Cleanup is idempotent, and every caller converges on the same promise and
+  outcome.
+- Primary outcome is immutable. Primary outcome, cleanup outcome, and
+  forced-fallback use are all preserved and separately observable, including an
+  injected primary-plus-cleanup failure.
+- Forced fallback is always reported distinctly and makes cleanup non-clean
+  even after the exact resources converge.
+- Exact run-ID output paths remain required. Successful completion proves
+  absence of the exact process tree, listeners, and output.
+- Concurrent runs cannot close, signal, delete, or otherwise affect one
+  another's process tree, listeners, outputs, reports, or test results.
+- Parent-owned forced-teardown coverage replaces the invalid autonomous
+  detached-descendant recovery requirement.
+- Vulnerable-baseline or mutation proof demonstrates that the regression fails
+  for the invalid behavior and passes on the final implementation.
+- Three independent fresh-process executions of
   `apps/web/test/e2e-harness.test.ts` pass.
-- At least two independent executions of `pnpm --filter @blackbox/web test`
-  pass from a clean generated-output state. Cleanup from the first execution,
-  not a broad deletion or retry, provides the clean state for the second.
-- Web lint, standalone Web typecheck, repository Prettier, and
+- Two independent executions of `pnpm --filter @blackbox/web test` pass. The
+  second begins from the clean exact postcondition produced by the first, not
+  by broad deletion, arbitrary delay, or retry.
+- Validation runs on Node `>=24 <25` and exact pnpm `11.19.0`.
+- Web lint, standalone Web typecheck, pinned repository Prettier, and
   `git diff --check` pass on the final implementation state.
-- `apps/web/next-env.d.ts` remains unchanged, the Option R rollback remains in
-  force, and `apps/web/vitest.config.ts` retains `fileParallelism: false`.
-- No product behavior, dependency, lockfile, task status, ADR, or out-of-scope
-  file changes.
-- Hosted Linux CI remains the final live-platform authority.
+- `apps/web/next-env.d.ts` remains unchanged and
+  `apps/web/vitest.config.ts` retains `fileParallelism: false` without a timeout
+  increase.
+- No owned process, listener, run output, Playwright report, or test-results
+  path remains after the affected runs.
+- No product, dependency, lockfile, task-status, ADR, native boundary, helper,
+  or out-of-scope file changes.
+- Hosted Linux CI remains the final platform authority for POSIX group behavior
+  and repository-level isolation does not claim to survive destruction of the
+  final owner or CI job.
 
 ## Required Tests
 
-- Focused regression coverage for the exact diagnosed lifecycle or teardown
-  defect, including the vulnerable-baseline or mutation failure proof.
+- A topology regression proving one retained detached root and non-detached
+  inherited descendants through the controller, owner, Playwright, server,
+  worker, application, and fixture path.
+- Deterministic cooperative-cleanup coverage that completes without force and
+  reports a clean cleanup result.
+- Deterministic forced-fallback coverage that targets only the retained root,
+  converges exactly, and reports cleanup as non-clean.
+- Hook-budget coverage proving the single monotonic deadline is below the hook
+  timeout and contains all cleanup phases.
+- Primary-plus-cleanup failure injection proving neither outcome overwrites the
+  other.
 - Existing success, nonzero child exit, signal, already-absent resource,
-  material cleanup failure, IPC disconnect, watchdog, external controller
-  termination, server startup failure, and concurrent-owner scenarios.
-- Exact postcondition checks for every known current-run process, listener, and
-  generated output after success and failure.
-- Teardown-hook coverage that starts a failing scenario and proves `afterEach`
-  waits for exact cleanup and exposes non-convergence.
-- Three separate fresh Vitest processes for the process-heavy harness file.
-- Two separate full Web test invocations from clean generated-output state.
+  material cleanup failure, IPC disconnect, watchdog, external teardown,
+  server startup failure, and concurrent-run coverage adapted to the Option S
+  ownership contract.
+- Exact postcondition checks for each current-run root/process tree, listener,
+  output, report, and test-result path after success and failure.
+- Concurrent-run isolation coverage and vulnerable-baseline or mutation proof.
+- Three separate fresh Vitest processes for the focused harness file and two
+  separate complete Web test invocations.
 
 ## Validation Commands
 
-Run focused checks while editing. On the final implementation state, run each
-of the first command in three independent fresh processes and each full Web
-test command in two independent invocations; do not replace these repetitions
-with Vitest retry configuration:
+Run focused checks while editing. On the final implementation state, verify the
+toolchain, run the focused file in three independent fresh processes, and run
+the complete Web suite twice in independent invocations:
 
 ```text
+node --version
+pnpm --version
 pnpm --filter @blackbox/web exec vitest run test/e2e-harness.test.ts
 pnpm --filter @blackbox/web exec vitest run test/e2e-harness.test.ts
 pnpm --filter @blackbox/web exec vitest run test/e2e-harness.test.ts
@@ -268,27 +361,29 @@ git diff --exit-code -- apps/web/next-env.d.ts
 git status --short --untracked-files=all
 ```
 
-Before and after each process-heavy or full Web invocation, verify absence of
-that invocation's exact owned processes, listeners, and generated paths. Record
-the command, exit result, test counts, convergence evidence, and any warning.
-Do not claim a clean generated-output state if it was obtained through broad
-shared-directory deletion.
+Record that Node satisfies `>=24 <25` and pnpm is exactly `11.19.0`. Before and
+after each process-heavy or complete Web invocation, verify absence of that
+invocation's exact owned root/tree, listeners, run-ID outputs, Playwright
+report, and test-results paths. Record command, exit result, test counts,
+cleanup outcome, forced-fallback use, convergence evidence, and warnings. A
+broad deletion, retry, or arbitrary sleep cannot establish the clean starting
+state for a later run.
 
-Hosted Linux CI is the final authority for live Linux process behavior. A local
-pass does not authorize push or substitute for the independent review and
+Hosted Linux CI is the final authority for live POSIX process-group behavior.
+A local pass does not authorize push or substitute for independent review and
 hosted-CI gates.
 
 ## Deliverables
 
-- The smallest allowed-file lifecycle or teardown correction supported by the
-  diagnosis gate.
-- Focused deterministic regression coverage and mutation or vulnerable-baseline
-  proof.
-- Sanitized diagnosis and cleanup-convergence evidence for the required local
-  runs.
-- A compact implementation report that separates the BBX-012C delta from the
-  pre-existing Option R recovery and lists changed files, exact validation,
-  acceptance status, deviations, and residual risks.
+- Recorded reset-to-recovery proof that is distinct from the Option S delta.
+- The smallest allowed-file Option S single-root lifecycle implementation.
+- Deterministic cooperative, forced-fallback, combined-failure, budget,
+  postcondition, and concurrent-isolation regressions.
+- Vulnerable-baseline or mutation evidence that the regression detects the
+  invalid behavior.
+- A compact implementation report listing changed files, exact commands and
+  results, acceptance status, deviations, and residual risks, while separating
+  pre-existing recovery, removed failed delta, and final Option S changes.
 
 ## Referenced Decisions and Documents
 
@@ -304,35 +399,39 @@ hosted-CI gates.
 
 ## Risks
 
-- Node process-tree behavior differs between Windows and Linux. A local fix may
-  appear stable while still losing ownership on hosted Linux; exact ownership
-  assertions and hosted CI are required.
-- Timing changes can hide the race without fixing it. Timeouts, sleeps, and
-  retries are prohibited as correctness mechanisms.
-- Cleanup can overwrite the primary failure or report success before the owner
-  exits. Separate outcomes and an awaited terminal sequence prevent false
-  success.
-- A shared path or broad kill can damage a concurrent run. Exact per-run
-  handles, listeners, and paths are mandatory.
-- The dirty Option R starting state can obscure scope. Implementation and
-  review must distinguish the pre-existing recovery from the BBX-012C delta and
-  must not stage or revert recovery paths accidentally.
-- Diagnostic process enumeration can become an implicit ownership mechanism.
-  Diagnostics may observe broadly when necessary, but cleanup must operate only
-  on exact known ownership.
+- Windows process-tree and POSIX process-group behavior differ. Exact root
+  targeting, platform-specific assertions, and hosted Linux CI reduce but do
+  not eliminate platform variance.
+- A phase-local wait can silently exceed the hook deadline when composed with
+  later phases. One absolute monotonic cleanup budget and an enforced
+  budget-versus-hook invariant prevent additive deadline drift.
+- Forced convergence can be mistaken for clean cleanup. The forced-fallback
+  fact is immutable and independently reported.
+- Cleanup failure can obscure the primary outcome. Separate immutable outcome
+  channels and combined-failure tests prevent replacement.
+- A shared path or broad kill can damage a concurrent run. Retained root
+  handles and exact run-ID resources are mandatory.
+- The dirty recovery state can obscure scope. Fingerprints, the mandatory reset
+  gate, and a report that separates recovery from Option S mitigate
+  misattribution.
+- Destruction of the final owner cannot be solved within Option S. CI/job
+  isolation, not a repository guardian, owns that residual boundary.
 
 ## Open Questions
 
-None before approval. The diagnosis classifications are explicit stop gates,
-not permission to select a broader process architecture during implementation.
+None before approval. If the single retained ownership root cannot satisfy the
+acceptance criteria without a guardian, Job Object, native helper, registry, or
+broader supervisor, implementation must stop and return to architecture. It
+must not approximate the guarantee.
 
 ## Implementation Prompt
 
-Use only after this unchanged task is `Approved` and tracked in the reported
-baseline commit. Replace `<APPROVED_BASELINE_SHA>` with that reported commit:
+Use only after this unchanged amended task is `Approved` and tracked in the
+reported baseline commit. Replace `<APPROVED_BASELINE_SHA>` with that reported
+commit:
 
 ```text
-$bbx-implement implement the Approved task in docs/tasks/BBX-012C-deterministic-web-e2e-lifecycle.md against baseline <APPROVED_BASELINE_SHA> in the saved project checkout. Preserve the pre-existing Option R recovery as the implementation starting state. Run the diagnosis gate first and stop for every required stop classification; implement only a demonstrated narrow defect within the allowed files. Run the complete task validation, separate the BBX-012C delta from recovery changes in the compact report, and stop ready for independent review without committing, pushing, or finalizing.
+$bbx-implement implement the Approved Option S task in docs/tasks/BBX-012C-deterministic-web-e2e-lifecycle.md against baseline <APPROVED_BASELINE_SHA> in the saved project checkout. Before any lifecycle edit, verify the failed four-file fingerprint and complete the mandatory reset-to-recovery proof exactly as specified; stop on any mismatch. Then implement only the single retained ownership-root design within the allowed files, run the complete task validation and regression-sensitivity proof, separate recovery/reset/Option S changes in the compact report, and stop ready for independent review without staging, committing, pushing, or finalizing. If the guarantee requires a prohibited supervisor or broader boundary, stop and return to architecture.
 ```
 
 ## Review Prompt
@@ -341,5 +440,5 @@ Use after implementation and replace `<APPROVED_BASELINE_SHA>` with the same
 reported baseline commit:
 
 ```text
-$bbx-review independently review the implementation against docs/tasks/BBX-012C-deterministic-web-e2e-lifecycle.md and baseline <APPROVED_BASELINE_SHA> in the saved project checkout. Verify the complete diff, preservation of the Option R recovery, diagnosis classification, exact cross-platform ownership, failure observability, mutation or vulnerable-baseline proof, cleanup convergence, concurrent isolation, scope, and all required validation. Do not edit files. Report the compact review result with PASS or NEEDS FIXES and stop without committing, pushing, or finalizing.
+$bbx-review independently review the Option S implementation against docs/tasks/BBX-012C-deterministic-web-e2e-lifecycle.md and baseline <APPROVED_BASELINE_SHA> in the saved project checkout. Verify the complete diff, mandatory reset-to-recovery evidence and fingerprints, the single retained ownership root with no detached descendants, one bounded cleanup deadline, exact platform fallback targeting, immutable primary and separate cleanup/forced outcomes, regression sensitivity, exact convergence and concurrent isolation, scope, and all required validation. Do not edit files. Report the compact review result with PASS or NEEDS FIXES and stop without committing, pushing, or finalizing.
 ```
