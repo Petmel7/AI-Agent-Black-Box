@@ -1,47 +1,45 @@
-import { spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { mkdir, writeFile } from 'node:fs/promises';
-import { request } from 'node:http';
-import { join } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { mkdir, rm, rmdir, writeFile } from 'node:fs/promises';
+import { createServer } from 'node:net';
 
-import { readLinuxProcessIdentity } from './e2e-process-control.mjs';
 import {
-  exactOwnedTempDirectory,
-  removeExactOwnedTempDirectory,
-} from './e2e-owned-process.mjs';
+  INTERNAL_CONTROLLER_MARKER,
+  runConfigurationFromEnvironment,
+} from './e2e-controller.mjs';
 
-const fixtureApp = fileURLToPath(
-  new URL('./e2e-fixture-app.mjs', import.meta.url),
-);
-const outputPath = process.env.BBX_E2E_OWNED_OUTPUT_DIR;
-const port = Number(process.env.BBX_E2E_INTERNAL_CONTROLLER_PORT);
-const mode = process.env.BBX_E2E_INTERNAL_CONTROLLER_MODE ?? 'hang';
+const mode = process.env.BBX_E2E_INTERNAL_FIXTURE_MODE ?? 'hang';
 if (
   process.env.BBX_E2E_INTERNAL_CONTROLLER_CONTEXT !==
-    'bbx-e2e-controller-harness-v1' ||
-  !outputPath ||
-  !Number.isSafeInteger(port) ||
-  port < 1024 ||
+    INTERNAL_CONTROLLER_MARKER ||
   ![
     'hang',
+    'ignore-shutdown',
     'success',
     'failure',
     'signal',
     'already-absent',
-    'root-exit',
-    'uninstrumented-root-exit',
-    'stubborn-hang',
-    'stubborn-root-exit',
   ].includes(mode)
 )
-  throw new Error('Invalid E2E controller fixture configuration.');
-exactOwnedTempDirectory(outputPath);
+  throw new Error(
+    'Invalid authenticated E2E controller fixture configuration.',
+  );
 
-await mkdir(outputPath, { recursive: true });
-await writeFile(join(outputPath, 'owned.txt'), 'owned');
+const configuration = runConfigurationFromEnvironment(process.env);
+if (!Object.isFrozen(configuration))
+  throw new Error('Fixture received mutable E2E configuration.');
+
+await mkdir(configuration.runRoot, { recursive: false });
+await mkdir(configuration.outputPath, { recursive: false });
+await mkdir(configuration.reportPath, { recursive: false });
+await writeFile(
+  `${configuration.outputPath}/fixture-configuration.json`,
+  `${JSON.stringify(configuration)}\n`,
+  { flag: 'wx' },
+);
+
 if (mode === 'already-absent') {
-  await removeExactOwnedTempDirectory(outputPath);
+  await rm(configuration.outputPath, { recursive: true, force: false });
+  await rm(configuration.reportPath, { recursive: true, force: false });
+  await rmdir(configuration.runRoot);
   process.exit(0);
 }
 if (mode === 'success') process.exit(0);
@@ -50,72 +48,42 @@ if (mode === 'signal') {
   process.kill(process.pid, 'SIGTERM');
   await new Promise(() => undefined);
 }
-const descendant = spawn(
-  process.execPath,
-  [
-    fixtureApp,
-    mode === 'stubborn-root-exit' || mode === 'stubborn-hang'
-      ? 'stubborn-stall'
-      : 'ready',
-    String(port),
-  ],
-  { detached: false, stdio: 'inherit', windowsHide: true },
-);
-await new Promise((resolve, reject) => {
-  descendant.once('spawn', resolve);
-  descendant.once('error', reject);
-});
-const readinessDeadline = Date.now() + 5_000;
-let descendantReady = false;
-if (mode === 'stubborn-root-exit' || mode === 'stubborn-hang')
-  descendantReady = true;
-while (!descendantReady && Date.now() < readinessDeadline) {
-  descendantReady = await new Promise((resolveReady) => {
-    const probe = request(
-      { host: '127.0.0.1', port, path: '/health', method: 'GET' },
-      (response) => {
-        response.resume();
-        resolveReady(response.statusCode === 200);
-      },
+
+function listen(port) {
+  const server = createServer((socket) => socket.end());
+  return new Promise((resolvePromise, reject) => {
+    server.once('error', reject);
+    server.listen({ port, host: '127.0.0.1', exclusive: true }, () =>
+      resolvePromise(server),
     );
-    probe.setTimeout(250, () => probe.destroy());
-    probe.once('error', () => resolveReady(false));
-    probe.end();
   });
-  if (!descendantReady)
-    await new Promise((resolveWait) => setTimeout(resolveWait, 25));
 }
-if (!descendantReady) throw new Error('Controller fixture descendant timeout.');
-const rootIdentity = readLinuxProcessIdentity(process.pid);
-const descendantIdentity = readLinuxProcessIdentity(descendant.pid);
-if (rootIdentity && descendantIdentity && mode !== 'uninstrumented-root-exit') {
-  const ownershipToken = process.env.BBX_E2E_OWNERSHIP_TOKEN;
-  if (!ownershipToken) throw new Error('Missing E2E ownership token.');
-  await writeFile(
-    join(outputPath, 'owned-members.json'),
-    JSON.stringify([
-      {
-        processId: descendantIdentity.processId,
-        processGroupId: descendantIdentity.processGroupId,
-        sessionId: descendantIdentity.sessionId,
-        startTime: descendantIdentity.startTime,
-        tokenDigest: createHash('sha256').update(ownershipToken).digest('hex'),
-      },
-    ]),
-    { encoding: 'utf8', flag: 'wx' },
+
+const appServer = await listen(configuration.appPort);
+const proxyServer = await listen(configuration.proxyPort);
+process.stdout.write(
+  `BBX_E2E_PHASE controller-fixture-ready app-port=${configuration.appPort} proxy-port=${configuration.proxyPort}\n`,
+);
+
+function close(server) {
+  return new Promise((resolvePromise, reject) =>
+    server.close((error) =>
+      error ? reject(error) : resolvePromise(undefined),
+    ),
   );
 }
-process.stdout.write(
-  `BBX_E2E_PHASE controller-fixture-ready pid=${descendant.pid ?? 0}${
-    rootIdentity && descendantIdentity
-      ? ` ppid=${descendantIdentity.parentProcessId} pgid=${descendantIdentity.processGroupId} sid=${descendantIdentity.sessionId} root-pid=${rootIdentity.processId} root-ppid=${rootIdentity.parentProcessId} root-pgid=${rootIdentity.processGroupId} root-sid=${rootIdentity.sessionId}`
-      : ''
-  }\n`,
-);
-if (
-  mode === 'root-exit' ||
-  mode === 'uninstrumented-root-exit' ||
-  mode === 'stubborn-root-exit'
-)
+
+let closing = false;
+async function shutdown() {
+  if (closing) return;
+  closing = true;
+  await Promise.all([close(appServer), close(proxyServer)]);
   process.exit(0);
-await new Promise(() => undefined);
+}
+
+process.on('message', (message) => {
+  if (message?.type === 'shutdown' && mode !== 'ignore-shutdown')
+    void shutdown();
+});
+for (const signal of ['SIGINT', 'SIGTERM'])
+  process.once(signal, () => void shutdown());

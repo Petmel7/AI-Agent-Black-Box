@@ -1,2530 +1,1462 @@
-import { fork, spawn, type ChildProcess } from 'node:child_process';
-import { createServer } from 'node:net';
-import { readFile, readdir, stat } from 'node:fs/promises';
+import { fork, type ChildProcess } from 'node:child_process';
+import { createServer, type Server } from 'node:net';
+import { mkdir, readFile, rm, rmdir, stat } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { describe, expect, it as vitestIt } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 
-// @ts-expect-error -- this Node-owned test helper intentionally executes as ESM.
-import * as processControlModule from './e2e-process-control.mjs';
-// @ts-expect-error -- this Node-owned test helper intentionally executes as ESM.
-import * as ownedProcessModule from './e2e-owned-process.mjs';
-// @ts-expect-error -- this Node-owned test helper intentionally executes as ESM.
-import * as resourceRegistryModule from './e2e-resource-registry.mjs';
+type RunConfiguration = Readonly<{
+  runIdentity: string;
+  runRoot: string;
+  appPort: number;
+  proxyPort: number;
+  outputPath: string;
+  reportPath: string;
+  resultPath: string;
+}>;
 
-interface LinuxProcessIdentity {
-  parentProcessId: number;
-  processGroupId: number;
-  sessionId: number;
-  state: string;
-  dead: boolean;
-  terminal: boolean;
-  zombie: boolean;
-}
+type RunAudit = Readonly<{
+  clean: boolean;
+  remainingPaths: readonly string[];
+  remainingPorts: readonly number[];
+}>;
 
-interface AcceptedResourceOwnership {
-  authority: {
-    actualProcessId: number;
-    metadataDirectory: string;
-    supervisorProcessId: number;
+type ControllerModule = {
+  INTERNAL_CONTROLLER_MARKER: string;
+  createRunAllocation(): Promise<{
+    configuration: RunConfiguration;
+    release(): Promise<void>;
+  }>;
+  environmentForRunConfiguration(
+    base: NodeJS.ProcessEnv,
+    configuration: RunConfiguration,
+  ): NodeJS.ProcessEnv;
+  runConfigurationFromEnvironment(
+    environment: NodeJS.ProcessEnv,
+  ): RunConfiguration;
+  verifyRunResources(configuration: RunConfiguration): Promise<RunAudit>;
+  convergeRunResources(
+    configuration: RunConfiguration,
+    timeoutMs: number,
+    options?: {
+      initialObservation?: RunAudit;
+      observe?: (configuration: RunConfiguration) => Promise<RunAudit>;
+      remove?: (configuration: RunConfiguration) => Promise<void>;
+    },
+  ): Promise<{
+    clean: boolean;
+    firstObservation: RunAudit;
+    lastObservation: RunAudit;
+    observationCount: number;
+    cleanupErrors: readonly string[];
+  }>;
+};
+
+type OwnerModule = {
+  createFinalLaunchPlan(
+    configuration: RunConfiguration,
+    arguments_: readonly string[],
+    environment: NodeJS.ProcessEnv,
+  ): {
+    kind: 'authenticated-no-browser-fixture' | 'playwright';
+    configuration: RunConfiguration;
+    environment: NodeJS.ProcessEnv;
+    arguments: readonly string[];
   };
-  entry: { metadataDirectory: string; resourceId: string };
-  ownedPaths: readonly string[];
-}
+};
 
-interface ActiveController {
-  authorities: AcceptedResourceOwnership['authority'][];
-  blockedResources: Set<string>;
-  child: ChildProcess;
-  directAuthority: unknown;
-  kind: 'server' | 'playwright';
-  output: () => string;
-  ports: number[];
-  resources: Set<string>;
-  layerProcessIds: Set<number>;
-  resourceOwnerships: Map<string, AcceptedResourceOwnership>;
-  authorityAckDelayMs: number;
-  resourcePaths: Map<string, string>;
-  resourceRegistry: {
-    accept: (candidate: unknown, expectedRole: string) => unknown;
-    completeAfter: (
-      resource: string,
-      cleanup: (value: {
-        authority: AcceptedResourceOwnership['authority'];
-        entry: { metadataDirectory: string; resourceId: string };
-      }) => Promise<void>,
-    ) => Promise<{ alreadyCompleted: boolean }>;
-    entry: (resource: string) => {
-      metadataDirectory: string;
-      resourceId: string;
-    };
-    state: (
-      resource: string,
-    ) => 'planned' | 'accepted' | 'completing' | 'completed';
-  };
-}
-
-const {
-  captureDirectChildAuthority,
-  probeProcessState,
-  readLinuxProcessIdentity,
-  terminateDirectChild,
-} = processControlModule as unknown as {
-  captureDirectChildAuthority: (child: ChildProcess) => unknown;
-  probeProcessState: (processId: number) => 'live' | 'absent' | 'unverifiable';
-  readLinuxProcessIdentity: (
-    processId: number,
-  ) => LinuxProcessIdentity | undefined;
-  terminateDirectChild: (authority: unknown) => Promise<unknown>;
-};
-const {
-  createParentResourcePlan,
-  createParentResourceRegistry,
-  parentResourceEnvironment,
-} = resourceRegistryModule as unknown as {
-  createParentResourcePlan: (
-    resources: string[],
-  ) => Map<string, { metadataDirectory: string; resourceId: string }>;
-  createParentResourceRegistry: (
-    plan: Map<string, { metadataDirectory: string; resourceId: string }>,
-    importer: typeof importOwnedProcessAuthority,
-  ) => ActiveController['resourceRegistry'];
-  parentResourceEnvironment: (
-    plan: Map<string, { metadataDirectory: string; resourceId: string }>,
-    environment?: NodeJS.ProcessEnv,
-  ) => NodeJS.ProcessEnv;
-};
-const {
-  cleanupOwnedProcessAuthority,
-  exactOwnedTempDirectory,
-  importOwnedProcessAuthority,
-  removeExactOwnedTempDirectory,
-} = ownedProcessModule as unknown as {
-  cleanupOwnedProcessAuthority: (authority: unknown) => Promise<unknown>;
-  importOwnedProcessAuthority: (
-    authority: unknown,
-    expected: { role: string; metadataDirectory: string },
-  ) => ActiveController['authorities'][number];
-  exactOwnedTempDirectory: (path: string) => string;
-  removeExactOwnedTempDirectory: (path: string) => Promise<unknown>;
-};
+// Indirection keeps these production JavaScript entrypoints outside TypeScript's
+// declaration-file contract without adding a task-prohibited helper file.
+const controllerModuleSpecifier = './e2e-controller.mjs';
+const ownerModuleSpecifier = './e2e-playwright-owner.mjs';
+const controllerModule = (await import(
+  controllerModuleSpecifier
+)) as ControllerModule;
+const ownerModule = (await import(ownerModuleSpecifier)) as OwnerModule;
 
 const serverPath = fileURLToPath(new URL('./e2e-server.mjs', import.meta.url));
-const playwrightControllerPath = fileURLToPath(
+const productionControllerPath = fileURLToPath(
   new URL('./e2e-controller.mjs', import.meta.url),
 );
-const nextEnvironmentPath = fileURLToPath(
-  new URL('../next-env.d.ts', import.meta.url),
+const ownerSourcePath = fileURLToPath(
+  new URL('./e2e-playwright-owner.mjs', import.meta.url),
 );
-const active = new Set<ActiveController>();
+const controllerSourcePath = fileURLToPath(
+  new URL('./e2e-controller.mjs', import.meta.url),
+);
+const processControlSourcePath = fileURLToPath(
+  new URL('./e2e-process-control.mjs', import.meta.url),
+);
+const serverSourcePath = fileURLToPath(
+  new URL('./e2e-server.mjs', import.meta.url),
+);
+const workerSourcePath = fileURLToPath(
+  new URL('./e2e-server-worker.mjs', import.meta.url),
+);
+const playwrightConfigPath = fileURLToPath(
+  new URL('../playwright.config.mjs', import.meta.url),
+);
 
-async function freePort(): Promise<number> {
-  return new Promise((resolve, reject) => {
-    const server = createServer();
-    server.once('error', reject);
-    server.listen(0, '127.0.0.1', () => {
-      const address = server.address();
-      if (!address || typeof address === 'string') {
-        server.close();
-        reject(new Error('Unable to allocate a fixture port.'));
-        return;
-      }
-      server.close((error) => (error ? reject(error) : resolve(address.port)));
-    });
-  });
-}
-
-async function linuxOwnershipToken(processId: number): Promise<string> {
-  const entries = String(await readFile(`/proc/${processId}/environ`)).split(
-    '\0',
-  );
-  const value = entries.find((entry) =>
-    entry.startsWith('BBX_E2E_OWNERSHIP_TOKEN='),
-  );
-  if (!value) throw new Error('Linux E2E process lacks its ownership token.');
-  return value.slice('BBX_E2E_OWNERSHIP_TOKEN='.length);
-}
-
-async function linuxGroupProcessIds(processGroupId: number): Promise<number[]> {
-  const processIds = (await readdir('/proc'))
-    .filter((entry) => /^[1-9][0-9]*$/.test(entry))
-    .map(Number);
-  return processIds.filter((processId) => {
-    const identity = readLinuxProcessIdentity(processId);
-    return identity?.processGroupId === processGroupId;
-  });
-}
-
-async function linuxCommandLine(processId: number): Promise<string> {
-  try {
-    return String(await readFile(`/proc/${processId}/cmdline`)).replaceAll(
-      '\0',
-      ' ',
-    );
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return '';
-    throw error;
-  }
-}
-
-function startController(
-  mode: string,
-  appPort: number,
-  proxyPort: number,
-  options: {
-    cleanupFailure?: boolean;
-    launchDelayMs?: number;
-    startupTimeoutMs?: number;
-    authorityAckDelayMs?: number;
-  } = {},
-) {
-  const resources =
-    process.platform === 'win32'
-      ? ['server-application', 'server-worker']
-      : ['server-application'];
-  const resourcePlan = createParentResourcePlan(resources);
-  const child = fork(serverPath, [], {
-    detached: true,
-    env: parentResourceEnvironment(resourcePlan, {
-      ...process.env,
-      BBX_E2E_APP_PORT: String(appPort),
-      BBX_E2E_PROXY_PORT: String(proxyPort),
-      BBX_E2E_TRUSTED_PROXY_TOKEN: 'fixture_proxy_token_012345678901',
-      BBX_E2E_INTERNAL_TEST_CONTEXT: 'bbx-e2e-harness-v1',
-      BBX_E2E_INTERNAL_FIXTURE_MODE: mode,
-      ...(options.startupTimeoutMs === undefined
-        ? {}
-        : {
-            BBX_E2E_INTERNAL_STARTUP_TIMEOUT_MS: String(
-              options.startupTimeoutMs,
-            ),
-          }),
-      ...(options.launchDelayMs === undefined
-        ? {}
-        : {
-            BBX_E2E_INTERNAL_LAUNCH_DELAY_MS: String(options.launchDelayMs),
-          }),
-      ...(options.cleanupFailure
-        ? { BBX_E2E_INTERNAL_WORKER_CLEANUP_FAILURE: 'injected' }
-        : {}),
-    }),
-    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-    windowsHide: true,
-  });
-  const pendingMessages: unknown[] = [];
-  const bufferMessage = (message: unknown) => pendingMessages.push(message);
-  child.on('message', bufferMessage);
-  let output = '';
-  child.stdout?.on('data', (chunk) => (output += String(chunk)));
-  child.stderr?.on('data', (chunk) => (output += String(chunk)));
-  const controller = {
-    authorities: [],
-    blockedResources: new Set<string>(),
-    child,
-    directAuthority: captureDirectChildAuthority(child),
-    kind: 'server' as const,
-    output: () => output,
-    ports: [appPort, proxyPort],
-    resources: new Set<string>(),
-    layerProcessIds: new Set<number>(),
-    resourceOwnerships: new Map<string, AcceptedResourceOwnership>(),
-    authorityAckDelayMs: options.authorityAckDelayMs ?? 0,
-    resourcePaths: new Map(
-      [...resourcePlan].map(([resource, entry]) => [
-        resource,
-        entry.metadataDirectory,
-      ]),
-    ),
-    resourceRegistry: createParentResourceRegistry(
-      resourcePlan,
-      importOwnedProcessAuthority,
-    ),
+type TerminalRecord = {
+  name: 'terminal-result';
+  configuration: RunConfiguration;
+  primary: { exitCode: number; signal: string | null };
+  cleanup: {
+    succeeded: boolean;
+    owner: {
+      succeeded: boolean;
+      errorCode: number;
+      remainingPathCount: number;
+    } | null;
+    observedBeforeControllerCleanup: RunAudit;
+    observedAfterControllerCleanup: RunAudit;
+    controllerCleanupObservationCount: number;
+    controllerCleanupErrors: readonly string[];
+    exactCleanupError: string | null;
+    controllerForcedFallback: boolean;
+    ownerForcedFallbackObserved: boolean;
+    finalAudit: RunAudit;
+    resultPathInitialObservation: RunAudit;
+    resultPathObservationCount: number;
+    resultPathCleanupErrors: readonly string[];
+    resultPathError: string | null;
   };
-  active.add(controller);
-  child.off('message', bufferMessage);
-  retainControllerResources(controller, pendingMessages);
-  return controller;
+  protocol: { succeeded: boolean; issues: string[] };
+  forcedDirectChildFallback: boolean;
+  ownershipBoundary: string;
+  reason: string;
+};
+
+type ConfigurationRecord = {
+  name: 'run-configuration';
+  configuration: RunConfiguration;
+  configurationDigest: string;
+};
+
+type HarnessProcess = {
+  child: ChildProcess;
+  output(): string;
+  waitForOutput(fragment: string, timeoutMs?: number): Promise<void>;
+  waitForRecord<T>(name: string, timeoutMs?: number): Promise<T>;
+};
+
+const active = new Set<HarnessProcess>();
+
+function createHarnessProcess(child: ChildProcess): HarnessProcess {
+  let output = '';
+  const listeners = new Set<() => void>();
+  const append = (chunk: unknown) => {
+    output += String(chunk);
+    for (const listener of listeners) listener();
+  };
+  child.stdout?.on('data', append);
+  child.stderr?.on('data', append);
+
+  function waitForCondition(
+    condition: () => boolean,
+    message: string,
+    timeoutMs: number,
+  ) {
+    if (condition()) return Promise.resolve();
+    return new Promise<void>((resolvePromise, reject) => {
+      const onOutput = () => {
+        if (!condition()) return;
+        clearTimeout(timer);
+        listeners.delete(onOutput);
+        resolvePromise();
+      };
+      const timer = setTimeout(() => {
+        listeners.delete(onOutput);
+        reject(new Error(`${message}\n${output}`));
+      }, timeoutMs);
+      listeners.add(onOutput);
+    });
+  }
+
+  function records() {
+    return output
+      .split(/\r?\n/)
+      .filter((line) => line.startsWith('BBX_E2E_RECORD '))
+      .map(
+        (line) =>
+          JSON.parse(line.slice('BBX_E2E_RECORD '.length)) as {
+            name: string;
+          },
+      );
+  }
+
+  const harness: HarnessProcess = {
+    child,
+    output: () => output,
+    waitForOutput(fragment, timeoutMs = 10_000) {
+      return waitForCondition(
+        () => output.includes(fragment),
+        `Timed out waiting for ${fragment}.`,
+        timeoutMs,
+      );
+    },
+    async waitForRecord<T>(name: string, timeoutMs = 10_000) {
+      await waitForCondition(
+        () => records().some((record) => record.name === name),
+        `Timed out waiting for record ${name}.`,
+        timeoutMs,
+      );
+      return records().find((record) => record.name === name) as T;
+    },
+  };
+  active.add(harness);
+  return harness;
 }
 
-function startPlaywrightController(
-  port: number,
+function startProductionController(
   options: {
     mode?:
       | 'hang'
+      | 'ignore-shutdown'
       | 'success'
       | 'failure'
       | 'signal'
-      | 'already-absent'
-      | 'root-exit'
-      | 'uninstrumented-root-exit'
-      | 'stubborn-hang'
-      | 'stubborn-root-exit';
+      | 'already-absent';
+    protocolMode?:
+      | 'normal'
+      | 'duplicate'
+      | 'conflict'
+      | 'malformed'
+      | 'missing'
+      | 'unacknowledged';
+    cleanupResultMode?:
+      | 'normal'
+      | 'success-nonzero-error'
+      | 'success-remaining-path'
+      | 'failure-zero-error'
+      | 'missing-remaining-path'
+      | 'invalid-remaining-path-domain'
+      | 'extra-cleanup-field';
+    lifecycleMode?: 'normal' | 'owner-ipc-disconnect';
+    verificationMode?:
+      | 'controller-transient-path'
+      | 'result-transient-remove'
+      | 'result-persistence-failure'
+      | 'final-transient-observation'
+      | 'controller-persistent-port';
     cleanupFailure?: boolean;
-    spawnFailure?: boolean;
-    operationTimeoutMs?: number;
-    protocolFault?:
-      | 'duplicate-launch-authority'
-      | 'unknown-after-launch-settlement'
-      | 'unknown-pending-spawn'
-      | 'unknown-pending-handoff'
-      | 'unknown-before-ownership-ready'
-      | 'unknown-running'
-      | 'unknown-cleaning'
-      | 'unknown-after-terminal-result';
-    registered?: boolean;
-    authorityAckDelayMs?: number;
-    preventPlaywrightAuthorityAcceptance?: boolean;
+    preservePath?: 'output' | 'report';
+    phaseTimeoutMs?: number;
+    outerTimeoutMs?: number;
   } = {},
 ) {
-  const resources =
-    process.platform === 'win32'
-      ? ['playwright', 'playwright-owner']
-      : ['playwright'];
-  const resourcePlan = createParentResourcePlan(resources);
-  const child = fork(playwrightControllerPath, [], {
-    detached: true,
-    env: parentResourceEnvironment(resourcePlan, {
-      ...process.env,
-      BBX_E2E_INTERNAL_CONTROLLER_CONTEXT: 'bbx-e2e-controller-harness-v1',
-      BBX_E2E_INTERNAL_CONTROLLER_PORT: String(port),
-      BBX_E2E_INTERNAL_CONTROLLER_MODE: options.mode ?? 'hang',
-      ...(options.cleanupFailure
-        ? { BBX_E2E_INTERNAL_CLEANUP_FAILURE: 'injected' }
-        : {}),
-      ...(options.spawnFailure
-        ? { BBX_E2E_INTERNAL_OWNER_SPAWN_FAILURE: 'injected' }
-        : {}),
-      ...(options.operationTimeoutMs === undefined
-        ? {}
-        : {
-            BBX_E2E_INTERNAL_OPERATION_TIMEOUT_MS: String(
-              options.operationTimeoutMs,
-            ),
-          }),
-      ...(options.protocolFault === undefined
-        ? {}
-        : { BBX_E2E_INTERNAL_PROTOCOL_FAULT: options.protocolFault }),
+  return createHarnessProcess(
+    fork(productionControllerPath, [], {
+      detached: false,
+      env: {
+        ...process.env,
+        BBX_E2E_INTERNAL_CONTROLLER_CONTEXT:
+          controllerModule.INTERNAL_CONTROLLER_MARKER,
+        BBX_E2E_INTERNAL_FIXTURE_MODE: options.mode ?? 'success',
+        ...(options.protocolMode
+          ? { BBX_E2E_INTERNAL_PROTOCOL_MODE: options.protocolMode }
+          : {}),
+        ...(options.cleanupFailure
+          ? { BBX_E2E_INTERNAL_CLEANUP_FAILURE: 'injected' }
+          : {}),
+        ...(options.cleanupResultMode
+          ? {
+              BBX_E2E_INTERNAL_CLEANUP_RESULT_MODE: options.cleanupResultMode,
+            }
+          : {}),
+        ...(options.lifecycleMode
+          ? { BBX_E2E_INTERNAL_LIFECYCLE_MODE: options.lifecycleMode }
+          : {}),
+        ...(options.verificationMode
+          ? {
+              BBX_E2E_INTERNAL_VERIFICATION_MODE: options.verificationMode,
+            }
+          : {}),
+        ...(options.preservePath
+          ? { BBX_E2E_INTERNAL_PRESERVE_PATH: options.preservePath }
+          : {}),
+        ...(options.phaseTimeoutMs
+          ? {
+              BBX_E2E_INTERNAL_PHASE_TIMEOUT_MS: String(options.phaseTimeoutMs),
+            }
+          : {}),
+        ...(options.outerTimeoutMs
+          ? {
+              BBX_E2E_INTERNAL_OUTER_TIMEOUT_MS: String(options.outerTimeoutMs),
+            }
+          : {}),
+      },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+      windowsHide: true,
     }),
-    stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
-    windowsHide: true,
-  });
-  const pendingMessages: unknown[] = [];
-  const bufferMessage = (message: unknown) => pendingMessages.push(message);
-  child.on('message', bufferMessage);
-  let output = '';
-  child.stdout?.on('data', (chunk) => (output += String(chunk)));
-  child.stderr?.on('data', (chunk) => (output += String(chunk)));
-  const controller = {
-    authorities: [],
-    blockedResources: new Set(
-      options.preventPlaywrightAuthorityAcceptance ? ['playwright'] : [],
-    ),
-    child,
-    directAuthority: captureDirectChildAuthority(child),
-    kind: 'playwright' as const,
-    output: () => output,
-    ports: [port],
-    resources: new Set<string>(),
-    layerProcessIds: new Set<number>(),
-    resourceOwnerships: new Map<string, AcceptedResourceOwnership>(),
-    authorityAckDelayMs: options.authorityAckDelayMs ?? 0,
-    resourcePaths: new Map(
-      [...resourcePlan].map(([resource, entry]) => [
-        resource,
-        entry.metadataDirectory,
-      ]),
-    ),
-    resourceRegistry: createParentResourceRegistry(
-      resourcePlan,
-      importOwnedProcessAuthority,
-    ),
-  };
-  if (options.registered !== false) active.add(controller);
-  child.off('message', bufferMessage);
-  retainControllerResources(controller, pendingMessages);
-  return controller;
+  );
 }
 
-function startLinuxStandardPlaywrightController(
-  port: number,
-  options: {
-    mode?: 'hang' | 'stubborn-hang' | 'uninstrumented-root-exit';
-    operationTimeoutMs?: number;
-    bootstrapPause?:
-      | 'before-configuration'
-      | 'during-controller-creation'
-      | 'before-armed-ack'
-      | 'after-terminal-result';
-  } = {},
+async function createServerFixture(
+  mode: 'ready' | 'stall' | 'pre-spawn-failure',
 ) {
-  const resourcePlan = createParentResourcePlan(['playwright']);
-  const child = spawn(process.execPath, [playwrightControllerPath], {
-    detached: true,
-    env: parentResourceEnvironment(resourcePlan, {
+  const allocation = await controllerModule.createRunAllocation();
+  const configuration = allocation.configuration;
+  const environment = controllerModule.environmentForRunConfiguration(
+    {
       ...process.env,
-      BBX_E2E_INTERNAL_CONTROLLER_CONTEXT: 'bbx-e2e-controller-harness-v1',
-      BBX_E2E_INTERNAL_CONTROLLER_PORT: String(port),
-      BBX_E2E_INTERNAL_CONTROLLER_MODE: options.mode ?? 'stubborn-hang',
-      BBX_E2E_INTERNAL_OPERATION_TIMEOUT_MS: String(
-        options.operationTimeoutMs ?? 5_000,
-      ),
-      ...(options.bootstrapPause === undefined
-        ? {}
-        : {
-            BBX_E2E_INTERNAL_GUARDIAN_BOOTSTRAP_PAUSE: options.bootstrapPause,
-          }),
+      BBX_E2E_TRUSTED_PROXY_TOKEN: 'fixture_proxy_token_012345678901',
+      BBX_E2E_INTERNAL_TEST_CONTEXT: 'bbx-e2e-server-harness-v2',
+      BBX_E2E_INTERNAL_FIXTURE_MODE: mode,
+      BBX_E2E_INTERNAL_STARTUP_TIMEOUT_MS: '750',
+    },
+    configuration,
+  );
+  await allocation.release();
+  const harness = createHarnessProcess(
+    fork(serverPath, [], {
+      detached: false,
+      env: environment,
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+      windowsHide: true,
     }),
-    stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,
-  });
-  let output = '';
-  child.stdout?.on('data', (chunk) => (output += String(chunk)));
-  child.stderr?.on('data', (chunk) => (output += String(chunk)));
-  return {
-    child,
-    output: () => output,
-    outputPath: resourcePlan.get('playwright')!.metadataDirectory,
-    ports: [port],
-  };
+  );
+  return { harness, configuration };
 }
 
-function startLinuxActualTopologyController(
-  proxyPort: number,
-  appPort: number,
-) {
-  const resourcePlan = createParentResourcePlan(['playwright']);
-  const child = spawn(process.execPath, [playwrightControllerPath], {
-    detached: true,
-    env: parentResourceEnvironment(resourcePlan, {
-      ...process.env,
-      BBX_E2E_INTERNAL_CONTROLLER_CONTEXT: 'bbx-e2e-controller-harness-v1',
-      BBX_E2E_INTERNAL_CONTROLLER_MODE: 'actual-topology',
-      BBX_E2E_INTERNAL_CONTROLLER_PORT: String(proxyPort),
-      BBX_E2E_INTERNAL_OPERATION_TIMEOUT_MS: '10000',
-      BBX_E2E_INTERNAL_TEST_CONTEXT: 'bbx-e2e-harness-v1',
-      BBX_E2E_INTERNAL_FIXTURE_MODE: 'stubborn-ready',
-      BBX_E2E_APP_PORT: String(appPort),
-      BBX_E2E_PROXY_PORT: String(proxyPort),
-      BBX_E2E_TRUSTED_PROXY_TOKEN: 'bbx-e2e-topology-token-000000000',
-    }),
-    stdio: ['ignore', 'pipe', 'pipe'],
-    windowsHide: true,
-  });
-  let output = '';
-  child.stdout?.on('data', (chunk) => (output += String(chunk)));
-  child.stderr?.on('data', (chunk) => (output += String(chunk)));
-  return {
-    child,
-    output: () => output,
-    outputPath: resourcePlan.get('playwright')!.metadataDirectory,
-    ports: [proxyPort, appPort],
-  };
-}
-
-function retainControllerResources(
-  controller: ActiveController,
-  pendingMessages: unknown[],
-) {
-  const retain = (message: unknown) => {
-    const candidate = message as {
-      authority?: unknown;
-      resource?: string;
-      layerProcessId?: number;
-      resourceId?: string;
-      ownedPaths?: unknown;
-      type?: string;
-      version?: number;
+function waitForExit(child: ChildProcess, timeoutMs = 15_000) {
+  if (child.exitCode !== null || child.signalCode !== null)
+    return Promise.resolve();
+  return new Promise<void>((resolvePromise, reject) => {
+    const onExit = () => {
+      clearTimeout(timer);
+      resolvePromise();
     };
-    if (candidate.type !== 'owned-resource-authority') return;
-    try {
-      const allowedResources =
-        controller.kind === 'server'
-          ? new Map([
-              ['server-worker', 'server-worker'],
-              ['server-application', 'application'],
-            ])
-          : new Map([
-              ['playwright-owner', 'playwright-owner'],
-              ['playwright', 'playwright'],
-            ]);
-      const resource = candidate.resource;
-      if (
-        typeof resource === 'string' &&
-        controller.blockedResources.has(resource)
-      )
-        return;
-      const expectedRole =
-        typeof resource === 'string'
-          ? allowedResources.get(resource)
-          : undefined;
-      if (
-        candidate.version !== 1 ||
-        typeof resource !== 'string' ||
-        expectedRole === undefined ||
-        !Number.isSafeInteger(candidate.layerProcessId) ||
-        candidate.layerProcessId! < 1 ||
-        controller.resources.has(resource)
-      )
-        throw new Error('Invalid registered E2E resource authority.');
-      if (
-        !Array.isArray(candidate.ownedPaths) ||
-        candidate.ownedPaths.length > 2
-      )
-        throw new Error('Invalid registered E2E owned paths.');
-      const ownedPaths: string[] = [];
-      for (const path of candidate.ownedPaths) {
-        const expectedPath = controller.resourcePaths.get('playwright');
-        if (
-          controller.kind !== 'playwright' ||
-          typeof path !== 'string' ||
-          path !== expectedPath ||
-          exactOwnedTempDirectory(path) !== expectedPath
-        )
-          throw new Error('Invalid registered E2E owned path.');
-        ownedPaths.push(expectedPath);
-      }
-      const entry = controller.resourceRegistry.entry(resource);
-      const authority = controller.resourceRegistry.accept(
-        candidate,
-        expectedRole,
-      ) as AcceptedResourceOwnership['authority'];
-      controller.resourceOwnerships.set(
-        resource,
-        Object.freeze({
-          authority,
-          entry,
-          ownedPaths: Object.freeze(ownedPaths),
-        }),
-      );
-      controller.authorities.push(authority);
-      controller.resources.add(resource);
-      controller.layerProcessIds.add(authority.supervisorProcessId);
-      const acknowledge = () => {
-        if (controller.child.connected)
-          controller.child.send({
-            type: 'owned-resource-authority-ack',
-            resource,
-            resourceId: controller.resourceRegistry.entry(resource).resourceId,
-            version: 1,
-          });
-      };
-      if (controller.authorityAckDelayMs === 0) acknowledge();
-      else setTimeout(acknowledge, controller.authorityAckDelayMs).unref();
-    } catch {
-      if (
-        controller.child.exitCode === null &&
-        controller.child.signalCode === null
-      )
-        controller.child.kill('SIGKILL');
-    }
-  };
-  controller.child.on('message', retain);
-  for (const message of pendingMessages) retain(message);
+    const timer = setTimeout(() => {
+      child.removeListener('exit', onExit);
+      reject(new Error('Retained direct child did not exit.'));
+    }, timeoutMs);
+    child.once('exit', onExit);
+  });
+}
+
+async function stopHarness(harness: HarnessProcess) {
+  if (
+    harness.child.exitCode === null &&
+    harness.child.signalCode === null &&
+    harness.child.connected
+  )
+    harness.child.send({ type: 'shutdown' });
+  await waitForExit(harness.child);
+  active.delete(harness);
 }
 
 async function pathExists(path: string) {
   try {
     await stat(path);
     return true;
-  } catch {
-    return false;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return false;
+    throw error;
   }
 }
 
-async function waitFor(
-  condition: () => boolean,
-  message: string | (() => string),
-  timeoutMs = 5_000,
-) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (condition()) return;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  throw new Error(typeof message === 'function' ? message() : message);
-}
-
-async function waitForAsync(
-  condition: () => Promise<boolean>,
-  message: string,
-  timeoutMs = 5_000,
-) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (await condition()) return;
-    await new Promise((resolve) => setTimeout(resolve, 50));
-  }
-  throw new Error(message);
-}
-
-async function waitForExit(child: ChildProcess, timeoutMs = 5_000) {
-  if (child.exitCode !== null || child.signalCode !== null) return;
-  await Promise.race([
-    new Promise<void>((resolve) => child.once('exit', () => resolve())),
-    new Promise<never>((_, reject) =>
-      setTimeout(
-        () => reject(new Error('Controller did not exit.')),
-        timeoutMs,
-      ),
-    ),
-  ]);
-}
-
-function processState(processId: number) {
-  const linuxIdentity = readLinuxProcessIdentity(processId);
-  if (linuxIdentity !== undefined)
-    return linuxIdentity.zombie
-      ? `zombie(ppid=${linuxIdentity.parentProcessId},pgid=${linuxIdentity.processGroupId},sid=${linuxIdentity.sessionId})`
-      : linuxIdentity.dead
-        ? `dead(state=${linuxIdentity.state},ppid=${linuxIdentity.parentProcessId},pgid=${linuxIdentity.processGroupId},sid=${linuxIdentity.sessionId})`
-        : `live(ppid=${linuxIdentity.parentProcessId},pgid=${linuxIdentity.processGroupId},sid=${linuxIdentity.sessionId})`;
-  if (process.platform === 'linux') return 'absent';
-  return probeProcessState(processId);
-}
-
-function processAbsent(processId: number) {
-  return processState(processId) === 'absent';
-}
-
-async function portIsFree(port: number) {
-  return new Promise<boolean>((resolve) => {
-    const server = createServer();
-    server.once('error', () => resolve(false));
-    server.listen(port, '127.0.0.1', () => server.close(() => resolve(true)));
+function portIsFree(port: number) {
+  const server = createServer();
+  return new Promise<boolean>((resolvePromise) => {
+    server.once('error', () => resolvePromise(false));
+    server.listen({ port, host: '127.0.0.1', exclusive: true }, () =>
+      server.close(() => resolvePromise(true)),
+    );
   });
 }
 
-function phasePid(output: string, phase: string) {
-  const match = new RegExp(`BBX_E2E_PHASE ${phase} pid=([0-9]+)`).exec(output);
-  return match ? Number(match[1]) : undefined;
+function listen(port: number) {
+  const server = createServer();
+  return new Promise<Server>((resolvePromise, reject) => {
+    server.once('error', reject);
+    server.listen({ port, host: '127.0.0.1', exclusive: true }, () =>
+      resolvePromise(server),
+    );
+  });
 }
 
-function phasePids(output: string, phase: string) {
-  return Array.from(
-    output.matchAll(new RegExp(`BBX_E2E_PHASE ${phase} pid=([0-9]+)`, 'g')),
-    (match) => Number(match[1]),
+function close(server: Server) {
+  return new Promise<void>((resolvePromise, reject) =>
+    server.close((error) => (error ? reject(error) : resolvePromise())),
   );
 }
 
-function phaseDetails(output: string, phase: string) {
-  const match = new RegExp(`BBX_E2E_PHASE ${phase} ([^\\r\\n]+)`).exec(output);
-  const fields = match?.[1];
-  if (!fields) return undefined;
-  return Object.fromEntries(
-    fields.split(' ').map((field) => {
-      const [key, value] = field.split('=');
-      return [key, Number(value)];
-    }),
+async function assertConfigurationClean(configuration: RunConfiguration) {
+  expect(await controllerModule.verifyRunResources(configuration)).toEqual({
+    clean: true,
+    remainingPaths: [],
+    remainingPorts: [],
+  });
+}
+
+async function assertExactTerminalResources(result: TerminalRecord) {
+  expect(result.cleanup.finalAudit).toEqual({
+    clean: true,
+    remainingPaths: [],
+    remainingPorts: [],
+  });
+  for (const path of [
+    result.configuration.runRoot,
+    result.configuration.outputPath,
+    result.configuration.reportPath,
+    result.configuration.resultPath,
+  ])
+    expect(await pathExists(path)).toBe(false);
+  expect(await portIsFree(result.configuration.appPort)).toBe(true);
+  expect(await portIsFree(result.configuration.proxyPort)).toBe(true);
+  await assertConfigurationClean(result.configuration);
+}
+
+function assertDelegatedBoundary(result: TerminalRecord) {
+  expect(result.ownershipBoundary).toBe(
+    'playwright-descendants-and-containing-ci-job',
   );
+  expect(result).not.toHaveProperty('descendantCleanupSucceeded');
+  expect(result).not.toHaveProperty('descendantPids');
 }
 
-function expectLinuxFixtureOwnership(output: string, ownerPid: number) {
-  if (process.platform !== 'linux') return;
-  const identity = phaseDetails(output, 'controller-fixture-ready');
-  expect(identity).toBeDefined();
-  expect(identity!['root-ppid']).toBe(ownerPid);
-  expect(identity!.ppid).toBe(identity!['root-pid']);
-  expect(identity!.pgid).toBe(identity!['root-pgid']);
-  expect(identity!.sid).toBe(identity!['root-sid']);
-  expect(identity!['root-pgid']).toBe(identity!['root-pid']);
-  expect(identity!['root-sid']).toBe(identity!['root-pid']);
+function phaseLine(output: string, phase: string) {
+  return output
+    .split(/\r?\n/)
+    .find((line) => line.startsWith(`BBX_E2E_PHASE ${phase} `));
 }
 
-async function stopController(child: ChildProcess) {
-  if (child.exitCode === null && child.signalCode === null && child.connected)
-    child.send({ type: 'shutdown', version: 1 });
-  await waitForExit(child);
+function cleanupDiagnostic(result: TerminalRecord, output: string) {
+  return JSON.stringify({
+    firstCleanupResult: result.cleanup.owner,
+    observedBeforeControllerCleanup:
+      result.cleanup.observedBeforeControllerCleanup,
+    observedAfterControllerCleanup:
+      result.cleanup.observedAfterControllerCleanup,
+    controllerCleanupObservationCount:
+      result.cleanup.controllerCleanupObservationCount,
+    controllerCleanupErrors: result.cleanup.controllerCleanupErrors,
+    exactCleanupError: result.cleanup.exactCleanupError,
+    controllerForcedFallback: result.cleanup.controllerForcedFallback,
+    ownerForcedFallbackObserved: result.cleanup.ownerForcedFallbackObserved,
+    resultPathInitialObservation: result.cleanup.resultPathInitialObservation,
+    resultPathObservationCount: result.cleanup.resultPathObservationCount,
+    resultPathCleanupErrors: result.cleanup.resultPathCleanupErrors,
+    resultPathError: result.cleanup.resultPathError,
+    finalAudit: result.cleanup.finalAudit,
+    protocol: result.protocol,
+    fixtureChildExit: phaseLine(output, 'playwright-child-exit'),
+    ownerExit: phaseLine(output, 'playwright-owner-exit-observed'),
+  });
 }
 
-async function runWithExactCleanup<T>(
-  action: () => Promise<T>,
-  cleanup: () => Promise<void>,
+function assertProtocolOnlyFailure(
+  result: TerminalRecord,
+  output: string,
+  issue: 'duplicate-terminal-result' | 'conflicting-terminal-result',
 ) {
-  let actionFailure: unknown;
-  let cleanupFailure: unknown;
-  let result: T | undefined;
+  const diagnostic = cleanupDiagnostic(result, output);
+  expect(result.primary, diagnostic).toEqual({ exitCode: 0, signal: null });
+  expect(result.cleanup.owner, diagnostic).toEqual({
+    succeeded: true,
+    errorCode: 0,
+    remainingPathCount: 0,
+  });
+  expect(result.cleanup.succeeded, diagnostic).toBe(true);
+  expect(result.cleanup.exactCleanupError, diagnostic).toBeNull();
+  expect(result.cleanup.resultPathError, diagnostic).toBeNull();
+  expect(result.cleanup.finalAudit, diagnostic).toEqual({
+    clean: true,
+    remainingPaths: [],
+    remainingPorts: [],
+  });
+  expect(result.protocol, diagnostic).toEqual({
+    succeeded: false,
+    issues: [issue],
+  });
+  expect(result.forcedDirectChildFallback, diagnostic).toBe(false);
+  expect(result.cleanup.controllerForcedFallback, diagnostic).toBe(false);
+  expect(result.cleanup.ownerForcedFallbackObserved, diagnostic).toBe(false);
+}
+
+async function withCrossRunSentinel<T>(operation: () => Promise<T>) {
+  const allocation = await controllerModule.createRunAllocation();
+  const configuration = allocation.configuration;
+  await allocation.release();
+  await mkdir(configuration.runRoot, { recursive: false });
+  await mkdir(configuration.outputPath, { recursive: false });
+  await mkdir(configuration.reportPath, { recursive: false });
+  const appListener = await listen(configuration.appPort);
+  const proxyListener = await listen(configuration.proxyPort);
   try {
-    result = await action();
-  } catch (error) {
-    actionFailure = error;
+    const value = await operation();
+    expect(await pathExists(configuration.runRoot)).toBe(true);
+    expect(await pathExists(configuration.outputPath)).toBe(true);
+    expect(await pathExists(configuration.reportPath)).toBe(true);
+    expect(await pathExists(configuration.resultPath)).toBe(false);
+    expect(await portIsFree(configuration.appPort)).toBe(false);
+    expect(await portIsFree(configuration.proxyPort)).toBe(false);
+    return value;
   } finally {
-    try {
-      await cleanup();
-    } catch (error) {
-      cleanupFailure = error;
+    await close(appListener);
+    await close(proxyListener);
+    await rm(configuration.resultPath, { force: true });
+    await rm(configuration.outputPath, { recursive: true, force: true });
+    await rm(configuration.reportPath, { recursive: true, force: true });
+    await rmdir(configuration.runRoot).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== 'ENOENT') throw error;
+    });
+    await assertConfigurationClean(configuration);
+  }
+}
+
+function exerciseInstalledSignalHandler(
+  harness: HarnessProcess,
+  signal: 'SIGINT' | 'SIGTERM',
+) {
+  if (process.platform === 'win32') {
+    harness.child.send({ type: 'internal-signal', signal });
+    return;
+  }
+  expect(harness.child.kill(signal)).toBe(true);
+}
+
+afterEach(async () => {
+  for (const harness of active) {
+    if (harness.child.exitCode === null && harness.child.signalCode === null) {
+      if (harness.child.connected) harness.child.send({ type: 'shutdown' });
+      try {
+        await waitForExit(harness.child, 5_000);
+      } catch {
+        harness.child.kill('SIGKILL');
+        await waitForExit(harness.child, 5_000).catch(() => undefined);
+      }
     }
   }
-  if (actionFailure !== undefined && cleanupFailure !== undefined)
-    throw new AggregateError(
-      [actionFailure, cleanupFailure],
-      'E2E assertion and exact cleanup both failed.',
+  active.clear();
+});
+
+describe('production Option D configuration and final launch seam', () => {
+  it('allocates, propagates, records, and cleans one immutable production run', async () => {
+    const harness = startProductionController({ mode: 'success' });
+    const allocation =
+      await harness.waitForRecord<ConfigurationRecord>('run-configuration');
+    await waitForExit(harness.child);
+    active.delete(harness);
+    const result =
+      await harness.waitForRecord<TerminalRecord>('terminal-result');
+
+    expect(harness.child.exitCode).toBe(0);
+    expect(allocation.configuration.runIdentity).toMatch(/^[a-f0-9]{64}$/);
+    expect(allocation.configuration.appPort).not.toBe(
+      allocation.configuration.proxyPort,
     );
-  if (cleanupFailure !== undefined) throw cleanupFailure;
-  if (actionFailure !== undefined) throw actionFailure;
-  return result as T;
-}
+    expect(allocation.configuration.runRoot).toBe(
+      resolve(tmpdir(), `bbx-e2e-${allocation.configuration.runIdentity}`),
+    );
+    expect(allocation.configuration.outputPath).toBe(
+      join(allocation.configuration.runRoot, 'output'),
+    );
+    expect(allocation.configuration.reportPath).toBe(
+      join(allocation.configuration.runRoot, 'report'),
+    );
+    expect(allocation.configuration.resultPath).toBe(
+      join(allocation.configuration.runRoot, 'result.json'),
+    );
+    expect(allocation.configurationDigest).toMatch(/^[a-f0-9]{64}$/);
+    expect(result.configuration).toEqual(allocation.configuration);
+    expect(result.primary).toEqual({ exitCode: 0, signal: null });
+    expect(result.cleanup.succeeded).toBe(true);
+    expect(result.protocol).toEqual({ succeeded: true, issues: [] });
+    expect(result.forcedDirectChildFallback).toBe(false);
+    expect(harness.output()).toContain('BBX_E2E_PHASE fixture-launch-seam');
+    expect(harness.output()).not.toContain(
+      'BBX_E2E_PHASE playwright-launch-seam',
+    );
+    await assertConfigurationClean(allocation.configuration);
+  });
 
-async function cleanupActiveControllers() {
-  const failures: unknown[] = [];
-  for (const controller of active) {
-    const resourceFailures: unknown[] = [];
-    const { child } = controller;
-    try {
-      let controllerConverged = true;
-      if (child.exitCode === null && child.signalCode === null) {
-        if (child.connected) child.send({ type: 'shutdown', version: 1 });
-        try {
-          await waitForExit(child, 10_000);
-        } catch (error) {
-          resourceFailures.push(error);
-          try {
-            await terminateDirectChild(controller.directAuthority);
-          } catch (terminationError) {
-            resourceFailures.push(terminationError);
-          }
-        }
-      }
-      if (child.pid !== undefined && !processAbsent(child.pid)) {
-        controllerConverged = false;
-        resourceFailures.push(
-          new Error('Controller remained after exact teardown.'),
-        );
-      }
+  it('runs two simultaneous production controllers without shared ports, paths, or cross-cleanup', async () => {
+    const first = startProductionController({ mode: 'hang' });
+    const second = startProductionController({ mode: 'hang' });
+    const [firstRecord, secondRecord] = await Promise.all([
+      first.waitForRecord<ConfigurationRecord>('run-configuration'),
+      second.waitForRecord<ConfigurationRecord>('run-configuration'),
+    ]);
+    await Promise.all([
+      first.waitForOutput('BBX_E2E_PHASE controller-fixture-ready'),
+      second.waitForOutput('BBX_E2E_PHASE controller-fixture-ready'),
+    ]);
 
-      for (const resource of controller.resources)
-        try {
-          const ownership = controller.resourceOwnerships.get(resource);
-          if (ownership === undefined)
-            throw new Error('Missing exact E2E resource ownership record.');
-          await controller.resourceRegistry.completeAfter(
-            resource,
-            async ({ authority, entry }) => {
-              if (
-                authority !== ownership.authority ||
-                entry.resourceId !== ownership.entry.resourceId ||
-                entry.metadataDirectory !== ownership.entry.metadataDirectory
-              )
-                throw new Error('E2E resource ownership record changed.');
-              if (!controllerConverged)
-                throw new Error(
-                  'Controller remained before exact resource completion.',
-                );
-              await cleanupOwnedProcessAuthority(authority);
-              await waitFor(
-                () =>
-                  [authority.supervisorProcessId, authority.actualProcessId]
-                    .filter(
-                      (processId, index, values) =>
-                        values.indexOf(processId) === index,
-                    )
-                    .every(processAbsent),
-                'Registered resource ownership did not converge to absence.',
-                10_000,
-              );
-              for (const port of controller.ports)
-                if (!(await portIsFree(port)))
-                  throw new Error(
-                    'Registered listener remained before resource completion.',
-                  );
-              await removeExactOwnedTempDirectory(entry.metadataDirectory);
-              for (const path of ownership.ownedPaths)
-                await removeExactOwnedTempDirectory(path);
-              if (
-                (await pathExists(entry.metadataDirectory)) ||
-                (
-                  await Promise.all(
-                    ownership.ownedPaths.map((path) => pathExists(path)),
-                  )
-                ).some(Boolean)
-              )
-                throw new Error(
-                  'Registered metadata or output remained before resource completion.',
-                );
-            },
-          );
-        } catch (error) {
-          resourceFailures.push(error);
-        }
-      try {
-        await waitFor(
-          () => [...controller.layerProcessIds].every(processAbsent),
-          'Registered owner or worker did not converge to absence.',
-          10_000,
-        );
-      } catch (error) {
-        resourceFailures.push(error);
-      }
-      const ownedPids = new Set(
-        controller.authorities.flatMap((authority) => [
-          authority.supervisorProcessId,
-          authority.actualProcessId,
+    const a = firstRecord.configuration;
+    const b = secondRecord.configuration;
+    expect(a.runIdentity).not.toBe(b.runIdentity);
+    expect(new Set([a.appPort, a.proxyPort, b.appPort, b.proxyPort]).size).toBe(
+      4,
+    );
+    expect(a.runRoot).not.toBe(b.runRoot);
+    expect(a.outputPath).not.toBe(b.outputPath);
+    expect(a.reportPath).not.toBe(b.reportPath);
+    expect(a.resultPath).not.toBe(b.resultPath);
+    expect(await pathExists(a.outputPath)).toBe(true);
+    expect(await pathExists(b.outputPath)).toBe(true);
+    expect(await portIsFree(a.appPort)).toBe(false);
+    expect(await portIsFree(b.appPort)).toBe(false);
+
+    await stopHarness(first);
+    await assertConfigurationClean(a);
+    expect(await pathExists(b.outputPath)).toBe(true);
+    expect(await pathExists(b.reportPath)).toBe(true);
+    expect(await portIsFree(b.appPort)).toBe(false);
+    expect(await portIsFree(b.proxyPort)).toBe(false);
+
+    await stopHarness(second);
+    await assertConfigurationClean(b);
+  }, 30_000);
+
+  it('allows the fixture only for the exact marker after configuration validation', async () => {
+    const allocation = await controllerModule.createRunAllocation();
+    const configuration = allocation.configuration;
+    const base = controllerModule.environmentForRunConfiguration(
+      process.env,
+      configuration,
+    );
+    const realPlan = ownerModule.createFinalLaunchPlan(configuration, [], base);
+    expect(realPlan.kind).toBe('playwright');
+    expect(realPlan.arguments).toContain(
+      `--output=${configuration.outputPath}`,
+    );
+
+    expect(() =>
+      ownerModule.createFinalLaunchPlan(configuration, [], {
+        ...base,
+        BBX_E2E_INTERNAL_CONTROLLER_CONTEXT: 'not-the-marker',
+        BBX_E2E_INTERNAL_FIXTURE_MODE: 'success',
+      }),
+    ).toThrow(/exact authenticated marker/);
+
+    const fixturePlan = ownerModule.createFinalLaunchPlan(configuration, [], {
+      ...base,
+      BBX_E2E_INTERNAL_CONTROLLER_CONTEXT:
+        controllerModule.INTERNAL_CONTROLLER_MARKER,
+      BBX_E2E_INTERNAL_FIXTURE_MODE: 'success',
+    });
+    expect(fixturePlan.kind).toBe('authenticated-no-browser-fixture');
+    expect(fixturePlan.configuration).toEqual(realPlan.configuration);
+    expect(fixturePlan.environment.BBX_E2E_APP_PORT).toBe(
+      realPlan.environment.BBX_E2E_APP_PORT,
+    );
+    expect(fixturePlan.environment.BBX_E2E_PROXY_PORT).toBe(
+      realPlan.environment.BBX_E2E_PROXY_PORT,
+    );
+    expect(fixturePlan.environment.BBX_E2E_OUTPUT_DIR).toBe(
+      realPlan.environment.BBX_E2E_OUTPUT_DIR,
+    );
+    await allocation.release();
+  });
+
+  it('rejects any child attempt to replace identity, ports, paths, or digest', async () => {
+    const allocation = await controllerModule.createRunAllocation();
+    const configuration = allocation.configuration;
+    const environment = controllerModule.environmentForRunConfiguration(
+      process.env,
+      configuration,
+    );
+    expect(Object.isFrozen(configuration)).toBe(true);
+    expect(() =>
+      controllerModule.runConfigurationFromEnvironment({
+        ...environment,
+        BBX_E2E_APP_PORT: String(configuration.proxyPort),
+      }),
+    ).toThrow();
+    expect(() =>
+      controllerModule.runConfigurationFromEnvironment({
+        ...environment,
+        BBX_E2E_OUTPUT_DIR: join(configuration.runRoot, 'other-output'),
+      }),
+    ).toThrow();
+    expect(() =>
+      controllerModule.runConfigurationFromEnvironment({
+        ...environment,
+        BBX_E2E_CONFIG_DIGEST: '0'.repeat(64),
+      }),
+    ).toThrow(/digest mismatch/);
+    await allocation.release();
+  });
+
+  it('rejects the result-persistence failure mode without the exact marker', async () => {
+    const harness = createHarnessProcess(
+      fork(productionControllerPath, [], {
+        detached: false,
+        env: {
+          ...process.env,
+          BBX_E2E_INTERNAL_CONTROLLER_CONTEXT: 'not-the-marker',
+          BBX_E2E_INTERNAL_FIXTURE_MODE: 'success',
+          BBX_E2E_INTERNAL_VERIFICATION_MODE: 'result-persistence-failure',
+        },
+        stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+        windowsHide: true,
+      }),
+    );
+    await waitForExit(harness.child);
+    active.delete(harness);
+    const record =
+      await harness.waitForRecord<ConfigurationRecord>('run-configuration');
+    const output = harness.output();
+
+    expect(harness.child.exitCode).toBe(1);
+    expect(output).toContain(
+      'Internal verification mode requires exact marker.',
+    );
+    expect(output).not.toContain('BBX_E2E_PHASE playwright-owner-spawned');
+    expect(output).not.toContain(
+      'BBX_E2E_PHASE result-persistence-failure-injected',
+    );
+    await assertConfigurationClean(record.configuration);
+  });
+
+  it('statically proves the ordinary branch shares pre-launch allocation and propagation', async () => {
+    const [controllerSource, ownerSource, configSource] = await Promise.all([
+      readFile(controllerSourcePath, 'utf8'),
+      readFile(ownerSourcePath, 'utf8'),
+      readFile(playwrightConfigPath, 'utf8'),
+    ]);
+    expect(controllerSource.indexOf('createRunAllocation()')).toBeLessThan(
+      controllerSource.indexOf('fork(ownerPath'),
+    );
+    expect(
+      ownerSource.indexOf('runConfigurationFromEnvironment(process.env)'),
+    ).toBeLessThan(
+      ownerSource.indexOf('const launchPlan = createFinalLaunchPlan('),
+    );
+    expect(ownerSource.match(/createFinalLaunchPlan\(/g)).toHaveLength(2);
+    expect(configSource).toContain(
+      'runConfigurationFromEnvironment(process.env)',
+    );
+    expect(configSource).toContain('env: childEnvironment');
+    expect(configSource).toContain('configuration.proxyPort');
+    expect(configSource).toContain('configuration.outputPath');
+    expect(configSource).toContain('configuration.reportPath');
+    expect(ownerSource).toContain(
+      "launchPlan.kind === 'authenticated-no-browser-fixture'",
+    );
+    expect(ownerSource).toContain("else child.kill('SIGTERM')");
+  });
+});
+
+describe('terminal cleanup schema and invariants', () => {
+  it.each([
+    {
+      label: 'success with a nonzero cleanup error preserves primary failure',
+      fixtureMode: 'failure',
+      cleanupResultMode: 'success-nonzero-error',
+      expectedPrimary: 17,
+    },
+    {
+      label: 'success with a remaining path',
+      fixtureMode: 'success',
+      cleanupResultMode: 'success-remaining-path',
+      expectedPrimary: 0,
+    },
+    {
+      label: 'failure with the success error code',
+      fixtureMode: 'success',
+      cleanupResultMode: 'failure-zero-error',
+      expectedPrimary: 0,
+    },
+    {
+      label: 'missing required remaining-path count',
+      fixtureMode: 'success',
+      cleanupResultMode: 'missing-remaining-path',
+      expectedPrimary: 0,
+    },
+    {
+      label: 'remaining-path count outside its exact domain',
+      fixtureMode: 'success',
+      cleanupResultMode: 'invalid-remaining-path-domain',
+      expectedPrimary: 0,
+    },
+    {
+      label: 'an undeclared cleanup field',
+      fixtureMode: 'success',
+      cleanupResultMode: 'extra-cleanup-field',
+      expectedPrimary: 0,
+    },
+  ] as const)(
+    'rejects contradictory cleanup: $label',
+    async ({ fixtureMode, cleanupResultMode, expectedPrimary }) => {
+      const harness = startProductionController({
+        mode: fixtureMode,
+        cleanupResultMode,
+        phaseTimeoutMs: 250,
+      });
+      await waitForExit(harness.child);
+      active.delete(harness);
+      const result =
+        await harness.waitForRecord<TerminalRecord>('terminal-result');
+
+      expect(harness.child.exitCode).toBe(expectedPrimary === 0 ? 1 : 17);
+      expect(result.primary).toEqual({
+        exitCode: expectedPrimary,
+        signal: null,
+      });
+      expect(result.cleanup.owner).toBeNull();
+      expect(result.cleanup.succeeded).toBe(false);
+      expect(result.protocol.succeeded).toBe(false);
+      expect(result.protocol.issues).toEqual(
+        expect.arrayContaining([
+          'malformed-terminal-result',
+          'missing-terminal-result',
         ]),
       );
-      if (![...ownedPids].every(processAbsent))
-        resourceFailures.push(
-          new Error('Registered ownership did not converge to absence.'),
-        );
-      for (const port of controller.ports)
-        if (!(await portIsFree(port)))
-          resourceFailures.push(
-            new Error('Registered listener remained after teardown.'),
-          );
-      const paths = [...controller.resourceOwnerships.values()].flatMap(
-        (ownership) => [
-          ownership.entry.metadataDirectory,
-          ...ownership.ownedPaths,
-        ],
-      );
-      for (const path of paths)
-        if (await pathExists(path))
-          resourceFailures.push(
-            new Error('Registered metadata or output remained after teardown.'),
-          );
-      for (const resource of controller.resources)
-        if (controller.resourceRegistry.state(resource) !== 'completed')
-          resourceFailures.push(
-            new Error('Registered E2E resource cleanup did not complete.'),
-          );
-      if (resourceFailures.length === 0) active.delete(controller);
-    } catch (error) {
-      resourceFailures.push(error);
-    }
-    failures.push(...resourceFailures);
-  }
-  if (failures.length > 0)
-    throw new AggregateError(failures, 'E2E ownership teardown failed.');
-}
-
-function it(name: string, body: () => Promise<void>, timeout?: number) {
-  return vitestIt(
-    name,
-    () => runWithExactCleanup(body, cleanupActiveControllers),
-    timeout,
+      expect(result.forcedDirectChildFallback).toBe(false);
+      assertDelegatedBoundary(result);
+      await assertExactTerminalResources(result);
+    },
   );
-}
 
-vitestIt(
-  'preserves both the original action failure and exact cleanup failure',
-  async () => {
-    const actionFailure = new Error('original action failed');
-    const cleanupFailure = new Error('exact cleanup failed');
-    let received: unknown;
-    try {
-      await runWithExactCleanup(
-        async () => {
-          throw actionFailure;
-        },
-        async () => {
-          throw cleanupFailure;
-        },
-      );
-    } catch (error) {
-      received = error;
-    }
-    expect(received).toBeInstanceOf(AggregateError);
-    expect((received as AggregateError).errors).toEqual([
-      actionFailure,
-      cleanupFailure,
-    ]);
-  },
-);
+  it('accepts a valid clean cleanup control', async () => {
+    const harness = startProductionController({ mode: 'success' });
+    await waitForExit(harness.child);
+    active.delete(harness);
+    const result =
+      await harness.waitForRecord<TerminalRecord>('terminal-result');
 
-describe('E2E server supervision', () => {
-  it('spawns, reaches readiness, and cleans only its exact processes and ports', async () => {
-    const appPort = await freePort();
-    const proxyPort = await freePort();
-    const sentinelPort = await freePort();
-    const sentinel = createServer().listen(sentinelPort, '127.0.0.1');
-    const controller = startController('ready', appPort, proxyPort);
-    try {
-      await waitFor(
-        () => controller.output().includes('BBX_E2E_PHASE proxy-ready'),
-        () => `Controller did not become ready.\n${controller.output()}`,
-        10_000,
+    expect(harness.child.exitCode).toBe(0);
+    expect(result.cleanup.owner).toEqual({
+      succeeded: true,
+      errorCode: 0,
+      remainingPathCount: 0,
+    });
+    expect(result.cleanup.succeeded).toBe(true);
+    expect(result.protocol).toEqual({ succeeded: true, issues: [] });
+    expect(result.forcedDirectChildFallback).toBe(false);
+    assertDelegatedBoundary(result);
+    await assertExactTerminalResources(result);
+  });
+
+  it('accepts a valid failed-cleanup control without terminal success', async () => {
+    const harness = startProductionController({
+      mode: 'success',
+      cleanupFailure: true,
+    });
+    await waitForExit(harness.child);
+    active.delete(harness);
+    const result =
+      await harness.waitForRecord<TerminalRecord>('terminal-result');
+
+    expect(harness.child.exitCode).toBe(1);
+    expect(result.primary).toEqual({ exitCode: 0, signal: null });
+    expect(result.cleanup.owner).toEqual({
+      succeeded: false,
+      errorCode: 1,
+      remainingPathCount: 0,
+    });
+    expect(result.cleanup.succeeded).toBe(false);
+    expect(result.protocol).toEqual({ succeeded: true, issues: [] });
+    expect(result.forcedDirectChildFallback).toBe(false);
+    assertDelegatedBoundary(result);
+    await assertExactTerminalResources(result);
+  });
+});
+
+describe('production lifecycle negative cases', () => {
+  it('handles already-absent direct-child resources as a clean success', async () => {
+    await withCrossRunSentinel(async () => {
+      const harness = startProductionController({ mode: 'already-absent' });
+      await waitForExit(harness.child);
+      active.delete(harness);
+      const result =
+        await harness.waitForRecord<TerminalRecord>('terminal-result');
+
+      expect(harness.child.exitCode).toBe(0);
+      expect(result.primary).toEqual({ exitCode: 0, signal: null });
+      expect(result.cleanup.owner).toEqual({
+        succeeded: true,
+        errorCode: 0,
+        remainingPathCount: 0,
+      });
+      expect(result.cleanup.succeeded).toBe(true);
+      expect(result.protocol).toEqual({ succeeded: true, issues: [] });
+      expect(result.forcedDirectChildFallback).toBe(false);
+      expect(result.reason).toBe('playwright-owner-exit');
+      expect(harness.output()).toContain(
+        'BBX_E2E_PHASE playwright-child-exit exit-code=0 signaled=0',
       );
-      const workerPid = phasePid(controller.output(), 'server-worker-spawned');
-      const appPid = phasePid(controller.output(), 'application-spawned');
-      expect(workerPid).toBeTypeOf('number');
-      expect(appPid).toBeTypeOf('number');
-      expect((await fetch(`http://127.0.0.1:${proxyPort}/health`)).status).toBe(
-        200,
+      expect(harness.output()).toContain(
+        'BBX_E2E_PHASE playwright-owner-exit-observed exit-code=0 signaled=0',
       );
-      await stopController(controller.child);
-      expect(controller.child.exitCode).toBe(0);
-      await waitFor(
-        () => processAbsent(workerPid!) && processAbsent(appPid!),
-        () =>
-          `Owned E2E processes remained after shutdown: worker=${processState(workerPid!)} app=${processState(appPid!)}.`,
+      assertDelegatedBoundary(result);
+      await assertExactTerminalResources(result);
+    });
+  });
+
+  it('preserves a signaled direct-child primary outcome', async () => {
+    await withCrossRunSentinel(async () => {
+      const harness = startProductionController({ mode: 'signal' });
+      await waitForExit(harness.child);
+      active.delete(harness);
+      const result =
+        await harness.waitForRecord<TerminalRecord>('terminal-result');
+
+      const signaledPrimary =
+        process.platform === 'win32'
+          ? { exitCode: 1, signal: null }
+          : { exitCode: 130, signal: 'SIGTERM' };
+      expect(harness.child.exitCode).toBe(signaledPrimary.exitCode);
+      expect(result.primary).toEqual(signaledPrimary);
+      expect(result.cleanup.succeeded).toBe(true);
+      expect(result.protocol).toEqual({ succeeded: true, issues: [] });
+      expect(result.forcedDirectChildFallback).toBe(false);
+      expect(result.reason).toBe('playwright-owner-exit');
+      expect(harness.output()).toContain(
+        process.platform === 'win32'
+          ? 'BBX_E2E_PHASE playwright-child-exit exit-code=1 signaled=0'
+          : 'BBX_E2E_PHASE playwright-child-exit exit-code=0 signaled=1',
       );
-      expect(await portIsFree(appPort)).toBe(true);
-      expect(await portIsFree(proxyPort)).toBe(true);
-      expect(await portIsFree(sentinelPort)).toBe(false);
-      expect(controller.output()).toContain(
-        'BBX_E2E_PHASE server-controller-cleanup-complete',
+      expect(harness.output()).toContain(
+        'BBX_E2E_PHASE playwright-owner-exit-observed exit-code=0 signaled=0',
       );
-      expect(
-        controller.output().match(/server-terminal-result-received/g),
-      ).toHaveLength(1);
-      expect(
-        controller.output().indexOf('worker-cleanup-complete'),
-      ).toBeLessThan(
-        controller.output().indexOf('server-terminal-result-received'),
-      );
-      expect(
-        controller.output().indexOf('server-terminal-result-acknowledged'),
-      ).toBeLessThan(
-        controller.output().indexOf('server-controller-cleanup-complete'),
-      );
-      if (process.platform === 'win32') {
-        expect(
-          controller.output().indexOf('windows-job-child-assigned'),
-        ).toBeLessThan(
-          controller.output().indexOf('windows-job-child-resumed'),
+      assertDelegatedBoundary(result);
+      await assertExactTerminalResources(result);
+    });
+  });
+
+  it.each(['SIGINT', 'SIGTERM'] as const)(
+    'routes catchable %s through the installed controller signal handler',
+    async (signal) => {
+      await withCrossRunSentinel(async () => {
+        const harness = startProductionController({ mode: 'hang' });
+        await harness.waitForOutput('BBX_E2E_PHASE controller-fixture-ready');
+        exerciseInstalledSignalHandler(harness, signal);
+        await waitForExit(harness.child);
+        active.delete(harness);
+        const result =
+          await harness.waitForRecord<TerminalRecord>('terminal-result');
+
+        expect(harness.child.exitCode).toBe(130);
+        expect(result.primary).toEqual({ exitCode: 130, signal: null });
+        expect(result.cleanup.succeeded).toBe(true);
+        expect(result.protocol).toEqual({ succeeded: true, issues: [] });
+        expect(result.forcedDirectChildFallback).toBe(false);
+        expect(result.reason).toBe(`controller-${signal.toLowerCase()}`);
+        expect(harness.output()).toContain(
+          `BBX_E2E_PHASE controller-signal-handler-entered signal=${
+            signal === 'SIGINT' ? 2 : 15
+          }`,
         );
+        expect(harness.output()).toContain(
+          'BBX_E2E_PHASE playwright-child-exit exit-code=0 signaled=0',
+        );
+        expect(harness.output()).toContain(
+          'BBX_E2E_PHASE playwright-owner-exit-observed exit-code=0 signaled=0',
+        );
+        assertDelegatedBoundary(result);
+        await assertExactTerminalResources(result);
+      });
+    },
+  );
+
+  it('fails visibly on an unexpected owner IPC disconnect', async () => {
+    await withCrossRunSentinel(async () => {
+      const harness = startProductionController({
+        mode: 'hang',
+        lifecycleMode: 'owner-ipc-disconnect',
+      });
+      await waitForExit(harness.child);
+      active.delete(harness);
+      const result =
+        await harness.waitForRecord<TerminalRecord>('terminal-result');
+
+      expect(harness.child.exitCode).toBe(1);
+      expect(result.primary).toEqual({ exitCode: 1, signal: null });
+      expect(result.cleanup.owner).toBeNull();
+      expect(result.cleanup.succeeded).toBe(false);
+      expect(result.cleanup.finalAudit.clean).toBe(true);
+      expect(result.protocol.succeeded).toBe(false);
+      expect(result.protocol.issues).toEqual(
+        expect.arrayContaining([
+          'owner-ipc-disconnect-before-terminal-result',
+          'missing-terminal-result',
+        ]),
+      );
+      expect(result.forcedDirectChildFallback).toBe(false);
+      expect(result.reason).toBe('owner-ipc-disconnect');
+      expect(harness.output()).toContain(
+        'BBX_E2E_PHASE controller-owner-ipc-disconnect terminal-result-received=0',
+      );
+      expect(harness.output()).toContain(
+        'BBX_E2E_PHASE playwright-child-exit exit-code=0 signaled=0',
+      );
+      expect(harness.output()).toContain(
+        'BBX_E2E_PHASE playwright-owner-exit-observed exit-code=1 signaled=0',
+      );
+      assertDelegatedBoundary(result);
+      await assertExactTerminalResources(result);
+    });
+  });
+
+  it('fails visibly on an unexpected controller-side IPC disconnect', async () => {
+    await withCrossRunSentinel(async () => {
+      const harness = startProductionController({ mode: 'hang' });
+      await harness.waitForOutput('BBX_E2E_PHASE controller-fixture-ready');
+      harness.child.disconnect();
+      await waitForExit(harness.child);
+      active.delete(harness);
+      const result =
+        await harness.waitForRecord<TerminalRecord>('terminal-result');
+
+      expect(harness.child.exitCode).toBe(1);
+      expect(result.primary).toEqual({ exitCode: 130, signal: null });
+      expect(result.cleanup.succeeded).toBe(true);
+      expect(result.protocol.succeeded).toBe(false);
+      expect(result.protocol.issues).toContain(
+        'controller-parent-ipc-disconnect',
+      );
+      expect(result.forcedDirectChildFallback).toBe(false);
+      expect(result.reason).toBe('controller-parent-ipc-disconnect');
+      expect(harness.output()).toContain(
+        'BBX_E2E_PHASE controller-parent-ipc-disconnect',
+      );
+      expect(harness.output()).toContain(
+        'BBX_E2E_PHASE playwright-child-exit exit-code=0 signaled=0',
+      );
+      expect(harness.output()).toContain(
+        'BBX_E2E_PHASE playwright-owner-exit-observed exit-code=0 signaled=0',
+      );
+      assertDelegatedBoundary(result);
+      await assertExactTerminalResources(result);
+    });
+  });
+});
+
+describe('immutable terminal facts and direct-child cleanup', () => {
+  it.each([
+    ['duplicate', 'duplicate-terminal-result'],
+    ['conflict', 'conflicting-terminal-result'],
+  ] as const)(
+    'keeps the first success immutable after a %s terminal result',
+    async (protocolMode, issue) => {
+      const harness = startProductionController({
+        mode: 'success',
+        protocolMode,
+      });
+      await waitForExit(harness.child);
+      active.delete(harness);
+      const result =
+        await harness.waitForRecord<TerminalRecord>('terminal-result');
+      const output = harness.output();
+
+      expect(harness.child.exitCode).toBe(1);
+      assertProtocolOnlyFailure(result, output, issue);
+      const firstResult = output.indexOf(
+        'BBX_E2E_PHASE controller-terminal-result-received',
+      );
+      const acknowledged = output.indexOf(
+        'BBX_E2E_PHASE owner-terminal-result-acknowledged',
+      );
+      const repeated = output.indexOf(
+        `BBX_E2E_PHASE controller-terminal-result-repeated conflicting=${
+          protocolMode === 'conflict' ? 1 : 0
+        }`,
+      );
+      const ownerExit = output.indexOf(
+        'BBX_E2E_PHASE playwright-owner-exit-observed',
+      );
+      expect(firstResult).toBeGreaterThanOrEqual(0);
+      expect(acknowledged).toBeGreaterThan(firstResult);
+      expect(repeated).toBeGreaterThan(acknowledged);
+      expect(ownerExit).toBeGreaterThan(repeated);
+      await assertExactTerminalResources(result);
+    },
+  );
+
+  it('keeps a genuine result-persistence failure non-clean after exact resources converge', async () => {
+    const harness = startProductionController({
+      mode: 'success',
+      verificationMode: 'result-persistence-failure',
+    });
+    await waitForExit(harness.child);
+    active.delete(harness);
+    const result =
+      await harness.waitForRecord<TerminalRecord>('terminal-result');
+    const output = harness.output();
+    const diagnostic = cleanupDiagnostic(result, output);
+
+    expect(harness.child.exitCode, diagnostic).toBe(1);
+    expect(result.primary, diagnostic).toEqual({ exitCode: 0, signal: null });
+    expect(result.cleanup.owner, diagnostic).toEqual({
+      succeeded: true,
+      errorCode: 0,
+      remainingPathCount: 0,
+    });
+    expect(result.cleanup.succeeded, diagnostic).toBe(false);
+    expect(result.cleanup.exactCleanupError, diagnostic).toBeNull();
+    expect(result.cleanup.resultPathError, diagnostic).toBe(
+      'Injected exact terminal result persistence verification failure.',
+    );
+    expect(result.protocol, diagnostic).toEqual({
+      succeeded: false,
+      issues: ['terminal-result-path-failure'],
+    });
+    expect(result.forcedDirectChildFallback, diagnostic).toBe(false);
+    expect(result.cleanup.controllerForcedFallback, diagnostic).toBe(false);
+    expect(result.cleanup.ownerForcedFallbackObserved, diagnostic).toBe(false);
+    expect(result.cleanup.resultPathInitialObservation, diagnostic).toEqual({
+      clean: false,
+      remainingPaths: [
+        result.configuration.resultPath,
+        result.configuration.runRoot,
+      ],
+      remainingPorts: [],
+    });
+    expect(result.cleanup.resultPathCleanupErrors, diagnostic).toEqual([]);
+    expect(result.cleanup.finalAudit, diagnostic).toEqual({
+      clean: true,
+      remainingPaths: [],
+      remainingPorts: [],
+    });
+    expect(output, diagnostic).toContain(
+      'BBX_E2E_PHASE result-persistence-failure-injected',
+    );
+    expect(output, diagnostic).toContain(
+      'BBX_E2E_PHASE playwright-child-exit exit-code=0 signaled=0',
+    );
+    expect(output, diagnostic).toContain(
+      'BBX_E2E_PHASE playwright-owner-exit-observed exit-code=0 signaled=0',
+    );
+    const injected = output.indexOf(
+      'BBX_E2E_PHASE result-persistence-failure-injected',
+    );
+    const verified = output.indexOf(
+      'BBX_E2E_PHASE result-path-verification-complete',
+    );
+    expect(injected, diagnostic).toBeGreaterThanOrEqual(0);
+    expect(verified, diagnostic).toBeGreaterThan(injected);
+    assertDelegatedBoundary(result);
+    await assertExactTerminalResources(result);
+  });
+
+  it.each([
+    ['controller-transient-path', 'controller-initial-observation'],
+    ['result-transient-remove', 'result-path-removal'],
+    ['final-transient-observation', 'final-resource-observation'],
+  ] as const)(
+    'converges a transient exact resource at the %s boundary',
+    async (verificationMode, boundary) => {
+      const harness = startProductionController({
+        mode: 'success',
+        protocolMode: 'duplicate',
+        verificationMode,
+        phaseTimeoutMs: 250,
+      });
+      await waitForExit(harness.child);
+      active.delete(harness);
+      const result =
+        await harness.waitForRecord<TerminalRecord>('terminal-result');
+      const output = harness.output();
+      const diagnostic = cleanupDiagnostic(result, output);
+
+      expect(harness.child.exitCode, diagnostic).toBe(1);
+      assertProtocolOnlyFailure(result, output, 'duplicate-terminal-result');
+      if (boundary === 'controller-initial-observation') {
+        expect(
+          result.cleanup.observedBeforeControllerCleanup.clean,
+          diagnostic,
+        ).toBe(false);
+        expect(
+          result.cleanup.observedBeforeControllerCleanup.remainingPaths,
+          diagnostic,
+        ).toContain(result.configuration.outputPath);
+        expect(
+          result.cleanup.observedAfterControllerCleanup.clean,
+          diagnostic,
+        ).toBe(true);
+        expect(
+          result.cleanup.controllerCleanupObservationCount,
+          diagnostic,
+        ).toBeGreaterThanOrEqual(2);
+      } else if (boundary === 'result-path-removal') {
+        expect(result.cleanup.resultPathCleanupErrors, diagnostic).toContain(
+          'Injected transient exact result-path removal failure.',
+        );
+        expect(
+          result.cleanup.resultPathObservationCount,
+          diagnostic,
+        ).toBeGreaterThanOrEqual(3);
+      } else {
+        expect(
+          result.cleanup.resultPathObservationCount,
+          diagnostic,
+        ).toBeGreaterThanOrEqual(3);
       }
+      await assertExactTerminalResources(result);
+    },
+  );
+
+  it('keeps a persistent exact port observation non-clean and protocol-independent', async () => {
+    const harness = startProductionController({
+      mode: 'success',
+      protocolMode: 'duplicate',
+      verificationMode: 'controller-persistent-port',
+      phaseTimeoutMs: 125,
+    });
+    await waitForExit(harness.child);
+    active.delete(harness);
+    const result =
+      await harness.waitForRecord<TerminalRecord>('terminal-result');
+    const output = harness.output();
+    const diagnostic = cleanupDiagnostic(result, output);
+
+    expect(harness.child.exitCode, diagnostic).toBe(1);
+    expect(result.primary, diagnostic).toEqual({
+      exitCode: 0,
+      signal: null,
+    });
+    expect(result.cleanup.owner, diagnostic).toEqual({
+      succeeded: true,
+      errorCode: 0,
+      remainingPathCount: 0,
+    });
+    expect(result.cleanup.succeeded, diagnostic).toBe(false);
+    expect(
+      result.cleanup.observedAfterControllerCleanup.remainingPorts,
+      diagnostic,
+    ).toEqual([result.configuration.appPort]);
+    expect(result.cleanup.exactCleanupError, diagnostic).toBe(
+      'Exact controller resources did not converge.',
+    );
+    expect(result.cleanup.finalAudit.clean, diagnostic).toBe(true);
+    expect(result.protocol, diagnostic).toEqual({
+      succeeded: false,
+      issues: ['duplicate-terminal-result'],
+    });
+    expect(result.forcedDirectChildFallback, diagnostic).toBe(false);
+    await assertExactTerminalResources(result);
+  });
+
+  it.each(['malformed', 'missing'] as const)(
+    'reports %s terminal behavior independently',
+    async (protocolMode) => {
+      const harness = startProductionController({
+        mode: 'success',
+        protocolMode,
+      });
+      await waitForExit(harness.child);
+      active.delete(harness);
+      const result =
+        await harness.waitForRecord<TerminalRecord>('terminal-result');
+
+      expect(harness.child.exitCode).toBe(1);
+      expect(result.cleanup.succeeded).toBe(false);
+      expect(result.protocol.succeeded).toBe(false);
+      expect(result.protocol.issues).toContain('missing-terminal-result');
+      if (protocolMode === 'malformed')
+        expect(result.protocol.issues).toContain('malformed-terminal-result');
+      await assertConfigurationClean(result.configuration);
+    },
+  );
+
+  it('preserves the first result when acknowledgement fails', async () => {
+    const harness = startProductionController({
+      mode: 'success',
+      protocolMode: 'unacknowledged',
+      phaseTimeoutMs: 250,
+    });
+    await waitForExit(harness.child);
+    active.delete(harness);
+    const result =
+      await harness.waitForRecord<TerminalRecord>('terminal-result');
+
+    expect(harness.child.exitCode).toBe(1);
+    expect(result.primary).toEqual({ exitCode: 0, signal: null });
+    expect(result.cleanup.owner?.succeeded).toBe(true);
+    expect(result.protocol.issues).toContain(
+      'owner-exit-after-terminal-failure',
+    );
+    await assertConfigurationClean(result.configuration);
+  });
+
+  it('preserves nonzero primary, cleanup failure, and protocol success as separate facts', async () => {
+    const harness = startProductionController({
+      mode: 'failure',
+      cleanupFailure: true,
+    });
+    await waitForExit(harness.child);
+    active.delete(harness);
+    const result =
+      await harness.waitForRecord<TerminalRecord>('terminal-result');
+
+    expect(harness.child.exitCode).toBe(17);
+    expect(result.primary).toEqual({ exitCode: 17, signal: null });
+    expect(result.cleanup.owner).toMatchObject({
+      succeeded: false,
+      errorCode: 1,
+    });
+    expect(result.cleanup.succeeded).toBe(false);
+    expect(result.protocol).toEqual({ succeeded: true, issues: [] });
+    expect(result.forcedDirectChildFallback).toBe(false);
+    await assertConfigurationClean(result.configuration);
+  });
+
+  it('marks an exact direct-child forced fallback as non-clean', async () => {
+    const harness = startProductionController({
+      mode: 'ignore-shutdown',
+      phaseTimeoutMs: 250,
+    });
+    await harness.waitForOutput('BBX_E2E_PHASE controller-fixture-ready');
+    harness.child.send({ type: 'shutdown' });
+    await waitForExit(harness.child);
+    active.delete(harness);
+    const result =
+      await harness.waitForRecord<TerminalRecord>('terminal-result');
+
+    expect(result.primary.exitCode).toBe(130);
+    expect(result.forcedDirectChildFallback).toBe(true);
+    expect(result.cleanup.owner).toMatchObject({
+      succeeded: false,
+      errorCode: 1,
+    });
+    expect(result.cleanup.succeeded).toBe(false);
+    expect(result.cleanup.finalAudit.clean).toBe(true);
+    await assertConfigurationClean(result.configuration);
+  });
+
+  it('fails visibly on an exact remaining path without expanding ownership', async () => {
+    const harness = startProductionController({
+      mode: 'success',
+      preservePath: 'output',
+    });
+    await waitForExit(harness.child);
+    active.delete(harness);
+    const result =
+      await harness.waitForRecord<TerminalRecord>('terminal-result');
+
+    expect(harness.child.exitCode).toBe(1);
+    expect(result.cleanup.succeeded).toBe(false);
+    expect(
+      result.cleanup.observedBeforeControllerCleanup.remainingPaths,
+    ).toContain(result.configuration.outputPath);
+    expect(result.cleanup.finalAudit.clean).toBe(true);
+    await assertConfigurationClean(result.configuration);
+  });
+
+  it('fails an allocated-port audit while the exact listener remains', async () => {
+    const allocation = await controllerModule.createRunAllocation();
+    const configuration = allocation.configuration;
+    await allocation.release();
+    const listener = await listen(configuration.appPort);
+    try {
+      const audit = await controllerModule.verifyRunResources(configuration);
+      expect(audit.clean).toBe(false);
+      expect(audit.remainingPorts).toEqual([configuration.appPort]);
+      expect(audit.remainingPaths).toEqual([]);
     } finally {
-      sentinel.close();
+      await close(listener);
     }
-  }, 15_000);
+    await assertConfigurationClean(configuration);
+  });
+
+  it('expires the outer watchdog but still awaits cooperative exact cleanup', async () => {
+    const harness = startProductionController({
+      mode: 'hang',
+      phaseTimeoutMs: 500,
+      outerTimeoutMs: 300,
+    });
+    await waitForExit(harness.child);
+    active.delete(harness);
+    const result =
+      await harness.waitForRecord<TerminalRecord>('terminal-result');
+
+    expect(harness.child.exitCode).toBe(1);
+    expect(result.reason).toBe('outer-timeout');
+    expect(result.forcedDirectChildFallback).toBe(false);
+    expect(result.cleanup.succeeded).toBe(true);
+    expect(result.protocol.succeeded).toBe(true);
+    expect(harness.output()).toContain(
+      'BBX_E2E_PHASE controller-watchdog-state expired=1',
+    );
+    await assertConfigurationClean(result.configuration);
+  });
+});
+
+describe('repository-created server direct-child ownership', () => {
+  it('starts and cooperatively cleans its exact worker, application, and listeners', async () => {
+    const { harness, configuration } = await createServerFixture('ready');
+    await harness.waitForOutput('BBX_E2E_PHASE proxy-ready');
+    expect(
+      (await fetch(`http://127.0.0.1:${configuration.proxyPort}/health`))
+        .status,
+    ).toBe(200);
+    await stopHarness(harness);
+
+    expect(harness.child.exitCode).toBe(0);
+    expect(harness.output()).toContain(
+      'BBX_E2E_PHASE server-controller-cleanup-complete forced=0',
+    );
+    await assertConfigurationClean(configuration);
+  });
 
   it('propagates a failure before application spawn', async () => {
-    const appPort = await freePort();
-    const proxyPort = await freePort();
-    const controller = startController('pre-spawn-failure', appPort, proxyPort);
-    await waitForExit(controller.child);
-    expect(controller.child.exitCode).toBe(1);
-    expect(controller.output()).toContain(
+    const { harness, configuration } =
+      await createServerFixture('pre-spawn-failure');
+    await waitForExit(harness.child);
+    active.delete(harness);
+
+    expect(harness.child.exitCode).toBe(1);
+    expect(harness.output()).toContain(
       'BBX_E2E_PHASE application-pre-spawn-failure',
     );
-    expect(controller.output()).not.toContain(
-      'BBX_E2E_PHASE application-spawned',
-    );
-    expect(await portIsFree(appPort)).toBe(true);
-    expect(await portIsFree(proxyPort)).toBe(true);
-  }, 15_000);
+    expect(harness.output()).not.toContain('BBX_E2E_PHASE application-spawned');
+    await assertConfigurationClean(configuration);
+  });
 
-  it('fails on the explicit startup timeout and removes the stalled child', async () => {
-    const appPort = await freePort();
-    const proxyPort = await freePort();
-    const controller = startController('stall', appPort, proxyPort, {
-      startupTimeoutMs: 2000,
-    });
-    await waitForExit(controller.child);
-    const applicationPids = [
-      ...phasePids(controller.output(), 'application-supervisor-spawned'),
-      ...phasePids(controller.output(), 'application-spawned'),
-    ];
-    expect(controller.child.exitCode).toBe(1);
-    expect(controller.output()).toMatch(
-      /BBX_E2E_PHASE (application-startup-timeout|server-startup-timeout|server-worker-failed)/,
-    );
-    await waitFor(
-      () => applicationPids.every(processAbsent),
-      () =>
-        `Stalled fixture processes remained after startup timeout: ${applicationPids
-          .map((pid) => `${pid}:${processState(pid)}`)
-          .join(',')}.`,
-    );
-    await waitForAsync(
-      async () => (await portIsFree(appPort)) && (await portIsFree(proxyPort)),
-      'Startup-timeout listeners did not converge to absence.',
-      10_000,
-    );
-  }, 15_000);
+  it('fails the monotonic startup phase and cleans the retained direct child', async () => {
+    const { harness, configuration } = await createServerFixture('stall');
+    await waitForExit(harness.child);
+    active.delete(harness);
 
-  it('allows the complete cleanup budget for a SIGKILL-required child', async () => {
-    if (process.platform !== 'linux') return;
-    const appPort = await freePort();
-    const proxyPort = await freePort();
-    const controller = startController('stubborn-stall', appPort, proxyPort, {
-      startupTimeoutMs: 5_000,
-    });
-    await waitForExit(controller.child, 15_000);
-    const output = controller.output();
-    const workerPid = phasePid(output, 'server-worker-spawned')!;
-    const applicationPid = phasePid(output, 'application-spawned')!;
-
-    expect(controller.child.exitCode).not.toBe(0);
-    expect(output).toContain('forced-process-cleanup=1');
-    expect(output.match(/server-terminal-result-received/g)).toHaveLength(1);
-    expect(output).toContain('server-terminal-result-acknowledged');
-    expect(output).not.toContain('BBX_E2E_PHASE server-startup-timeout');
-    await waitFor(
-      () => processAbsent(workerPid) && processAbsent(applicationPid),
-      'SIGKILL-required cleanup did not converge.',
-      10_000,
+    expect(harness.child.exitCode).toBe(1);
+    expect(harness.output()).toMatch(
+      /BBX_E2E_PHASE (server-startup-timeout|server-worker-failed)/,
     );
-    await waitForAsync(
-      async () => (await portIsFree(appPort)) && (await portIsFree(proxyPort)),
-      'SIGKILL-required listeners did not converge to absence.',
-      10_000,
-    );
-    expect(
-      await pathExists(controller.resourcePaths.get('server-application')!),
-    ).toBe(false);
-  }, 20_000);
-
-  it('charges application launch delay to the worker startup deadline', async () => {
-    const appPort = await freePort();
-    const proxyPort = await freePort();
-    const controller = startController('ready', appPort, proxyPort, {
-      startupTimeoutMs: 500,
-      launchDelayMs: 600,
-    });
-    await waitForExit(controller.child, 10_000);
-    const output = controller.output();
-    expect(controller.child.exitCode).toBe(1);
-    expect(output).toContain('application-startup-timeout');
-    expect(output).not.toContain('BBX_E2E_PHASE application-spawned');
-    expect(output).not.toContain('BBX_E2E_PHASE server-startup-timeout');
-    expect(await portIsFree(appPort)).toBe(true);
-    expect(await portIsFree(proxyPort)).toBe(true);
-  }, 15_000);
-
-  for (const [signal, exitCode] of [
-    ['SIGINT', 130],
-    ['SIGTERM', 143],
-  ] as const) {
-    it(`preserves ${signal} as a nonzero server result after cleanup`, async () => {
-      const appPort = await freePort();
-      const proxyPort = await freePort();
-      const controller = startController('ready', appPort, proxyPort);
-      await waitFor(
-        () => controller.output().includes('BBX_E2E_PHASE proxy-ready'),
-        () => `Controller did not become ready.\n${controller.output()}`,
-        10_000,
-      );
-      if (process.platform === 'win32')
-        controller.child.send({ type: 'simulate-signal', signal, version: 1 });
-      else process.kill(controller.child.pid!, signal);
-      await waitForExit(controller.child, 15_000);
-      expect(controller.child.exitCode).toBe(exitCode);
-      expect(controller.output()).toContain('BBX_E2E_PHASE server-signal');
-      expect(controller.output()).toContain(
-        'BBX_E2E_PHASE server-controller-cleanup-complete',
-      );
-      expect(await portIsFree(appPort)).toBe(true);
-      expect(await portIsFree(proxyPort)).toBe(true);
-    }, 20_000);
-  }
-
-  it('delivers one valid terminal result when worker cleanup fails', async () => {
-    const appPort = await freePort();
-    const proxyPort = await freePort();
-    const controller = startController('ready', appPort, proxyPort, {
-      cleanupFailure: true,
-    });
-    await waitFor(
-      () => controller.output().includes('BBX_E2E_PHASE proxy-ready'),
-      () => `Controller did not become ready.\n${controller.output()}`,
-      10_000,
-    );
-    controller.child.send({ type: 'shutdown', version: 1 });
-    await waitForExit(controller.child, 15_000);
-    const output = controller.output();
-    expect(controller.child.exitCode).toBe(1);
-    expect(output).toContain(
-      'BBX_E2E_PHASE worker-cleanup-failed error-code=1 failure-count=1',
-    );
-    expect(output.match(/server-terminal-result-received/g)).toHaveLength(1);
-    expect(output).toContain('cleanup-error-code=1');
-    expect(output).toContain('BBX_E2E_PHASE server-controller-cleanup-failed');
-    expect(await portIsFree(appPort)).toBe(true);
-    expect(await portIsFree(proxyPort)).toBe(true);
-  }, 20_000);
-
-  it('cleans worker, application, and listeners when the controller is externally terminated', async () => {
-    const appPort = await freePort();
-    const proxyPort = await freePort();
-    const controller = startController('ready', appPort, proxyPort);
-    await waitFor(
-      () => controller.output().includes('BBX_E2E_PHASE proxy-ready'),
-      () => `Controller did not become ready.\n${controller.output()}`,
-      10_000,
-    );
-    const workerPid = phasePid(controller.output(), 'server-worker-spawned')!;
-    const appPid = phasePid(controller.output(), 'application-spawned')!;
-    expect(controller.child.kill('SIGKILL')).toBe(true);
-    await waitForExit(controller.child);
-    await waitFor(
-      () => processAbsent(workerPid) && processAbsent(appPid),
-      'Owned processes remained after external controller termination.',
-    );
-    await waitForAsync(
-      async () => (await portIsFree(appPort)) && (await portIsFree(proxyPort)),
-      'Externally terminated server listeners did not converge to absence.',
-      10_000,
-    );
-  }, 15_000);
-
-  it('removes a surviving descendant after the application root exits', async () => {
-    const appPort = await freePort();
-    const proxyPort = await freePort();
-    const controller = startController('root-exit', appPort, proxyPort);
-    await waitForExit(controller.child, 15_000);
-    const applicationPids = phasePids(
-      controller.output(),
-      'application-spawned',
-    );
-    const descendantPid = phasePid(
-      controller.output(),
-      'controller-fixture-ready',
-    );
-    expect(controller.child.exitCode).toBe(1);
-    expect(applicationPids.length).toBeGreaterThanOrEqual(1);
-    expect(descendantPid).toBeTypeOf('number');
-    await waitFor(
-      () =>
-        applicationPids.every(processAbsent) && processAbsent(descendantPid!),
-      'Application root or surviving descendant remained after natural exit.',
-      10_000,
-    );
-    expect(await portIsFree(appPort)).toBe(true);
-    expect(await portIsFree(proxyPort)).toBe(true);
-  }, 20_000);
-
-  it('fails closed and removes the application tree after worker termination', async () => {
-    const appPort = await freePort();
-    const proxyPort = await freePort();
-    const controller = startController('ready', appPort, proxyPort);
-    await waitFor(
-      () => controller.output().includes('BBX_E2E_PHASE proxy-ready'),
-      () => `Controller did not become ready.\n${controller.output()}`,
-      10_000,
-    );
-    expect(
-      controller.output().indexOf('application-ownership-authority-retained'),
-    ).toBeLessThan(controller.output().indexOf('proxy-ready'));
-    const workerPid = phasePid(controller.output(), 'server-worker-spawned')!;
-    const applicationPids = phasePids(
-      controller.output(),
-      'application-spawned',
-    );
-    expect(process.kill(workerPid, 'SIGKILL')).toBe(true);
-    await waitForExit(controller.child, 15_000);
-    expect(controller.child.exitCode).toBe(1);
-    await waitFor(
-      () => processAbsent(workerPid) && applicationPids.every(processAbsent),
-      'Worker-owned application tree remained after worker termination.',
-      10_000,
-    );
-    expect(
-      await pathExists(controller.resourcePaths.get('server-application')!),
-    ).toBe(false);
-    expect(await portIsFree(appPort)).toBe(true);
-    expect(await portIsFree(proxyPort)).toBe(true);
-  }, 30_000);
-
-  it('isolates concurrent server-controller ownership', async () => {
-    const firstApp = await freePort();
-    const firstProxy = await freePort();
-    const secondApp = await freePort();
-    const secondProxy = await freePort();
-    const first = startController('ready', firstApp, firstProxy);
-    const second = startController('ready', secondApp, secondProxy);
-    await waitFor(
-      () =>
-        first.output().includes('BBX_E2E_PHASE proxy-ready') &&
-        second.output().includes('BBX_E2E_PHASE proxy-ready'),
-      () =>
-        `Concurrent controllers did not become ready.\n${first.output()}\n${second.output()}`,
-      15_000,
-    );
-    const secondWorker = phasePid(second.output(), 'server-worker-spawned')!;
-    const secondApplications = phasePids(
-      second.output(),
-      'application-spawned',
-    );
-    await stopController(first.child);
-    expect(processAbsent(secondWorker)).toBe(false);
-    expect(secondApplications.every((pid) => !processAbsent(pid))).toBe(true);
-    expect(await portIsFree(firstApp)).toBe(true);
-    expect(await portIsFree(firstProxy)).toBe(true);
-    expect(await portIsFree(secondApp)).toBe(false);
-    expect(await portIsFree(secondProxy)).toBe(false);
-    await stopController(second.child);
-    await waitFor(
-      () =>
-        processAbsent(secondWorker) && secondApplications.every(processAbsent),
-      'Concurrent survivor did not clean its exact owned tree.',
-      10_000,
-    );
-  }, 30_000);
+    await assertConfigurationClean(configuration);
+  });
 });
 
-describe('top-level Playwright ownership', () => {
-  it('returns success only after a successful child and exact cleanup', async () => {
-    const port = await freePort();
-    const controller = startPlaywrightController(port, { mode: 'success' });
-    await waitForExit(controller.child, 10_000).catch((error) => {
-      throw new Error(
-        `Successful controller did not exit.\n${controller.output()}`,
-        { cause: error },
-      );
-    });
-    const outputPath = controller.resourcePaths.get('playwright')!;
+describe('delegated Playwright ownership boundary', () => {
+  it('contains no descendant PID, PGID, process-tree, or fixed-port cleanup authority', async () => {
+    const sources = (
+      await Promise.all([
+        readFile(controllerSourcePath, 'utf8'),
+        readFile(ownerSourcePath, 'utf8'),
+        readFile(processControlSourcePath, 'utf8'),
+        readFile(serverSourcePath, 'utf8'),
+        readFile(workerSourcePath, 'utf8'),
+        readFile(playwrightConfigPath, 'utf8'),
+      ])
+    ).join('\n');
 
-    expect(controller.child.exitCode, controller.output()).toBe(0);
-    expect(controller.output()).toContain(
-      'BBX_E2E_PHASE playwright-child-exit exit-code=0 signaled=0',
-    );
-    expect(controller.output()).toContain(
-      'BBX_E2E_PHASE playwright-owner-cleanup-complete',
-    );
-    if (process.platform === 'win32') {
-      const output = controller.output();
-      expect(output.indexOf('windows-job-child-assigned')).toBeLessThan(
-        output.indexOf('windows-job-child-resumed'),
-      );
-      expect(output).toContain('BBX_E2E_PHASE windows-job-cleanup-complete');
-    }
-    expect(controller.output()).toContain('cleanup-error-code=0');
-    expect(controller.output()).toContain(
-      'BBX_E2E_PHASE controller-terminal-result-received exit-code=0 cleanup-error-code=0',
-    );
-    expect(controller.output()).toContain(
-      'BBX_E2E_PHASE owner-terminal-result-acknowledged',
-    );
-    expect(controller.output()).toContain(
-      'BBX_E2E_PHASE controller-owner-ipc-disconnect terminal-result-received=1',
-    );
-    expect(controller.output()).toContain(
-      'BBX_E2E_PHASE playwright-owner-exit-observed exit-code=0 signaled=0 result-count=1',
-    );
-    expect(controller.output()).toContain(
-      'BBX_E2E_PHASE controller-watchdog-state expired=0',
-    );
-    expect(await pathExists(outputPath)).toBe(false);
-    expect(await portIsFree(port)).toBe(true);
-  }, 15_000);
+    expect(sources).not.toMatch(/detached:\s*true/);
+    expect(sources).not.toMatch(/taskkill/i);
+    expect(sources).not.toMatch(/process\.kill\s*\(\s*-/);
+    expect(sources).not.toMatch(/\/proc\//);
+    expect(sources).not.toMatch(/43121|43122/);
+    expect(sources).not.toMatch(/guardian|job object|resource registry/i);
+    expect(sources).toContain('playwright-descendants-and-containing-ci-job');
+  });
 
-  it('preserves a nonzero child failure after cleanup', async () => {
-    const port = await freePort();
-    const controller = startPlaywrightController(port, { mode: 'failure' });
-    await waitForExit(controller.child, 10_000);
-
-    expect(controller.child.exitCode).toBe(17);
-    expect(controller.output()).toContain(
-      'BBX_E2E_PHASE playwright-child-exit exit-code=17 signaled=0',
+  it('states that uncatchable final-owner destruction has no repository cleanup guarantee', async () => {
+    const controllerSource = await readFile(controllerSourcePath, 'utf8');
+    expect(controllerSource).toContain(
+      'playwright-descendants-and-containing-ci-job',
     );
-    expect(controller.output()).toContain(
-      'BBX_E2E_PHASE controller-terminal-result-received exit-code=17 cleanup-error-code=0',
+    const harness = startProductionController({ mode: 'success' });
+    await waitForExit(harness.child);
+    active.delete(harness);
+    const result =
+      await harness.waitForRecord<TerminalRecord>('terminal-result');
+    expect(result.ownershipBoundary).toBe(
+      'playwright-descendants-and-containing-ci-job',
     );
-    expect(await portIsFree(port)).toBe(true);
-  }, 15_000);
-
-  it('fails when the child is terminated by a signal', async () => {
-    const port = await freePort();
-    const controller = startPlaywrightController(port, { mode: 'signal' });
-    await waitForExit(controller.child, 10_000);
-
-    expect(controller.child.exitCode).toBe(130);
-    expect(controller.output()).toContain(
-      'BBX_E2E_PHASE playwright-child-exit exit-code=0 signaled=1',
-    );
-    expect(await portIsFree(port)).toBe(true);
-  }, 15_000);
-
-  it('accepts already-absent cleanup only after exact absence is verified', async () => {
-    const port = await freePort();
-    const controller = startPlaywrightController(port, {
-      mode: 'already-absent',
-    });
-    await waitForExit(controller.child, 10_000);
-    const outputPath = controller.resourcePaths.get('playwright')!;
-
-    expect(controller.child.exitCode).toBe(0);
-    expect(controller.output()).toContain('process-already-absent=1');
-    expect(controller.output()).toContain('cleanup-error-code=0');
-    expect(await pathExists(outputPath)).toBe(false);
-  }, 15_000);
-
-  it('cleans the owned tree after its actual root leader exits', async () => {
-    const port = await freePort();
-    const controller = startPlaywrightController(port, { mode: 'root-exit' });
-    await waitForExit(controller.child, 10_000);
-    const ownerPid = phasePid(controller.output(), 'playwright-owner-spawned')!;
-    const fixturePid = phasePid(controller.output(), 'playwright-spawned')!;
-    const descendantPid = phasePid(
-      controller.output(),
-      'controller-fixture-ready',
-    )!;
-    const outputPath = controller.resourcePaths.get('playwright')!;
-
-    expectLinuxFixtureOwnership(controller.output(), ownerPid);
-    expect(controller.child.exitCode).toBe(0);
-    expect(controller.output()).toContain(
-      'BBX_E2E_PHASE playwright-child-exit exit-code=0 signaled=0',
-    );
-    expect(controller.output()).toContain('cleanup-error-code=0');
-    await waitFor(
-      () => processAbsent(fixturePid) && processAbsent(descendantPid),
-      'The exited Linux leader group remained present after cleanup.',
-      10_000,
-    );
-    expect(await pathExists(outputPath)).toBe(false);
-    expect(await portIsFree(port)).toBe(true);
-  }, 15_000);
-
-  vitestIt.skipIf(process.platform !== 'linux')(
-    'cleans a real uninstrumented Linux descendant after its leaders exit',
-    async () => {
-      await runWithExactCleanup(async () => {
-        const port = await freePort();
-        const controller = startPlaywrightController(port, {
-          mode: 'uninstrumented-root-exit',
-        });
-        await waitForExit(controller.child, 15_000);
-        const fixturePid = phasePid(controller.output(), 'playwright-spawned')!;
-        const descendantPid = phasePid(
-          controller.output(),
-          'controller-fixture-ready',
-        )!;
-        const outputPath = controller.resourcePaths.get('playwright')!;
-
-        expect(controller.child.exitCode).toBe(0);
-        expect(controller.output()).toContain('cleanup-error-code=0');
-        await waitFor(
-          () => processAbsent(fixturePid) && processAbsent(descendantPid),
-          'The uninstrumented Linux descendant remained after cleanup.',
-          10_000,
-        );
-        expect(await pathExists(outputPath)).toBe(false);
-        expect(await portIsFree(port)).toBe(true);
-      }, cleanupActiveControllers);
-    },
-    20_000,
-  );
-
-  it('turns a material cleanup failure into a controller failure', async () => {
-    const port = await freePort();
-    const controller = startPlaywrightController(port, {
-      mode: 'hang',
-      cleanupFailure: true,
-    });
-    await waitFor(
-      () =>
-        controller.output().includes('BBX_E2E_PHASE controller-fixture-ready'),
-      `Controller fixture did not become ready.\n${controller.output()}`,
-      10_000,
-    );
-    controller.child.send({ type: 'shutdown', version: 1 });
-    await waitForExit(controller.child, 10_000);
-    const outputPath = controller.resourcePaths.get('playwright')!;
-
-    expect(controller.child.exitCode).toBe(1);
-    expect(controller.output()).toContain('cleanup-error-code=1');
-    expect(controller.output()).toContain(
-      'BBX_E2E_PHASE controller-terminal-result-received exit-code=1 cleanup-error-code=1',
-    );
-    expect(await pathExists(outputPath)).toBe(false);
-  }, 15_000);
-
-  it('does not replace an acknowledged success after IPC disconnect', async () => {
-    const port = await freePort();
-    const controller = startPlaywrightController(port, { mode: 'success' });
-    await waitForExit(controller.child, 10_000);
-    const output = controller.output();
-
-    expect(controller.child.exitCode).toBe(0);
-    expect(output.match(/owner-terminal-result-sent/g)).toHaveLength(1);
-    expect(output.match(/controller-terminal-result-received/g)).toHaveLength(
-      1,
-    );
-    expect(output.indexOf('controller-terminal-result-received')).toBeLessThan(
-      output.indexOf('controller-owner-ipc-disconnect'),
-    );
-    expect(output).not.toContain('playwright-owner-failed');
-  }, 15_000);
-
-  it('fails closed and cleans exact ownership on duplicate protocol launch authority', async () => {
-    const port = await freePort();
-    const controller = startPlaywrightController(port, {
-      mode: 'hang',
-      protocolFault: 'duplicate-launch-authority',
-    });
-    await waitForExit(controller.child, 10_000);
-    expect(controller.child.exitCode).toBe(1);
-    expect(controller.output()).toContain(
-      'BBX_E2E_PHASE owner-protocol-failed error-code=1',
-    );
-    expect(controller.output()).toContain(
-      'BBX_E2E_PHASE controller-watchdog-state expired=0',
-    );
-    expect(await pathExists(controller.resourcePaths.get('playwright')!)).toBe(
-      false,
-    );
-    expect(await portIsFree(port)).toBe(true);
-  }, 15_000);
-
-  for (const testCase of [
-    {
-      label: 'after launch authority Promise settlement',
-      protocolFault: 'unknown-after-launch-settlement' as const,
-      mode: 'hang' as const,
-    },
-    {
-      label: 'while owned-process spawn is pending',
-      protocolFault: 'unknown-pending-spawn' as const,
-      mode: 'hang' as const,
-    },
-    ...(process.platform === 'win32'
-      ? [
-          {
-            label: 'while the Windows ownership handoff is pending',
-            protocolFault: 'unknown-pending-handoff' as const,
-            mode: 'hang' as const,
-          },
-        ]
-      : []),
-    {
-      label: 'after the handle exists but before ownership readiness',
-      protocolFault: 'unknown-before-ownership-ready' as const,
-      mode: 'hang' as const,
-      operationTimeoutMs: 10_000,
-      exitWaitMs: 20_000,
-      elapsedBoundMs: 20_000,
-      testTimeoutMs: 25_000,
-      requiresRoot: true,
-    },
-    {
-      label: 'after running begins',
-      protocolFault: 'unknown-running' as const,
-      mode: 'hang' as const,
-      operationTimeoutMs: 10_000,
-      exitWaitMs: 20_000,
-      elapsedBoundMs: 20_000,
-      testTimeoutMs: 25_000,
-      requiresRoot: true,
-    },
-    {
-      label: 'during cleanup',
-      protocolFault: 'unknown-cleaning' as const,
-      mode: 'success' as const,
-    },
-    {
-      label: 'after the terminal result',
-      protocolFault: 'unknown-after-terminal-result' as const,
-      mode: 'success' as const,
-    },
-  ])
-    it(
-      `fails once and converges immediately on an invalid message ${testCase.label}`,
-      async () => {
-        const port = await freePort();
-        const startedAt = Date.now();
-        const operationTimeoutMs =
-          'operationTimeoutMs' in testCase
-            ? testCase.operationTimeoutMs
-            : 5_000;
-        const exitWaitMs =
-          'exitWaitMs' in testCase ? testCase.exitWaitMs : 12_000;
-        const elapsedBoundMs =
-          'elapsedBoundMs' in testCase ? testCase.elapsedBoundMs : 12_000;
-        const controller = startPlaywrightController(port, {
-          mode: testCase.mode,
-          operationTimeoutMs,
-          protocolFault: testCase.protocolFault,
-        });
-        await waitForExit(controller.child, exitWaitMs);
-        const output = controller.output();
-        const ownerPid = phasePid(output, 'playwright-owner-spawned')!;
-        const rootPid = phasePid(output, 'playwright-spawned');
-        const descendantPid = phasePid(output, 'controller-fixture-ready');
-        const isLateFault = 'operationTimeoutMs' in testCase;
-
-        if ('requiresRoot' in testCase && testCase.requiresRoot)
-          expect(rootPid).toBeTypeOf('number');
-        if ('requiresReadiness' in testCase && testCase.requiresReadiness)
-          expect(descendantPid).toBeTypeOf('number');
-
-        expect(controller.child.exitCode).toBe(1);
-        expect(output).toContain(
-          'BBX_E2E_PHASE controller-protocol-fault-injected',
-        );
-        expect(output.match(/owner-protocol-failed/g)).toHaveLength(1);
-        expect(output).toContain(
-          'BBX_E2E_PHASE controller-watchdog-state expired=0',
-        );
-        if (isLateFault) {
-          expect(output).not.toContain(
-            'BBX_E2E_PHASE controller-operation-deadline',
-          );
-          expect(output).not.toContain('BBX_E2E_PHASE operation-timeout');
-          expect(output).not.toContain('BBX_E2E_PHASE outer-timeout');
-          expect(output.match(/playwright-owner-cleanup-start/g)).toHaveLength(
-            1,
-          );
-          expect(
-            output.match(/playwright-owner-cleanup-complete/g),
-          ).toHaveLength(1);
-          expect(
-            output.match(/owner-terminal-result-acknowledged/g),
-          ).toHaveLength(1);
-          expect(
-            output.indexOf('controller-protocol-fault-injected'),
-          ).toBeLessThan(output.indexOf('playwright-owner-cleanup-start'));
-          expect(
-            output.indexOf('playwright-owner-cleanup-complete'),
-          ).toBeLessThan(output.indexOf('owner-terminal-result-acknowledged'));
-        }
-        expect(Date.now() - startedAt).toBeLessThan(elapsedBoundMs);
-        await waitFor(
-          () =>
-            processAbsent(ownerPid) &&
-            (rootPid === undefined || processAbsent(rootPid)) &&
-            (descendantPid === undefined || processAbsent(descendantPid)),
-          'Invalid owner protocol left an owned process running.',
-          10_000,
-        );
-        expect(
-          await pathExists(controller.resourcePaths.get('playwright')!),
-        ).toBe(false);
-        expect(await portIsFree(port)).toBe(true);
-      },
-      'testTimeoutMs' in testCase ? testCase.testTimeoutMs : 20_000,
-    );
-
-  it('preserves protocol and pending-spawn failures in one terminal result', async () => {
-    const port = await freePort();
-    const controller = startPlaywrightController(port, {
-      mode: 'hang',
-      operationTimeoutMs: 5_000,
-      protocolFault: 'unknown-pending-spawn',
-      spawnFailure: true,
-    });
-    await waitForExit(controller.child, 12_000);
-    const output = controller.output();
-    expect(controller.child.exitCode).toBe(1);
-    expect(output.match(/playwright-owner-cleanup-start/g)).toHaveLength(1);
-    expect(output.match(/owner-terminal-result-sent/g)).toHaveLength(1);
-    expect(output).toContain(
-      'BBX_E2E_PHASE controller-terminal-result-received exit-code=1 cleanup-error-code=0 failure-count=2',
-    );
-    expect(output.match(/owner-protocol-failed/g)).toHaveLength(1);
-    expect(await pathExists(controller.resourcePaths.get('playwright')!)).toBe(
-      false,
-    );
-    expect(await portIsFree(port)).toBe(true);
-  }, 20_000);
-
-  it('starts stubborn-descendant cleanup at the operation deadline and finishes before the outer watchdog', async () => {
-    const port = await freePort();
-    const controller = startPlaywrightController(port, {
-      mode: 'stubborn-hang',
-      // The shortened operation window still includes real Windows Job setup.
-      operationTimeoutMs: 10_000,
-    });
-    await waitForExit(controller.child, 20_000);
-    const ownerPid = phasePid(controller.output(), 'playwright-owner-spawned')!;
-    const fixturePid = phasePid(controller.output(), 'playwright-spawned')!;
-    const descendantPid = phasePid(
-      controller.output(),
-      'controller-fixture-ready',
-    );
-    const supervisorPid = phasePid(
-      controller.output(),
-      'playwright-supervisor-spawned',
-    );
-    expectLinuxFixtureOwnership(controller.output(), ownerPid);
-    const outputPath = controller.resourcePaths.get('playwright')!;
-
-    expect(controller.child.exitCode).toBe(1);
-    expect(controller.output()).toContain(
-      'BBX_E2E_PHASE controller-ownership-authority-retained',
-    );
-    expect(controller.output()).toContain(
-      'BBX_E2E_PHASE controller-watchdog-state expired=0',
-    );
-    expect(controller.output()).toContain(
-      'BBX_E2E_PHASE controller-operation-deadline',
-    );
-    expect(controller.output()).toContain(
-      process.platform === 'linux'
-        ? 'BBX_E2E_PHASE controller-forced-group-cleanup'
-        : 'BBX_E2E_PHASE playwright-owner-forced-cleanup',
-    );
-    expect(controller.output()).toContain(
-      'BBX_E2E_PHASE operation-timeout exit-code=1',
-    );
-    expect(controller.output()).not.toContain('BBX_E2E_PHASE outer-timeout');
-    expect(
-      controller.output().indexOf('controller-operation-deadline'),
-    ).toBeLessThan(
-      controller.output().indexOf('playwright-owner-cleanup-start'),
-    );
-    expect(
-      controller.output().indexOf('owner-terminal-result-acknowledged'),
-    ).toBeLessThan(
-      controller.output().indexOf('operation-timeout exit-code=1'),
-    );
-    await waitFor(
-      () =>
-        processAbsent(ownerPid) &&
-        (supervisorPid === undefined || processAbsent(supervisorPid)) &&
-        (fixturePid === undefined || processAbsent(fixturePid)) &&
-        (descendantPid === undefined || processAbsent(descendantPid)),
-      () =>
-        `Watchdog cleanup did not remove every owned PID: owner=${processState(ownerPid)} supervisor=${supervisorPid === undefined ? 'not-started' : processState(supervisorPid)} root=${fixturePid === undefined ? 'not-started' : processState(fixturePid)} descendant=${descendantPid === undefined ? 'not-started' : processState(descendantPid)}.`,
-      10_000,
-    );
-    expect(await pathExists(outputPath)).toBe(false);
-    expect(await portIsFree(port)).toBe(true);
-  }, 25_000);
-
-  it('uses retained authority for top-level signal cleanup', async () => {
-    const port = await freePort();
-    const controller = startPlaywrightController(port);
-    await waitFor(
-      () => controller.output().includes('controller-fixture-ready'),
-      () => `Controller fixture did not become ready.\n${controller.output()}`,
-      10_000,
-    );
-    const ownerPid = phasePid(controller.output(), 'playwright-owner-spawned')!;
-    const rootPid = phasePid(controller.output(), 'playwright-spawned')!;
-    const descendantPid = phasePid(
-      controller.output(),
-      'controller-fixture-ready',
-    )!;
-    const outputPath = controller.resourcePaths.get('playwright')!;
-    if (process.platform === 'win32')
-      controller.child.send({
-        type: 'simulate-signal',
-        signal: 'SIGTERM',
-        version: 1,
-      });
-    else process.kill(controller.child.pid!, 'SIGTERM');
-    await waitForExit(controller.child, 15_000);
-    expect(controller.child.exitCode).toBe(143);
-    expect(controller.output()).toContain(
-      'BBX_E2E_PHASE controller-ownership-authority-retained',
-    );
-    await waitFor(
-      () =>
-        processAbsent(ownerPid) &&
-        processAbsent(rootPid) &&
-        processAbsent(descendantPid),
-      'Signal cleanup left an owned Playwright process.',
-      10_000,
-    );
-    expect(await pathExists(outputPath)).toBe(false);
-    expect(await portIsFree(port)).toBe(true);
-  }, 25_000);
-
-  it('cleans an externally terminated controller without touching a concurrent owner', async () => {
-    const originalNextEnvironment = await readFile(nextEnvironmentPath);
-    const firstPort = await freePort();
-    let secondPort = await freePort();
-    while (secondPort === firstPort) secondPort = await freePort();
-    const first = startPlaywrightController(firstPort);
-    const second = startPlaywrightController(secondPort);
-    await waitFor(
-      () =>
-        first.output().includes('BBX_E2E_PHASE controller-fixture-ready') &&
-        second.output().includes('BBX_E2E_PHASE controller-fixture-ready'),
-      `Controllers did not become ready.\n${first.output()}\n${second.output()}`,
-      10_000,
-    );
-    const firstOwner = phasePid(first.output(), 'playwright-owner-spawned')!;
-    const firstPlaywright = phasePid(first.output(), 'playwright-spawned')!;
-    const firstDescendant = phasePid(
-      first.output(),
-      'controller-fixture-ready',
-    )!;
-    const firstGuardian = phasePid(
-      first.output(),
-      'windows-layer-job-guardian-ready',
-    );
-    const secondOwner = phasePid(second.output(), 'playwright-owner-spawned')!;
-    const secondOutputPath = second.resourcePaths.get('playwright')!;
-    const firstOutputPath = first.resourcePaths.get('playwright')!;
-    expectLinuxFixtureOwnership(first.output(), firstOwner);
-    expectLinuxFixtureOwnership(second.output(), secondOwner);
-    expect(await pathExists(firstOutputPath)).toBe(true);
-    expect(await pathExists(secondOutputPath)).toBe(true);
-
-    expect(first.child.kill('SIGKILL')).toBe(true);
-    await waitForExit(first.child);
-    await waitFor(
-      () =>
-        processAbsent(firstOwner) &&
-        processAbsent(firstPlaywright) &&
-        processAbsent(firstDescendant),
-      () =>
-        `The surviving owner did not clean the terminated controller tree: owner=${processState(firstOwner)} root=${processState(firstPlaywright)} descendant=${processState(firstDescendant)}.`,
-      10_000,
-    );
-    await waitFor(
-      () => !processAbsent(secondOwner),
-      'The concurrent owner was unexpectedly terminated.',
-    );
-    await waitFor(
-      () => !processAbsent(phasePid(second.output(), 'playwright-spawned')!),
-      'The concurrent Playwright fixture was unexpectedly terminated.',
-    );
-    await waitFor(
-      () =>
-        !processAbsent(phasePid(second.output(), 'controller-fixture-ready')!),
-      'The concurrent descendant was unexpectedly terminated.',
-    );
-    if (firstGuardian !== undefined)
-      await waitFor(
-        () => processAbsent(firstGuardian),
-        'The surviving owner guardian did not converge.',
-        10_000,
-      );
-    expect(await pathExists(secondOutputPath)).toBe(true);
-    await waitForAsync(
-      () => portIsFree(firstPort),
-      'Externally terminated controller listener did not converge to absence.',
-      10_000,
-    );
-    expect(await portIsFree(secondPort)).toBe(false);
-    expect(await readFile(nextEnvironmentPath)).toEqual(
-      originalNextEnvironment,
-    );
-
-    second.child.send({ type: 'shutdown', version: 1 });
-    await waitForExit(second.child, 15_000);
-    expect(await pathExists(secondOutputPath)).toBe(false);
-    expect(await portIsFree(secondPort)).toBe(true);
-    expect(await readFile(nextEnvironmentPath)).toEqual(
-      originalNextEnvironment,
-    );
-  }, 30_000);
-
-  vitestIt.skipIf(process.platform !== 'win32')(
-    'cleans an owner-declared output when the controller dies before Playwright authority acceptance',
-    () =>
-      runWithExactCleanup(async () => {
-        const port = await freePort();
-        const controller = startPlaywrightController(port, {
-          preventPlaywrightAuthorityAcceptance: true,
-        });
-        const outputPath = controller.resourcePaths.get('playwright')!;
-        await waitForAsync(
-          async () =>
-            controller.resources.has('playwright-owner') &&
-            !controller.resources.has('playwright') &&
-            controller.resourceRegistry.state('playwright') === 'planned' &&
-            (controller.output().match(/controller-upper-authority-requested/g)
-              ?.length ?? 0) >= 2 &&
-            (await pathExists(outputPath)),
-          'Partial Windows ownership handoff did not reach the test boundary.',
-          10_000,
-        );
-        const owner = controller.resourceOwnerships.get('playwright-owner');
-        if (owner === undefined)
-          throw new Error('Playwright owner authority was not retained.');
-        expect(owner.ownedPaths).toEqual([outputPath]);
-        expect(await pathExists(owner.entry.metadataDirectory)).toBe(true);
-        expect(controller.resourceRegistry.state('playwright-owner')).toBe(
-          'accepted',
-        );
-        const ownerProcessId = phasePid(
-          controller.output(),
-          'playwright-owner-spawned',
-        )!;
-        const reachedProcessIds = [
-          ownerProcessId,
-          phasePid(controller.output(), 'playwright-supervisor-spawned'),
-          phasePid(controller.output(), 'playwright-spawned'),
-          phasePid(controller.output(), 'controller-fixture-ready'),
-        ].filter((processId): processId is number => processId !== undefined);
-
-        expect(controller.child.kill('SIGKILL')).toBe(true);
-        await waitForExit(controller.child, 10_000);
-        await cleanupActiveControllers();
-
-        expect(reachedProcessIds.every(processAbsent)).toBe(true);
-        expect(await portIsFree(port)).toBe(true);
-        expect(await pathExists(owner.entry.metadataDirectory)).toBe(false);
-        expect(await pathExists(outputPath)).toBe(false);
-        expect(controller.resourceRegistry.state('playwright-owner')).toBe(
-          'completed',
-        );
-        expect(controller.resourceRegistry.state('playwright')).toBe('planned');
-        expect(active.has(controller)).toBe(false);
-        await cleanupActiveControllers();
-        expect(active.has(controller)).toBe(false);
-      }, cleanupActiveControllers),
-    25_000,
-  );
-
-  it('converges exact ownership when the controller dies during cleanup', async () => {
-    const port = await freePort();
-    const controller = startPlaywrightController(port, {
-      mode: 'stubborn-hang',
-      operationTimeoutMs: 10_000,
-    });
-    await waitFor(
-      () =>
-        controller
-          .output()
-          .includes('BBX_E2E_PHASE playwright-owner-cleanup-start'),
-      () => `Controller cleanup did not begin.\n${controller.output()}`,
-      15_000,
-    );
-    const owner = phasePid(controller.output(), 'playwright-owner-spawned')!;
-    const root = phasePid(controller.output(), 'playwright-spawned')!;
-    const descendant = phasePid(
-      controller.output(),
-      'controller-fixture-ready',
-    )!;
-    expect(controller.child.kill('SIGKILL')).toBe(true);
-    await waitForExit(controller.child, 10_000);
-    await waitFor(
-      () => [owner, root, descendant].every(processAbsent),
-      'Controller death during cleanup left an owned process.',
-      12_000,
-    );
-    expect(await portIsFree(port)).toBe(true);
-    await cleanupActiveControllers();
-    expect(await pathExists(controller.resourcePaths.get('playwright')!)).toBe(
-      false,
-    );
-  }, 35_000);
-
-  it('reclaims an exact failed-assertion tree without touching its concurrent tree', async () => {
-    const failedPort = await freePort();
-    let survivingPort = await freePort();
-    while (survivingPort === failedPort) survivingPort = await freePort();
-    const failed = startPlaywrightController(failedPort);
-    const surviving = startPlaywrightController(survivingPort, {
-      registered: false,
-    });
-    try {
-      await waitFor(
-        () =>
-          failed.output().includes('controller-fixture-ready') &&
-          surviving.output().includes('controller-fixture-ready'),
-        'Assertion-failure fixtures did not become ready.',
-        10_000,
-      );
-      const failedOwner = phasePid(
-        failed.output(),
-        'playwright-owner-spawned',
-      )!;
-      const failedRoot = phasePid(failed.output(), 'playwright-spawned')!;
-      const failedDescendant = phasePid(
-        failed.output(),
-        'controller-fixture-ready',
-      )!;
-      const failedGuardians = phasePids(
-        failed.output(),
-        'windows-layer-job-guardian-ready',
-      );
-      const survivingRoot = phasePid(surviving.output(), 'playwright-spawned')!;
-      const failedOutput = failed.resourcePaths.get('playwright')!;
-
-      await expect(
-        runWithExactCleanup(async () => {
-          expect(failed.child.kill('SIGKILL')).toBe(true);
-          await waitForExit(failed.child);
-          expect('early assertion').toBe('deliberate failure');
-        }, cleanupActiveControllers),
-      ).rejects.toThrow();
-      expect(processAbsent(failed.child.pid!)).toBe(true);
-      expect(processAbsent(failedOwner)).toBe(true);
-      expect(processAbsent(failedRoot)).toBe(true);
-      expect(processAbsent(failedDescendant)).toBe(true);
-      expect(failedGuardians.every(processAbsent)).toBe(true);
-      expect(await pathExists(failedOutput)).toBe(false);
-      expect(await portIsFree(failedPort)).toBe(true);
-      expect(processAbsent(survivingRoot)).toBe(false);
-      expect(await portIsFree(survivingPort)).toBe(false);
-    } finally {
-      await stopController(surviving.child);
-    }
-  }, 30_000);
+    expect(result).not.toHaveProperty('descendantCleanupSucceeded');
+  });
 });
-
-describe.skipIf(process.platform !== 'linux')(
-  'Linux upper-layer launch authority',
-  () => {
-    for (const testCase of [
-      {
-        label: 'before ownership acknowledgement',
-        phase: 'server-upper-authority-requested',
-        authorityAckDelayMs: 1_500,
-        childExpected: false,
-      },
-      {
-        label: 'immediately after child spawn',
-        phase: 'application-spawned',
-        authorityAckDelayMs: 0,
-        childExpected: true,
-      },
-      {
-        label: 'immediately after authority retention',
-        phase: 'application-ownership-authority-retained',
-        authorityAckDelayMs: 0,
-        childExpected: false,
-      },
-      {
-        label: 'after readiness',
-        phase: 'proxy-ready',
-        authorityAckDelayMs: 0,
-        childExpected: true,
-      },
-    ]) {
-      it(`converges the exact group when the worker dies ${testCase.label}`, async () => {
-        const appPort = await freePort();
-        const proxyPort = await freePort();
-        const controller = startController('ready', appPort, proxyPort, {
-          authorityAckDelayMs: testCase.authorityAckDelayMs,
-        });
-        await waitFor(
-          () => controller.output().includes(`BBX_E2E_PHASE ${testCase.phase}`),
-          () =>
-            `Worker did not reach ${testCase.phase}.\n${controller.output()}`,
-          10_000,
-        );
-        const workerPid = phasePid(
-          controller.output(),
-          'server-worker-spawned',
-        )!;
-        expect(process.kill(workerPid, 'SIGKILL')).toBe(true);
-        await waitForExit(controller.child, 15_000);
-        const applicationPids = phasePids(
-          controller.output(),
-          'application-spawned',
-        );
-        if (testCase.childExpected)
-          expect(applicationPids.length).toBeGreaterThan(0);
-        if (testCase.authorityAckDelayMs > 0)
-          expect(applicationPids).toHaveLength(0);
-        const descendantPids = phasePids(
-          controller.output(),
-          'controller-fixture-ready',
-        );
-        await waitFor(
-          () =>
-            processAbsent(workerPid) &&
-            [...applicationPids, ...descendantPids].every(processAbsent),
-          'Upper-layer authority did not converge the exact server group.',
-          10_000,
-        );
-        expect(await portIsFree(appPort)).toBe(true);
-        expect(await portIsFree(proxyPort)).toBe(true);
-        expect(
-          await pathExists(controller.resourcePaths.get('server-application')!),
-        ).toBe(false);
-      }, 25_000);
-    }
-
-    for (const testCase of [
-      {
-        label: 'before ownership acknowledgement',
-        phase: 'controller-upper-authority-requested',
-        authorityAckDelayMs: 1_500,
-        childExpected: false,
-      },
-      {
-        label: 'immediately after child spawn',
-        phase: 'playwright-spawned',
-        authorityAckDelayMs: 0,
-        childExpected: true,
-      },
-      {
-        label: 'immediately after authority retention',
-        phase: 'controller-ownership-authority-retained',
-        authorityAckDelayMs: 0,
-        childExpected: false,
-      },
-      {
-        label: 'after readiness',
-        phase: 'controller-fixture-ready',
-        authorityAckDelayMs: 0,
-        childExpected: true,
-      },
-    ]) {
-      it(`converges the exact group when the owner dies ${testCase.label}`, async () => {
-        const { phase, authorityAckDelayMs, childExpected } = testCase;
-        const port = await freePort();
-        const controller = startPlaywrightController(port, {
-          authorityAckDelayMs,
-        });
-        await waitFor(
-          () => controller.output().includes(`BBX_E2E_PHASE ${phase}`),
-          () => `Owner did not reach ${phase}.\n${controller.output()}`,
-          10_000,
-        );
-        const ownerPid = phasePid(
-          controller.output(),
-          'playwright-owner-spawned',
-        )!;
-        expect(process.kill(ownerPid, 'SIGKILL')).toBe(true);
-        await waitForExit(controller.child, 15_000);
-        const childPids = phasePids(controller.output(), 'playwright-spawned');
-        if (childExpected) expect(childPids.length).toBeGreaterThan(0);
-        if (authorityAckDelayMs > 0) expect(childPids).toHaveLength(0);
-        const descendantPids = phasePids(
-          controller.output(),
-          'controller-fixture-ready',
-        );
-        await waitFor(
-          () =>
-            processAbsent(ownerPid) &&
-            [...childPids, ...descendantPids].every(processAbsent),
-          'Upper-layer authority did not converge the exact Linux group.',
-          10_000,
-        );
-        expect(await portIsFree(port)).toBe(true);
-        expect(
-          await pathExists(controller.resourcePaths.get('playwright')!),
-        ).toBe(false);
-      }, 25_000);
-    }
-  },
-);
-
-describe.skipIf(process.platform !== 'linux')(
-  'Linux standard-command guardian convergence',
-  () => {
-    async function stopStandardController(
-      controller: ReturnType<typeof startLinuxStandardPlaywrightController>,
-    ) {
-      if (
-        controller.child.exitCode === null &&
-        controller.child.signalCode === null
-      )
-        controller.child.kill('SIGTERM');
-      await waitForExit(controller.child, 15_000);
-    }
-
-    async function assertGuardianFailover(
-      controller:
-        | ReturnType<typeof startLinuxStandardPlaywrightController>
-        | ReturnType<typeof startLinuxActualTopologyController>,
-      phase: string,
-      timeoutMs = 10_000,
-    ) {
-      const survivorPort = await freePort();
-      const survivor = startLinuxStandardPlaywrightController(survivorPort, {
-        mode: 'stubborn-hang',
-        operationTimeoutMs: 10_000,
-      });
-      try {
-        await waitFor(
-          () => survivor.output().includes('controller-fixture-ready'),
-          () =>
-            `Concurrent Linux controller was not ready.\n${survivor.output()}`,
-          4_000,
-        );
-        await waitFor(
-          () => controller.output().includes(`BBX_E2E_PHASE ${phase}`),
-          () =>
-            `Guardian-loss boundary ${phase} was not reached.\n${controller.output()}`,
-          timeoutMs,
-        );
-        const guardianProcessId = phasePid(
-          controller.output(),
-          'linux-group-guardian-ready',
-        )!;
-        const survivorRoot = phasePid(survivor.output(), 'playwright-spawned')!;
-        expect(process.kill(guardianProcessId, 'SIGKILL')).toBe(true);
-        await waitForExit(controller.child, 12_000);
-        expect(controller.child.exitCode).not.toBe(0);
-        const output = controller.output();
-        const absence = output.indexOf(
-          'BBX_E2E_PHASE linux-controller-guardian-absence-confirmed',
-        );
-        const fallback = output.indexOf(
-          'BBX_E2E_PHASE linux-controller-supervisor-fallback-cleanup-start',
-        );
-        const completionStart = output.indexOf(
-          'BBX_E2E_PHASE linux-controller-supervisor-registry-completion-start',
-        );
-        const completionComplete = output.indexOf(
-          'BBX_E2E_PHASE linux-controller-supervisor-registry-completion-complete',
-        );
-        const converged = output.indexOf(
-          'BBX_E2E_PHASE linux-controller-supervisor-signal-converged',
-        );
-        expect(absence).toBeGreaterThanOrEqual(0);
-        expect(completionStart).toBeGreaterThanOrEqual(0);
-        expect(fallback).toBeGreaterThan(absence);
-        expect(fallback).toBeGreaterThan(completionStart);
-        expect(completionComplete).toBeGreaterThan(fallback);
-        expect(converged).toBeGreaterThan(completionComplete);
-        expect(
-          output.match(/linux-controller-supervisor-fallback-cleanup-start/g),
-        ).toHaveLength(1);
-        expect(
-          output.match(
-            /linux-controller-supervisor-fallback-cleanup-complete/g,
-          ),
-        ).toHaveLength(1);
-        const ownedProcessIds = [
-          guardianProcessId,
-          phasePid(output, 'controller-start'),
-          phasePid(output, 'playwright-owner-spawned'),
-          phasePid(output, 'playwright-spawned'),
-          phasePid(output, 'server-controller-start'),
-          phasePid(output, 'server-worker-spawned'),
-          phasePid(output, 'application-spawned'),
-          phasePid(output, 'controller-fixture-ready'),
-        ].filter((value): value is number => value !== undefined);
-        await waitFor(
-          () => ownedProcessIds.every(processAbsent),
-          () => `Guardian failover left an owned process.\n${output}`,
-          8_000,
-        );
-        for (const port of controller.ports)
-          expect(await portIsFree(port)).toBe(true);
-        expect(await pathExists(controller.outputPath)).toBe(false);
-        expect(processAbsent(survivorRoot)).toBe(false);
-        expect(await portIsFree(survivorPort)).toBe(false);
-      } finally {
-        await stopStandardController(controller);
-        await stopStandardController(survivor);
-      }
-    }
-
-    vitestIt(
-      'does not start guardian cleanup before a shortened operation deadline',
-      async () => {
-        const port = await freePort();
-        const startedAt = Date.now();
-        const controller = startLinuxStandardPlaywrightController(port, {
-          mode: 'stubborn-hang',
-          operationTimeoutMs: 5_000,
-        });
-        try {
-          await waitFor(
-            () => controller.output().includes('controller-fixture-ready'),
-            () => `Linux fixture did not become ready.\n${controller.output()}`,
-            2_000,
-          );
-          await new Promise((resolveBoundary) =>
-            setTimeout(
-              resolveBoundary,
-              Math.max(0, startedAt + 4_000 - Date.now()),
-            ),
-          );
-          expect(controller.output()).not.toContain(
-            'linux-controller-guardian-cleanup-start',
-          );
-          await waitForExit(controller.child, 12_000);
-          expect(Date.now() - startedAt).toBeGreaterThanOrEqual(4_900);
-          expect(controller.child.exitCode).toBe(1);
-        } finally {
-          await stopStandardController(controller);
-        }
-      },
-      20_000,
-    );
-
-    vitestIt(
-      'owns the actual Playwright and web-server process chain in one Linux group',
-      async () => {
-        const proxyPort = await freePort();
-        const appPort = await freePort();
-        const controller = startLinuxActualTopologyController(
-          proxyPort,
-          appPort,
-        );
-        try {
-          await waitFor(
-            () =>
-              controller.output().includes('BBX_E2E_PHASE proxy-ready') &&
-              controller
-                .output()
-                .includes('BBX_E2E_PHASE server-controller-start'),
-            () =>
-              `Actual Playwright topology did not become ready.\n${controller.output()}`,
-            9_000,
-          );
-          const output = controller.output();
-          const phaseProcessIds = [
-            phasePid(output, 'controller-start'),
-            phasePid(output, 'playwright-owner-spawned'),
-            phasePid(output, 'playwright-spawned'),
-            phasePid(output, 'server-controller-start'),
-            phasePid(output, 'server-worker-spawned'),
-            phasePid(output, 'application-spawned'),
-          ].filter((value): value is number => value !== undefined);
-          expect(phaseProcessIds).toHaveLength(6);
-          const innerController = phaseProcessIds[0];
-          if (innerController === undefined)
-            throw new Error('Inner controller identity was not captured.');
-          const controllerIdentity = readLinuxProcessIdentity(innerController)!;
-          expect(controllerIdentity.processGroupId).toBe(innerController);
-          expect(controllerIdentity.sessionId).toBe(innerController);
-          const ownershipToken = await linuxOwnershipToken(innerController);
-          const serverController = phasePid(output, 'server-controller-start')!;
-          const serverIdentity = readLinuxProcessIdentity(serverController)!;
-          const webServerShell = serverIdentity.parentProcessId;
-          expect(webServerShell).not.toBe(
-            phasePid(output, 'playwright-spawned'),
-          );
-          const knownProcessIds = [...phaseProcessIds, webServerShell];
-          expect(new Set(knownProcessIds).size).toBe(7);
-          for (const processId of knownProcessIds) {
-            const identity = readLinuxProcessIdentity(processId)!;
-            expect(identity.processGroupId).toBe(
-              controllerIdentity.processGroupId,
-            );
-            expect(identity.sessionId).toBe(controllerIdentity.sessionId);
-            expect(await linuxOwnershipToken(processId)).toBe(ownershipToken);
-          }
-          let browserProcessIds: number[] = [];
-          await waitForAsync(
-            async () => {
-              const candidates = await linuxGroupProcessIds(
-                controllerIdentity.processGroupId,
-              );
-              browserProcessIds = [];
-              for (const processId of candidates)
-                if (
-                  /(?:chrome|chromium)/i.test(await linuxCommandLine(processId))
-                )
-                  browserProcessIds.push(processId);
-              return (
-                browserProcessIds.length > 1 &&
-                browserProcessIds.some((processId) =>
-                  browserProcessIds.includes(
-                    readLinuxProcessIdentity(processId)?.parentProcessId ?? -1,
-                  ),
-                )
-              );
-            },
-            'Chromium and a descendant did not join the guardian-owned Linux group.',
-            8_000,
-          );
-          const groupMembers = await linuxGroupProcessIds(
-            controllerIdentity.processGroupId,
-          );
-          expect(groupMembers.length).toBeGreaterThan(knownProcessIds.length);
-          for (const browserProcessId of browserProcessIds) {
-            const browserIdentity = readLinuxProcessIdentity(browserProcessId)!;
-            expect(browserIdentity.processGroupId).toBe(
-              controllerIdentity.processGroupId,
-            );
-            expect(browserIdentity.sessionId).toBe(
-              controllerIdentity.sessionId,
-            );
-            expect(await linuxOwnershipToken(browserProcessId)).toBe(
-              ownershipToken,
-            );
-          }
-
-          await waitForExit(controller.child, 20_000);
-          expect(controller.child.exitCode).toBe(1);
-          const guardianProcessId = phasePid(
-            controller.output(),
-            'linux-group-guardian-ready',
-          )!;
-          expect(
-            controller.output().match(/linux-group-guardian-cleanup-start/g),
-          ).toHaveLength(1);
-          expect(
-            controller.output().match(/linux-group-guardian-forced-cleanup/g),
-          ).toHaveLength(1);
-          await waitFor(
-            () =>
-              processAbsent(guardianProcessId) &&
-              groupMembers.every(processAbsent),
-            'Actual Playwright topology left a Linux group member.',
-            10_000,
-          );
-          expect(await portIsFree(proxyPort)).toBe(true);
-          expect(await portIsFree(appPort)).toBe(true);
-          expect(await pathExists(controller.outputPath)).toBe(false);
-        } finally {
-          await stopStandardController(controller);
-        }
-      },
-      30_000,
-    );
-
-    for (const guardianLoss of [
-      {
-        label: 'immediately after guardian arming',
-        phase: 'linux-supervisor-before-armed-ack',
-        bootstrapPause: 'before-armed-ack' as const,
-      },
-      {
-        label: 'after inner controller authorization',
-        phase: 'linux-group-guardian-controller-authorized',
-      },
-      {
-        label: 'after Playwright launch',
-        phase: 'playwright-spawned',
-      },
-      {
-        label: 'while guardian cleanup is active',
-        phase: 'linux-group-guardian-cleanup-start',
-        operationTimeoutMs: 5_000,
-      },
-      {
-        label: 'after terminal result and before acknowledgement',
-        phase: 'linux-supervisor-after-terminal-result',
-        operationTimeoutMs: 5_000,
-        bootstrapPause: 'after-terminal-result' as const,
-      },
-    ])
-      vitestIt(
-        `transfers exclusive cleanup authority ${guardianLoss.label}`,
-        async () => {
-          const port = await freePort();
-          const controller = startLinuxStandardPlaywrightController(port, {
-            mode: 'stubborn-hang',
-            operationTimeoutMs: guardianLoss.operationTimeoutMs ?? 10_000,
-            ...(guardianLoss.bootstrapPause === undefined
-              ? {}
-              : { bootstrapPause: guardianLoss.bootstrapPause }),
-          });
-          await assertGuardianFailover(controller, guardianLoss.phase);
-        },
-        30_000,
-      );
-
-    vitestIt(
-      'transfers cleanup authority after real web server and Chromium launch',
-      async () => {
-        const proxyPort = await freePort();
-        const appPort = await freePort();
-        const controller = startLinuxActualTopologyController(
-          proxyPort,
-          appPort,
-        );
-        await waitForAsync(
-          async () => {
-            const innerController = phasePid(
-              controller.output(),
-              'controller-start',
-            );
-            if (innerController === undefined) return false;
-            const identity = readLinuxProcessIdentity(innerController);
-            if (identity === undefined) return false;
-            for (const processId of await linuxGroupProcessIds(
-              identity.processGroupId,
-            ))
-              if (
-                /(?:chrome|chromium)/i.test(await linuxCommandLine(processId))
-              )
-                return controller
-                  .output()
-                  .includes('BBX_E2E_PHASE proxy-ready');
-            return false;
-          },
-          'Real server and Chromium did not reach the guardian-loss boundary.',
-          9_000,
-        );
-        await assertGuardianFailover(controller, 'proxy-ready');
-      },
-      35_000,
-    );
-
-    for (const boundary of [
-      {
-        label: 'before guardian configuration',
-        pause: 'before-configuration' as const,
-        phase: 'linux-supervisor-before-configuration',
-      },
-      {
-        label: 'during controller creation',
-        pause: 'during-controller-creation' as const,
-        phase: 'linux-group-guardian-controller-creation-start',
-      },
-      {
-        label: 'after controller creation but before armed acknowledgement',
-        pause: 'before-armed-ack' as const,
-        phase: 'linux-supervisor-before-armed-ack',
-      },
-      {
-        label: 'immediately after armed',
-        phase: 'linux-group-guardian-controller-authorized',
-      },
-      {
-        label: 'after descendant launch',
-        phase: 'controller-fixture-ready',
-      },
-    ])
-      vitestIt(
-        `converges when the supervisor dies ${boundary.label}`,
-        async () => {
-          const port = await freePort();
-          const controller = startLinuxStandardPlaywrightController(port, {
-            mode: 'stubborn-hang',
-            operationTimeoutMs: 10_000,
-            ...('pause' in boundary ? { bootstrapPause: boundary.pause } : {}),
-          });
-          await waitFor(
-            () => controller.output().includes(boundary.phase),
-            () =>
-              `Linux bootstrap boundary was not reached.\n${controller.output()}`,
-            8_000,
-          );
-          if ('pause' in boundary)
-            expect(controller.output()).not.toContain(
-              'BBX_E2E_PHASE playwright-owner-spawned',
-            );
-          expect(controller.child.kill('SIGKILL')).toBe(true);
-          await waitForExit(controller.child, 5_000);
-          await waitFor(
-            () => {
-              const output = controller.output();
-              const processIds = [
-                phasePid(output, 'linux-group-guardian-ready'),
-                phasePid(output, 'controller-start'),
-                phasePid(output, 'playwright-owner-spawned'),
-                phasePid(output, 'playwright-spawned'),
-                phasePid(output, 'controller-fixture-ready'),
-              ].filter((value): value is number => value !== undefined);
-              return processIds.every(processAbsent);
-            },
-            `Supervisor death left a Linux guardian resource.\n${controller.output()}`,
-            12_000,
-          );
-          expect(await portIsFree(port)).toBe(true);
-          expect(await pathExists(controller.outputPath)).toBe(false);
-        },
-        25_000,
-      );
-
-    vitestIt(
-      'uses one upper TERM/KILL sequence for a hung owner and resistant descendant',
-      async () => {
-        const port = await freePort();
-        const controller = startLinuxStandardPlaywrightController(port);
-        try {
-          await waitForExit(controller.child, 15_000);
-          const output = controller.output();
-          const groupGuardian = phasePid(output, 'linux-group-guardian-ready')!;
-          const innerController = phasePid(output, 'controller-start')!;
-          const owner = phasePid(output, 'playwright-owner-spawned')!;
-          const root = phasePid(output, 'playwright-spawned')!;
-          const descendant = phasePid(output, 'controller-fixture-ready')!;
-          expect(controller.child.exitCode).toBe(1);
-          expect(output).toContain(
-            'BBX_E2E_PHASE linux-controller-guardian-authority-retained',
-          );
-          expect(output).toContain(
-            'BBX_E2E_PHASE linux-controller-guardian-operation-deadline',
-          );
-          expect(output).toContain(
-            'BBX_E2E_PHASE linux-controller-guardian-cleanup-complete failure-count=0 exit-code=1',
-          );
-          const completionComplete = output.indexOf(
-            'BBX_E2E_PHASE linux-controller-guardian-registry-completion-complete',
-          );
-          const converged = output.indexOf(
-            'BBX_E2E_PHASE linux-controller-guardian-signal-converged',
-          );
-          expect(completionComplete).toBeGreaterThanOrEqual(0);
-          expect(converged).toBeGreaterThan(completionComplete);
-          expect(output).not.toContain(
-            'linux-controller-supervisor-registry-completion-start',
-          );
-          expect(
-            output.match(/linux-controller-guardian-cleanup-start/g),
-          ).toHaveLength(1);
-          await waitFor(
-            () =>
-              [groupGuardian, innerController, owner, root, descendant].every(
-                processAbsent,
-              ),
-            'The standard Linux command left an owned process group.',
-            10_000,
-          );
-          expect(await portIsFree(port)).toBe(true);
-          expect(await pathExists(controller.outputPath)).toBe(false);
-        } finally {
-          await stopStandardController(controller);
-        }
-      },
-      25_000,
-    );
-
-    vitestIt(
-      'retains cleanup authority when the inner controller dies during cleanup',
-      async () => {
-        const port = await freePort();
-        const controller = startLinuxStandardPlaywrightController(port);
-        try {
-          await waitFor(
-            () =>
-              controller
-                .output()
-                .includes('linux-controller-guardian-cleanup-start'),
-            () =>
-              `Linux guardian did not begin cleanup.\n${controller.output()}`,
-            10_000,
-          );
-          const innerController = phasePid(
-            controller.output(),
-            'controller-start',
-          )!;
-          const groupGuardian = phasePid(
-            controller.output(),
-            'linux-group-guardian-ready',
-          )!;
-          const owner = phasePid(
-            controller.output(),
-            'playwright-owner-spawned',
-          )!;
-          const root = phasePid(controller.output(), 'playwright-spawned')!;
-          const descendant = phasePid(
-            controller.output(),
-            'controller-fixture-ready',
-          )!;
-          try {
-            process.kill(innerController, 'SIGKILL');
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error;
-          }
-          await waitForExit(controller.child, 15_000);
-          expect(controller.child.exitCode).toBe(1);
-          expect(controller.output()).toContain(
-            'BBX_E2E_PHASE linux-controller-guardian-cleanup-complete failure-count=0 exit-code=1',
-          );
-          await waitFor(
-            () =>
-              [groupGuardian, innerController, owner, root, descendant].every(
-                processAbsent,
-              ),
-            'The guardian did not converge after inner controller death.',
-            10_000,
-          );
-          expect(await portIsFree(port)).toBe(true);
-          expect(await pathExists(controller.outputPath)).toBe(false);
-        } finally {
-          await stopStandardController(controller);
-        }
-      },
-      25_000,
-    );
-
-    vitestIt(
-      'recognizes and cleans an uninstrumented descendant after its root exits',
-      async () => {
-        const port = await freePort();
-        const controller = startLinuxStandardPlaywrightController(port, {
-          mode: 'uninstrumented-root-exit',
-        });
-        try {
-          await waitForExit(controller.child, 15_000);
-          const root = phasePid(controller.output(), 'playwright-spawned')!;
-          const descendant = phasePid(
-            controller.output(),
-            'controller-fixture-ready',
-          )!;
-          expect(controller.child.exitCode).toBe(0);
-          await waitFor(
-            () => processAbsent(root) && processAbsent(descendant),
-            'The standard guardian left an uninstrumented descendant.',
-            10_000,
-          );
-          expect(await portIsFree(port)).toBe(true);
-          expect(await pathExists(controller.outputPath)).toBe(false);
-        } finally {
-          await stopStandardController(controller);
-        }
-      },
-      25_000,
-    );
-  },
-);

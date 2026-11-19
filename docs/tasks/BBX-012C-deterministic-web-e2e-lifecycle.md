@@ -1,6 +1,6 @@
 # BBX-012C: Deterministic Web E2E Lifecycle
 
-- **Status:** Approved
+- **Status:** Done
 - **Owner:** Implementation Chat
 - **Review:** Review Chat
 - **Depends on:** BBX-012B is Done; the Option R/product recovery state remains
