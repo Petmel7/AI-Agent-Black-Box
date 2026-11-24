@@ -16,6 +16,7 @@
     "@blackbox/artifact-storage": "workspace:*",
     "@blackbox/contracts": "workspace:*",
     "@blackbox/database": "workspace:*",
+    "@blackbox/export": "workspace:*",
     "next": "16.3.5",
     "react": "19.3.0",
     "react-dom": "19.3.0"

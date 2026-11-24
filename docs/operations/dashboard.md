@@ -2,7 +2,8 @@
 
 BBX-012A establishes the read-only application boundary and BBX-012B presents
 that boundary as an authenticated run list, evidence-rich run detail, and exact
-evidence view. Neither slice adds replay, evidence mutation, export, or public
+evidence view. BBX-013A adds one authenticated, metadata-only Export V1 download
+from run detail. None of these slices adds replay, evidence mutation, or public
 artifact access.
 
 ## Configuration and startup
@@ -122,5 +123,7 @@ repository, count, or provider body. Repository UUID is the display fallback.
 ## Deliberately unavailable
 
 There are no unrestricted or browser-direct artifact downloads, signed URLs,
-replay controls, writes, exports, notifications, accounts, RBAC, SSO, policy,
-LLM calls, GitHub/PR integration, or public evidence endpoints.
+replay controls, writes, persistent export jobs or stored export objects,
+notifications, accounts, RBAC, SSO, policy, LLM calls, GitHub/PR integration,
+or public evidence endpoints. See [Evidence Export V1](./evidence-export.md) for
+the bounded private download contract and operating guidance.

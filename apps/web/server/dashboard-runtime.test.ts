@@ -84,6 +84,11 @@ const queryMocks = vi.hoisted(() => ({
       return null;
     },
   ),
+  exportSnapshot: vi.fn(async (client: unknown, input: unknown) => {
+    void client;
+    void input;
+    return null;
+  }),
 }));
 
 vi.mock('@blackbox/database', async (importOriginal) => ({
@@ -96,6 +101,7 @@ vi.mock('@blackbox/database', async (importOriginal) => ({
   listSummaryClaims: queryMocks.listClaims,
   listSummarySupports: queryMocks.listSupports,
   resolveDashboardEvidence: queryMocks.resolveEvidence,
+  getEvidenceExportSnapshot: queryMocks.exportSnapshot,
 }));
 
 import type { DashboardServerConfig } from './dashboard-config';
@@ -123,6 +129,35 @@ const config: DashboardServerConfig = {
 };
 
 describe('dashboard runtime lifecycle', () => {
+  it('injects the configured tenant into export snapshot reads', async () => {
+    queryMocks.exportSnapshot.mockClear();
+    const database = {
+      client: {},
+      dispose: vi.fn(async () => undefined),
+    } as unknown as DatabaseClientHandle;
+    const artifactReader = {
+      open: vi.fn(),
+    } as unknown as ArtifactObjectReader;
+    const runtime = createDashboardRuntime({
+      config,
+      database,
+      artifactReader,
+    });
+
+    await expect(
+      runtime.exportRun({
+        repositoryId: '22222222-2222-4222-8222-222222222222',
+        canonicalRunId: '33333333-3333-4333-8333-333333333333',
+      }),
+    ).resolves.toBeNull();
+    expect(queryMocks.exportSnapshot).toHaveBeenCalledWith(database.client, {
+      organizationId: config.organizationId,
+      repositoryId: '22222222-2222-4222-8222-222222222222',
+      canonicalRunId: '33333333-3333-4333-8333-333333333333',
+    });
+    await runtime.dispose();
+  });
+
   it('deterministically disposes the owned database handle once', async () => {
     const dispose = vi.fn(async () => undefined);
     const database = {

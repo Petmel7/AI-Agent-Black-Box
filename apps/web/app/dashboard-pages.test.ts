@@ -47,6 +47,10 @@ import EvidencePage, {
   dynamic as evidenceDynamic,
   fetchCache as evidenceFetchCache,
 } from './repositories/[repositoryId]/runs/[runId]/evidence/page';
+import {
+  dynamic as exportDynamic,
+  fetchCache as exportFetchCache,
+} from './repositories/[repositoryId]/runs/[runId]/export/route';
 import NotFound from './not-found';
 import RunDetailPage from './repositories/[repositoryId]/runs/[runId]/page';
 import RunsPage, {
@@ -199,11 +203,13 @@ describe('dashboard server routes', () => {
   beforeEach(() => vi.clearAllMocks());
 
   it('keeps private pages dynamic and non-cacheable', () => {
-    expect([runsDynamic, evidenceDynamic]).toEqual([
+    expect([runsDynamic, evidenceDynamic, exportDynamic]).toEqual([
+      'force-dynamic',
       'force-dynamic',
       'force-dynamic',
     ]);
-    expect([runsFetchCache, evidenceFetchCache]).toEqual([
+    expect([runsFetchCache, evidenceFetchCache, exportFetchCache]).toEqual([
+      'force-no-store',
       'force-no-store',
       'force-no-store',
     ]);
@@ -302,6 +308,10 @@ describe('dashboard server routes', () => {
       searchParams: Promise.resolve({ tools: 'signed-tools' }),
     });
     const html = renderToStaticMarkup(view);
+    expect(html).toContain(
+      `href="/repositories/${repositoryId}/runs/${runId}/export"`,
+    );
+    expect(html).toContain('Download Export V1 JSON');
     expect(html).toContain(
       `href="/repositories/${repositoryId}/runs/${runId}?tools=signed-tools&amp;focusFinding=${resultKey}#finding-${resultKey}"`,
     );

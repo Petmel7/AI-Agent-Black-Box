@@ -122,6 +122,12 @@ export {
   InvalidDashboardCursorError,
 } from './dashboard-cursors.js';
 export {
+  EvidenceExportQueryError,
+  getEvidenceExportSnapshot,
+  type EvidenceExportQueryErrorCode,
+  type EvidenceExportSnapshotInput,
+} from './export-queries.js';
+export {
   createPgmqProcessingQueue,
   MalformedQueueMessageError,
   PROCESSING_QUEUE_NAME,

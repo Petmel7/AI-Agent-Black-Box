@@ -85,6 +85,9 @@ importers:
       '@blackbox/database':
         specifier: workspace:*
         version: link:../../packages/database
+      '@blackbox/export':
+        specifier: workspace:*
+        version: link:../../packages/export
       next:
         specifier: 16.3.5
         version: 16.3.5(@babel/core@7.29.7(supports-color@7.2.0))(@playwright/test@1.51.1)(@types/node@24.13.6)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)
@@ -239,6 +242,9 @@ importers:
       '@blackbox/contracts':
         specifier: workspace:*
         version: link:../contracts
+      '@blackbox/export':
+        specifier: workspace:*
+        version: link:../export
       '@blackbox/summaries':
         specifier: workspace:*
         version: link:../summaries
@@ -267,6 +273,31 @@ importers:
       prisma:
         specifier: 7.10.0
         version: 7.10.0(@types/react-dom@19.3.0(@types/react@19.3.0))(@types/react@19.3.0)(react-dom@19.3.0(react@19.3.0))(react@19.3.0)(typescript@6.0.3)
+      typescript:
+        specifier: 6.0.3
+        version: 6.0.3
+      vitest:
+        specifier: 5.0.1
+        version: 5.0.1(@types/node@24.13.6)(vite@8.3.0(@types/node@24.13.6)(esbuild@0.28.2)(jiti@2.7.0)(tsx@4.23.15))
+
+  packages/export:
+    dependencies:
+      '@blackbox/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+      zod:
+        specifier: 4.6.5
+        version: 4.6.5
+    devDependencies:
+      '@blackbox/config':
+        specifier: workspace:*
+        version: link:../config
+      '@types/node':
+        specifier: 24.13.6
+        version: 24.13.6
+      eslint:
+        specifier: 9.39.5
+        version: 9.39.5(jiti@2.7.0)(supports-color@7.2.0)
       typescript:
         specifier: 6.0.3
         version: 6.0.3

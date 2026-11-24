@@ -102,6 +102,10 @@ Evidence is rendered only as inert text or structured data. The server may
 return a small allowlisted text/JSON preview after exact length and SHA-256
 verification, strict UTF-8 and binary checks, and deadline/cancellation bounds.
 Storage keys and public or signed artifact capabilities are never returned.
+Run detail provides one authenticated Export V1 JSON attachment containing
+canonical evidence and compatible derived-state context, but never artifact
+bytes or storage authority. See `docs/operations/evidence-export.md` for its
+format, bounds, safe handling, and local verification workflow.
 
 The UI labels `PASS`, `REVIEW`, `FAILED`, `INCOMPLETE`, and `PROCESSING` only
 through the accepted presentation mapper. Those labels do not replace the
@@ -131,5 +135,6 @@ download a browser. Its owning orchestration must remove the isolated database,
 storage fixture, browser/server processes, ports, and temporary credentials in
 a `finally` path.
 
-Replay, mutation, unrestricted downloads, export, public artifacts, accounts,
-RBAC, SSO, and external-provider integrations are unavailable in this slice.
+Replay, mutation, unrestricted or artifact downloads, persistent export jobs,
+public artifacts, accounts, RBAC, SSO, and external-provider integrations are
+unavailable in this slice.

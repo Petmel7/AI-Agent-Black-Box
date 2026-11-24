@@ -263,7 +263,12 @@ export default async function RunDetailPage({
           <h1>Run evidence</h1>
           <p className="mono">{runId}</p>
         </div>
-        <StateBadge state={detail.presentationState} />
+        <div>
+          <StateBadge state={detail.presentationState} />
+          <a className="export-link" href={`${pathname}/export`} download>
+            Download Export V1 JSON
+          </a>
+        </div>
       </div>
       <PresentationState state={detail.presentationState} />
       <nav aria-label="Run evidence sections">

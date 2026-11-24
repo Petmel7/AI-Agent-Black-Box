@@ -7,6 +7,7 @@ import {
 import {
   createDatabaseClient,
   DashboardQueryError,
+  getEvidenceExportSnapshot,
   getCoreRunDetail,
   listFileChanges,
   listFindings,
@@ -18,6 +19,10 @@ import {
   type DatabaseClientHandle,
   type DashboardEvidenceLocator,
 } from '@blackbox/database';
+import {
+  buildEvidenceExportV1,
+  type BuiltEvidenceExportV1,
+} from '@blackbox/export';
 
 import { deriveDashboardPresentationState } from '../lib/presentation';
 import type { DashboardPresentationState } from '../lib/presentation';
@@ -113,6 +118,10 @@ export interface DashboardRuntime {
     locator: DashboardEvidenceLocator;
     signal?: AbortSignal;
   }): ReturnType<typeof resolveDashboardEvidence>;
+  exportRun(input: {
+    repositoryId: string;
+    canonicalRunId: string;
+  }): Promise<BuiltEvidenceExportV1 | null>;
   dispose(): Promise<void>;
 }
 
@@ -488,6 +497,14 @@ export function createDashboardRuntime(
         },
         preview,
       );
+    },
+    async exportRun(input) {
+      const snapshot = await getEvidenceExportSnapshot(database.client, {
+        organizationId: config.organizationId,
+        repositoryId: input.repositoryId,
+        canonicalRunId: input.canonicalRunId,
+      });
+      return snapshot ? buildEvidenceExportV1(snapshot) : null;
     },
     async dispose() {
       if (disposed) return;

@@ -12,6 +12,9 @@ export default defineConfig({
       '@blackbox/contracts': fileURLToPath(
         new URL('../contracts/src/index.ts', import.meta.url),
       ),
+      '@blackbox/export': fileURLToPath(
+        new URL('../export/src/index.ts', import.meta.url),
+      ),
       '@blackbox/summaries': fileURLToPath(
         new URL('../summaries/src/index.ts', import.meta.url),
       ),

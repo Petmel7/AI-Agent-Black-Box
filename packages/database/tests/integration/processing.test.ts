@@ -1,5 +1,6 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { EvidenceBatchSchema } from '@blackbox/contracts';
+import { buildEvidenceExportV1, parseEvidenceExportV1 } from '@blackbox/export';
 import { Pool } from 'pg';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
@@ -7,6 +8,7 @@ import {
   claimProcessingIntents,
   completeIntentDelivery,
   getCoreRunDetail,
+  getEvidenceExportSnapshot,
   ingestEvidenceBatch,
   listCoreRuns,
   listFindings,
@@ -21,6 +23,7 @@ import {
   replaySummaryIntent,
   type ProcessingQueue,
 } from '../../src/index.js';
+import { inspectFileSourceSnapshot } from '../../src/file-processing.js';
 
 const connectionString = process.env.TEST_DATABASE_URL!;
 let pool: Pool;
@@ -104,6 +107,56 @@ function errorEvent(runId: string, sequence: number, code: string) {
       message: { state: 'omitted' as const },
     },
   };
+}
+
+async function addUnverifiedFileSource(
+  handle: ReturnType<typeof createDatabaseClient>,
+  scope: Awaited<ReturnType<typeof seed>>,
+  runId: string,
+) {
+  const diffId = randomUUID();
+  const fromSnapshotId = randomUUID();
+  const toSnapshotId = randomUUID();
+  const bytes = Buffer.from('unverified file evidence');
+  const reference = {
+    artifactId: randomUUID(),
+    kind: 'git-file-list',
+    mediaType: 'application/json',
+    byteLength: bytes.length,
+    sha256: createHash('sha256').update(bytes).digest('hex'),
+    redaction: { applied: false },
+    characterEncoding: 'utf-8',
+  } as const;
+  const accepted = EvidenceBatchSchema.parse({
+    schemaVersion: 1,
+    batchId: randomUUID(),
+    runId,
+    sentAt: '2026-10-01T00:00:02.000Z',
+    events: [
+      {
+        schemaVersion: 1,
+        eventId: randomUUID(),
+        runId,
+        sequence: 2,
+        kind: 'git.diff.captured',
+        observedAt: '2026-10-01T00:00:02.000Z',
+        source: { component: 'git' },
+        payload: {
+          diffId,
+          fromSnapshotId,
+          toSnapshotId,
+          diffArtifact: {
+            ...reference,
+            artifactId: randomUUID(),
+            kind: 'git-diff',
+          },
+          fileListArtifact: reference,
+        },
+      },
+    ],
+  });
+  await ingestEvidenceBatch(handle.client, { ...scope, batch: accepted });
+  return accepted;
 }
 
 const options = {
@@ -2778,6 +2831,341 @@ describe('processing migration and core persistence', () => {
       expect(current.findingsFingerprint).toBe(findings.sourceFingerprint);
     } finally {
       await Promise.all([fixture.handle.dispose(), second.dispose()]);
+    }
+  });
+
+  it('exports one current bounded snapshot identically across internal page sizes and isolates its trusted scope', async () => {
+    const fixture = await readySummaryFixture();
+    try {
+      const input = {
+        organizationId: fixture.scope.organizationId,
+        repositoryId: fixture.scope.repositoryId,
+        canonicalRunId: fixture.accepted.runId,
+      };
+      const oneRowPages = await getEvidenceExportSnapshot(
+        fixture.handle.client,
+        { ...input, pageSize: 1 },
+      );
+      const widePages = await getEvidenceExportSnapshot(fixture.handle.client, {
+        ...input,
+        pageSize: 100,
+      });
+      expect(oneRowPages).not.toBeNull();
+      expect(widePages).not.toBeNull();
+      const first = buildEvidenceExportV1(oneRowPages);
+      const second = buildEvidenceExportV1(widePages);
+      expect(second.bytes).toEqual(first.bytes);
+      expect(second.sha256).toBe(first.sha256);
+      expect(parseEvidenceExportV1(first.bytes)).toEqual(first);
+
+      expect(oneRowPages?.core).toMatchObject({
+        state: 'available',
+        run: { evidenceCompleteness: 'incomplete' },
+      });
+      expect(oneRowPages?.files).toEqual({
+        state: 'unavailable',
+        reason: 'missing',
+      });
+      expect(oneRowPages?.findings).toMatchObject({
+        state: 'available',
+        filesVersion: null,
+        filesFingerprint: null,
+        filesCompleteness: 'missing',
+      });
+      expect(oneRowPages?.summary).toMatchObject({
+        state: 'available',
+        filesVersion: null,
+        filesFingerprint: null,
+        filesCompleteness: 'missing',
+      });
+      if (oneRowPages?.summary.state !== 'available') throw new Error();
+      expect(oneRowPages.summary.claims).toHaveLength(
+        oneRowPages.summary.claimCount,
+      );
+      for (const claim of oneRowPages.summary.claims)
+        expect(claim.supports).toHaveLength(claim.supportCount);
+
+      const serialized = new TextDecoder().decode(first.bytes);
+      expect(serialized).not.toContain(fixture.scope.organizationId);
+      expect(serialized).not.toContain(fixture.runId);
+      expect(serialized).not.toContain('objectKey');
+      expect(serialized).not.toContain('DATABASE_URL');
+
+      await expect(
+        getEvidenceExportSnapshot(fixture.handle.client, {
+          ...input,
+          organizationId: randomUUID(),
+        }),
+      ).resolves.toBeNull();
+      await expect(
+        getEvidenceExportSnapshot(fixture.handle.client, {
+          ...input,
+          repositoryId: randomUUID(),
+        }),
+      ).resolves.toBeNull();
+      await expect(
+        getEvidenceExportSnapshot(fixture.handle.client, {
+          ...input,
+          canonicalRunId: randomUUID(),
+        }),
+      ).resolves.toBeNull();
+    } finally {
+      await fixture.handle.dispose();
+    }
+  });
+
+  it('exports an incomplete database files projection as unavailable with null dependency identity', async () => {
+    const scope = await seed();
+    const handle = createDatabaseClient({ connectionString });
+    const accepted = batch();
+    try {
+      await ingestEvidenceBatch(handle.client, { ...scope, batch: accepted });
+      const fileBatch = await addUnverifiedFileSource(
+        handle,
+        scope,
+        accepted.runId,
+      );
+      const run = await handle.client.run.findUniqueOrThrow({
+        where: {
+          organizationId_canonicalRunId: {
+            organizationId: scope.organizationId,
+            canonicalRunId: accepted.runId,
+          },
+        },
+        select: { id: true },
+      });
+      const intent = await handle.client.processingIntent.findFirstOrThrow({
+        where: {
+          organizationId: scope.organizationId,
+          runId: run.id,
+          batch: { canonicalBatchId: fileBatch.batchId },
+        },
+        select: { id: true },
+      });
+      await processCoreIntent(handle.client, intent.id, options);
+      const source = await inspectFileSourceSnapshot(
+        handle.client,
+        scope.organizationId,
+        run.id,
+      );
+      expect(source).toMatchObject({ count: 1, complete: false });
+      const completedAt = new Date();
+      await handle.client.$transaction([
+        handle.client.fileRunProjection.create({
+          data: {
+            organizationId: scope.organizationId,
+            repositoryId: scope.repositoryId,
+            runId: run.id,
+            projectorName: 'files',
+            projectorVersion: 1,
+            sourceEventCount: source.count,
+            sourceMaxSequence: source.maxSequence,
+            sourceFingerprint: source.fingerprint,
+            completeness: 'incomplete',
+            completenessReason: 'file_evidence_unverified',
+            fileCount: 0,
+          },
+        }),
+        handle.client.runProcessingState.upsert({
+          where: {
+            organizationId_runId_projectorName: {
+              organizationId: scope.organizationId,
+              runId: run.id,
+              projectorName: 'files',
+            },
+          },
+          create: {
+            organizationId: scope.organizationId,
+            runId: run.id,
+            projectorName: 'files',
+            projectorVersion: 1,
+            state: 'READY',
+            sourceEventCount: source.count,
+            sourceMaxSequence: source.maxSequence,
+            sourceFingerprint: source.fingerprint,
+            completedAt,
+          },
+          update: {
+            projectorVersion: 1,
+            state: 'READY',
+            leaseId: null,
+            leaseExpiresAt: null,
+            attemptDeadlineAt: null,
+            activeIntentId: null,
+            attemptFingerprint: null,
+            sourceEventCount: source.count,
+            sourceMaxSequence: source.maxSequence,
+            sourceFingerprint: source.fingerprint,
+            completedAt,
+            lastErrorCode: null,
+          },
+        }),
+      ]);
+      await processFindingsIntent(handle.client, intent.id, findingsOptions);
+      await processSummaryIntent(handle.client, intent.id, summaryOptions);
+
+      const snapshot = await getEvidenceExportSnapshot(handle.client, {
+        organizationId: scope.organizationId,
+        repositoryId: scope.repositoryId,
+        canonicalRunId: accepted.runId,
+      });
+      expect(snapshot?.processing.files).toMatchObject({
+        state: 'ready',
+        currentness: 'incomplete',
+      });
+      expect(snapshot?.files).toEqual({
+        state: 'unavailable',
+        reason: 'incomplete',
+      });
+      expect(snapshot?.findings).toMatchObject({
+        state: 'available',
+        filesVersion: null,
+        filesFingerprint: null,
+        filesCompleteness: 'incomplete',
+      });
+      expect(snapshot?.summary).toMatchObject({
+        state: 'available',
+        filesVersion: null,
+        filesFingerprint: null,
+        filesCompleteness: 'incomplete',
+      });
+      const built = buildEvidenceExportV1(snapshot);
+      expect(parseEvidenceExportV1(built.bytes)).toEqual(built);
+    } finally {
+      await handle.dispose();
+    }
+  });
+
+  it('distinguishes processing, missing, and failed export sections without attaching incompatible rows', async () => {
+    const scope = await seed();
+    const processor = createDatabaseClient({ connectionString });
+    const reader = createDatabaseClient({ connectionString });
+    const accepted = batch();
+    await ingestEvidenceBatch(processor.client, { ...scope, batch: accepted });
+    const run = await processor.client.run.findUniqueOrThrow({
+      where: {
+        organizationId_canonicalRunId: {
+          organizationId: scope.organizationId,
+          canonicalRunId: accepted.runId,
+        },
+      },
+      select: { id: true },
+    });
+    const intent = await processor.client.processingIntent.findFirstOrThrow({
+      where: { organizationId: scope.organizationId, runId: run.id },
+      select: { id: true },
+    });
+    let processingStarted!: () => void;
+    const atProcessing = new Promise<void>((resolve) => {
+      processingStarted = resolve;
+    });
+    let allowPublication!: () => void;
+    const publish = new Promise<void>((resolve) => {
+      allowPublication = resolve;
+    });
+    const processing = processCoreIntent(processor.client, intent.id, options, {
+      hooks: {
+        beforeReceipt: async () => {
+          processingStarted();
+          await publish;
+        },
+      },
+    });
+    try {
+      await atProcessing;
+      const current = await getEvidenceExportSnapshot(reader.client, {
+        organizationId: scope.organizationId,
+        repositoryId: scope.repositoryId,
+        canonicalRunId: accepted.runId,
+      });
+      expect(current?.processing.core.state).toBe('processing');
+      expect(current?.core).toEqual({
+        state: 'unavailable',
+        reason: 'processing',
+      });
+      expect(current?.files).toEqual({
+        state: 'unavailable',
+        reason: 'missing',
+      });
+      expect(current?.summary).toEqual({
+        state: 'unavailable',
+        reason: 'missing',
+      });
+    } finally {
+      allowPublication();
+      await processing;
+      await Promise.all([processor.dispose(), reader.dispose()]);
+    }
+
+    const failed = await failedFindingsFixture();
+    try {
+      const snapshot = await getEvidenceExportSnapshot(failed.handle.client, {
+        organizationId: failed.scope.organizationId,
+        repositoryId: failed.scope.repositoryId,
+        canonicalRunId: failed.accepted.runId,
+      });
+      expect(snapshot?.processing.findings).toMatchObject({
+        state: 'failed',
+        currentness: 'failed',
+      });
+      expect(snapshot?.findings).toEqual({
+        state: 'unavailable',
+        reason: 'failed',
+      });
+    } finally {
+      await failed.handle.dispose();
+    }
+  });
+
+  it('keeps a repeatable-read export coherent when late evidence arrives and marks a later snapshot stale', async () => {
+    const fixture = await readySummaryFixture();
+    const writer = createDatabaseClient({ connectionString });
+    try {
+      const late = incrementalBatch(fixture.accepted.runId, [
+        errorEvent(fixture.accepted.runId, 2, 'late-export-event'),
+      ]);
+      let inserted = false;
+      const stable = await getEvidenceExportSnapshot(
+        fixture.handle.client,
+        {
+          organizationId: fixture.scope.organizationId,
+          repositoryId: fixture.scope.repositoryId,
+          canonicalRunId: fixture.accepted.runId,
+          pageSize: 1,
+        },
+        {
+          afterBaseRead: async () => {
+            if (inserted) return;
+            inserted = true;
+            await ingestEvidenceBatch(writer.client, {
+              ...fixture.scope,
+              batch: late,
+            });
+          },
+        },
+      );
+      expect(stable?.events).toHaveLength(2);
+      expect(stable?.core.state).toBe('available');
+      expect(stable?.summary.state).toBe('available');
+
+      const after = await getEvidenceExportSnapshot(writer.client, {
+        organizationId: fixture.scope.organizationId,
+        repositoryId: fixture.scope.repositoryId,
+        canonicalRunId: fixture.accepted.runId,
+      });
+      expect(after?.events).toHaveLength(3);
+      expect(after?.processing.core.currentness).toBe('stale');
+      expect(after?.core).toEqual({ state: 'unavailable', reason: 'stale' });
+      expect(after?.findings).toEqual({
+        state: 'unavailable',
+        reason: 'stale',
+      });
+      expect(after?.summary).toEqual({
+        state: 'unavailable',
+        reason: 'stale',
+      });
+    } finally {
+      await Promise.all([fixture.handle.dispose(), writer.dispose()]);
     }
   });
 });

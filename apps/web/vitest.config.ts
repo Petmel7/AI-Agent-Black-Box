@@ -20,6 +20,9 @@ export default defineConfig({
       '@blackbox/database': fileURLToPath(
         new URL('../../packages/database/src/index.ts', import.meta.url),
       ),
+      '@blackbox/export': fileURLToPath(
+        new URL('../../packages/export/src/index.ts', import.meta.url),
+      ),
     },
   },
   test: {

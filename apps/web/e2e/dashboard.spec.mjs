@@ -1,4 +1,5 @@
 import { expect, test } from '@playwright/test';
+import { parseEvidenceExportV1 } from '@blackbox/export';
 
 import { replaceRunListSourceSnapshot } from '../test/e2e-database-control.mjs';
 import {
@@ -484,6 +485,14 @@ async function observeGenericNotFound(page, requestedRepositoryId) {
   };
 }
 
+async function downloadBytes(download) {
+  const stream = await download.createReadStream();
+  if (!stream) throw new Error('The export download stream is unavailable.');
+  const chunks = [];
+  for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+  return new Uint8Array(Buffer.concat(chunks));
+}
+
 test.beforeAll(() => {
   if (
     !repositoryId ||
@@ -507,6 +516,42 @@ test('challenges unauthenticated requests at the real proxy boundary', async ({
   expect(response.status).toBe(401);
   expect(response.headers.get('www-authenticate')).toContain('Basic');
   expect(response.headers.get('cache-control')).toBe('no-store');
+
+  const exportResponse = await fetch(
+    new URL(`/repositories/${repositoryId}/runs/${runId}/export`, baseURL),
+    { redirect: 'manual' },
+  );
+  expect(exportResponse.status).toBe(401);
+  expect(exportResponse.headers.get('www-authenticate')).toContain('Basic');
+  expect(exportResponse.headers.get('cache-control')).toBe('no-store');
+});
+
+test('downloads and independently validates one Export V1 bundle', async ({
+  page,
+}) => {
+  await page.goto(`/repositories/${repositoryId}/runs/${runId}`);
+  await expect(page.getByRole('main')).toBeFocused();
+  const visiblePresentation = await page
+    .locator('.presentation-state .state-badge')
+    .textContent();
+  const [download] = await Promise.all([
+    page.waitForEvent('download'),
+    page.getByRole('link', { name: 'Download Export V1 JSON' }).click(),
+  ]);
+  expect(download.suggestedFilename()).toBe(
+    `blackbox-evidence-${runId}.v1.json`,
+  );
+  const downloadedBytes = await downloadBytes(download);
+  const parsedExport = parseEvidenceExportV1(downloadedBytes);
+  expect(parsedExport.bundle.repositoryId).toBe(repositoryId);
+  expect(parsedExport.bundle.runId).toBe(runId);
+  expect(parsedExport.bundle.outcomes.presentation).toBe(visiblePresentation);
+  expect(parsedExport.bundle.events.length).toBeGreaterThan(0);
+  expect(parsedExport.bundle.summary.state).toBe('available');
+  expect(new TextDecoder().decode(downloadedBytes)).not.toContain(
+    secretSentinel,
+  );
+  expect(JSON.stringify(parsedExport.bundle)).not.toContain('objectKey');
 });
 
 test('navigates list, independent states, supports, evidence, and pages', async ({
@@ -722,6 +767,17 @@ test('does not distinguish hidden-tenant and nonexistent resource routes', async
   expect(missing.redirected).toBe(false);
   expect(hidden.visible).toEqual(missing.visible);
   expect(hidden.body).toBe(missing.body);
+
+  const hiddenExport = await page.request.get(
+    `/repositories/${hiddenRepositoryId}/runs/${runId}/export`,
+  );
+  const missingExport = await page.request.get(
+    `/repositories/${missingRepositoryId}/runs/${runId}/export`,
+  );
+  expect(hiddenExport.status()).toBe(missingExport.status());
+  expect(await hiddenExport.text()).toBe(await missingExport.text());
+  expect(hiddenExport.headers()['cache-control']).toBe('no-store');
+  expect(missingExport.headers()['cache-control']).toBe('no-store');
 
   for (const privateValue of [
     hiddenRepositoryId,
